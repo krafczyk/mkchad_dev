@@ -24,6 +24,14 @@ Treat each child as an independent repository. Run Git operations, tests, and
 formatters from the child repository they apply to, and do not mix unrelated
 changes across children.
 
+## Sprint Documentation
+
+Cross-repository sprint plans, specifications, checklists, and sprint-specific
+policies live under `docs/sprints/<sprint-name>/`. Each series keeps its plan at
+the series root and its sprint artifacts in numbered subdirectories. Durable
+product and repository documentation remains in the child repository it
+describes.
+
 ## Temporary Files
 
 Anything requiring a temporary directory must use a task-specific directory in
