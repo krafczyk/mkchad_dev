@@ -1,0 +1,12 @@
+[submodule "mkchad"]
+	path = mkchad
+	url = git@github.com:krafczyk/mkchad
+[submodule "msk_containers"]
+	path = msk_containers
+	url = git@github.com:krafczyk/msk_containers
+[submodule "opencode.nvim"]
+	path = opencode.nvim
+	url = git@github.com:krafczyk/opencode.nvim
+[submodule "opencode_sprint_loop"]
+	path = opencode_sprint_loop
+	url = git@github.com:krafczyk/opencode_sprint_loop
