@@ -387,7 +387,7 @@ and participating repositories to every agent.
 
 ## 16. Automated Regression Suites
 
-- [ ] **S3-TEST-001** Run strict protected server-config tests.
+- [x] **S3-TEST-001** Run strict protected server-config tests.
 - [ ] **S3-TEST-002** Run schema-1, schema-2, schema-3, pending, launch-intent,
       malformed, future, and downgrade state tests.
 - [ ] **S3-TEST-003** Run TLS lifecycle, direct lifecycle, partial-stop,
@@ -500,6 +500,29 @@ and participating repositories to every agent.
   proves one host entry, direct in-container Neovim execution, inherited XDG,
   npm, and `OPENCODE_CONFIG` values, and refusal to let the legacy host marker
   choose host-native execution.
+
+### Closeout verification pass (2026-07-16)
+
+- The final combined local tree was verified at parent `fd33d0e`, MkChad
+  `a713a71`, `msk_containers` `4d3a709`, and `opencode.nvim` `b8ad804`.
+  Isolated paths were created only below
+  `/tmp/opencode-mkchad/spos3-closeout-20260716`.
+- The focused standalone-command, MkChad command-adapter, wrapper fake-runtime,
+  and isolated installer regressions passed. The strict protected server-config
+  suite also passed under isolated XDG paths.
+- Broader inherited verification is blocked by suites that create fixtures under
+  the prohibited legacy `/tmp/opencode` root: `python3
+  tests/opencode_downgrade_spec.py`, `python3 tests/opencode_fence_spec.py`,
+  `python3 tests/opencode_disclosure_spec.py`, `python3
+  tests/opencode_subprocess_spec.py`, and `python3 tests/concurrent_startup.py`.
+  They were not run and were not modified. Consequently, no remaining broader
+  suites, runtime/browser gates, publication gates, or acceptance rows are
+  claimed complete by this pass.
+- Auditor pass 2 reported no policy-reportable P0/P1 findings; prior
+  `SPOS3-AUD-P1-001` and `SPOS3-AUD-P1-002` remain resolved. The pass report did
+  not supply recordable identifiers, owners, or dispositions for its remaining
+  P2 findings, so **S3-ACCEPT-011** remains open. Real SingularityCE,
+  Apptainer, and browser evidence remains unclaimed.
 
 ## 19. Acceptance and Closeout
 
