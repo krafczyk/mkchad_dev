@@ -287,12 +287,12 @@ and participating repositories to every agent.
       never depend on caller cwd.
 - [ ] **S3-WRAP-004** Use the active managed `neovim.sif` contract and preserve
       supported `NVIM_CONT_LOCATION`/container-directory overrides.
-- [ ] **S3-WRAP-005** Enter the active SIF exactly once from host mode.
+- [x] **S3-WRAP-005** Enter the active SIF exactly once from host mode.
 - [x] **S3-WRAP-006** Detect in-container mode through a reliable explicit image
       signal and invoke image Neovim directly.
 - [x] **S3-WRAP-007** Never recursively invoke SingularityCE or Apptainer from
       inside the MkChad image.
-- [ ] **S3-WRAP-008** Preserve MkChad's XDG runtime/cache setup,
+- [x] **S3-WRAP-008** Preserve MkChad's XDG runtime/cache setup,
       architecture-neutral npm host bind, architecture-specific npm selection,
       and `OPENCODE_CONFIG` environment.
 - [x] **S3-WRAP-009** Invoke minimal headless Neovim with `-u NONE` and no plugin
@@ -307,26 +307,26 @@ and participating repositories to every agent.
 
 ## 13. opencode.nvim and MkChad Adapter
 
-- [ ] **S3-ADAPT-001** Configure opencode.nvim with asynchronous
+- [x] **S3-ADAPT-001** Configure opencode.nvim with asynchronous
       `server.ensure(callback)` that invokes
       `mkchad-opencode-server start --json`.
-- [ ] **S3-ADAPT-002** Keep `server.start = false` and provide no terminal launch
+- [x] **S3-ADAPT-002** Keep `server.start = false` and provide no terminal launch
       fallback after command failure.
-- [ ] **S3-ADAPT-003** Invoke the command through an argv array without blocking
+- [x] **S3-ADAPT-003** Invoke the command through an argv array without blocking
       Neovim's main loop.
-- [ ] **S3-ADAPT-004** Bound command duration, stdout, and stderr and invoke the
+- [x] **S3-ADAPT-004** Bound command duration, stdout, and stderr and invoke the
       ensure callback exactly once.
-- [ ] **S3-ADAPT-005** Require exit zero and a valid success object before
+- [x] **S3-ADAPT-005** Require exit zero and a valid success object before
       exposing an endpoint.
-- [ ] **S3-ADAPT-006** Cache URL, transport, generation, and CA only from the
+- [x] **S3-ADAPT-006** Cache URL, transport, generation, and CA only from the
       current successful ensure result.
-- [ ] **S3-ADAPT-007** Make `server.url` resolve only the current validated cached
+- [x] **S3-ADAPT-007** Make `server.url` resolve only the current validated cached
       endpoint after ensure.
 - [ ] **S3-ADAPT-008** Make `server.ca_cert` return the current TLS CA and nil for
       direct mode.
-- [ ] **S3-ADAPT-009** Reject stale command completion after a newer invocation
+- [x] **S3-ADAPT-009** Reject stale command completion after a newer invocation
       or generation has won.
-- [ ] **S3-ADAPT-010** Clear or supersede stale endpoint cache after stop,
+- [x] **S3-ADAPT-010** Clear or supersede stale endpoint cache after stop,
       command failure, or validated generation change.
 - [ ] **S3-ADAPT-011** Preserve protected config/environment authentication in
       opencode.nvim without returning credentials in command JSON.
@@ -338,13 +338,13 @@ and participating repositories to every agent.
 - [ ] **S3-UI-001** Keep local `opencode attach` creation and recycling in the
       editor adapter.
 - [ ] **S3-UI-002** Make external standalone start create no attached TUI.
-- [ ] **S3-UI-003** Make `:OpenCodeStart` ensure the server through the command
+- [x] **S3-UI-003** Make `:OpenCodeStart` ensure the server through the command
       before creating or showing the local TUI.
 - [ ] **S3-UI-004** Preserve attached TUI URL, `--dir`, generation, transport,
       and active CA identity recycling rules.
 - [ ] **S3-UI-005** Supply `NODE_EXTRA_CA_CERTS` only for TLS attach.
 - [ ] **S3-UI-006** Preserve terminal toggle, show, close, and placement behavior.
-- [ ] **S3-UI-007** Make `:OpenCodeStop` delegate to the command and close only
+- [x] **S3-UI-007** Make `:OpenCodeStop` delegate to the command and close only
       the invoking local TUI after successful or inactive stop.
 - [ ] **S3-UI-008** Make `:OpenCodeInfo` combine command status with editor-local
       SSE/TUI state without lifecycle mutation.
@@ -380,7 +380,7 @@ and participating repositories to every agent.
       for bounded contender recovery.
 - [ ] **S3-RACE-010** Repeat timeout, overflow, callback failure, and start failure
       paths and prove stable fd, timer, and child counts.
-- [ ] **S3-RACE-011** Prove stale Lua command completion cannot overwrite a newer
+- [x] **S3-RACE-011** Prove stale Lua command completion cannot overwrite a newer
       validated endpoint cache.
 - [ ] **S3-RACE-012** Prove loss of command output after complete publication does
       not create a second generation on retry.
@@ -484,6 +484,22 @@ and participating repositories to every agent.
 - The broader existing lifecycle suites still need relocation from their legacy
   `/tmp/opencode` fixture paths before they can run under this sprint's required
   `/tmp/opencode-mkchad` temporary-path policy.
+- Repair cycle 1 (2026-07-16) resolves `SPOS3-AUD-P1-001` with MkChad commit
+  `a713a71`: the asynchronous argv-only adapter bounds process output and time,
+  requires a current strict JSON result before caching an endpoint, rejects
+  malformed, trailing, oversized, and nonzero output, and delegates editor
+  start, stop, and status to the standalone command. Its isolated regression
+  covers callback once, cache clearing, stale completion, command stop/status,
+  and an editor attach to an externally returned generation.
+- Repair cycle 1 resolves `SPOS3-AUD-P1-002` with `msk_containers` commit
+  `4d3a709`. This corrects the prior S3-WRAP-006/007 evidence: the legacy
+  `MKCHAD_NVIM_CONTAINER` marker alone was not a reliable in-image signal.
+  The image definitions and launcher now establish `MKCHAD_NVIM_IMAGE`; the
+  wrapper validates it with the standard runtime signal and retains compatibility
+  for an already running `neovim.sif` image. The isolated fake-runtime test
+  proves one host entry, direct in-container Neovim execution, inherited XDG,
+  npm, and `OPENCODE_CONFIG` values, and refusal to let the legacy host marker
+  choose host-native execution.
 
 ## 19. Acceptance and Closeout
 
