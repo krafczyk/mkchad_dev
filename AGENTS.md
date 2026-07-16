@@ -79,10 +79,22 @@ selection unless the user makes sprint scope relevant.
   `opencode.nvim/`
 - Commit order: each changed child before the parent workspace
 
-Both selectors are active, so this workspace has no default sprint. Sprint 1 of
-`single-opencode-server` is archived historical evidence and is never selected
-from its unchecked gates. Run at most one sprint loop in this coordination
-worktree at a time.
+#### `single-opencode-server/3`
+
+- Plan: `docs/sprints/single-opencode-server/sprint_plan.md`
+- Specification: `docs/sprints/single-opencode-server/3/sprint_spec.md`
+- Checklist: `docs/sprints/single-opencode-server/3/sprint_checklist.md`
+- Inherited policies: `docs/sprints/single-opencode-server/2/threat_model.md` and
+  `docs/sprints/single-opencode-server/2/audit_policy.md`
+- Participating repositories: `mkchad/`, `msk_containers/`, and
+  `opencode.nvim/` when focused compatibility tests require plugin work
+- Commit order: each changed child before the parent workspace
+
+All three selectors are active, so this workspace has no default sprint. Sprint
+1 of `single-opencode-server` is archived historical evidence and is never
+selected from its unchecked gates. Select Sprint 2 or Sprint 3 explicitly; their
+shared series and repositories do not make either one implicit. Run at most one
+sprint loop in this coordination worktree at a time.
 
 ## Temporary Files
 
