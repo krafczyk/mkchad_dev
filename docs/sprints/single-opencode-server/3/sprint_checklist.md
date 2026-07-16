@@ -17,67 +17,67 @@ and participating repositories to every agent.
 
 ## 1. Scope and Governing Inputs
 
-- [ ] **S3-SCOPE-001** Read the parent and all participating child `AGENTS.md`
+- [x] **S3-SCOPE-001** Read the parent and all participating child `AGENTS.md`
       files before changing behavior.
-- [ ] **S3-SCOPE-002** Read the complete Sprint 3 specification, this checklist,
+- [x] **S3-SCOPE-002** Read the complete Sprint 3 specification, this checklist,
       Sprint 2 specification, Sprint 2 threat model, and Sprint 2 audit policy.
-- [ ] **S3-SCOPE-003** Confirm the invocation explicitly selected
+- [x] **S3-SCOPE-003** Confirm the invocation explicitly selected
       `single-opencode-server/3`; do not infer selection from unchecked rows or
       directory order.
-- [ ] **S3-SCOPE-004** Record exact starting commits and worktree status in
+- [x] **S3-SCOPE-004** Record exact starting commits and worktree status in
       `mkchad`, `msk_containers`, `opencode.nvim`, and the parent workspace.
-- [ ] **S3-SCOPE-005** Base MkChad implementation on
+- [x] **S3-SCOPE-005** Base MkChad implementation on
       `origin/verification/optional-transport` at or after reviewed baseline
       `512ab83`, not the lifecycle-free checked-out main history.
-- [ ] **S3-SCOPE-006** Preserve unrelated user changes, including MkChad's
+- [x] **S3-SCOPE-006** Preserve unrelated user changes, including MkChad's
       untracked `lazy-lock.json` and unrelated container artifacts.
-- [ ] **S3-SCOPE-007** Keep systemd, watchdogs, login startup, remote lifecycle,
+- [x] **S3-SCOPE-007** Keep systemd, watchdogs, login startup, remote lifecycle,
       host-native fallback, Python rewrite, mandatory credential generation,
       non-loopback listeners, and multiple managed generations out of scope.
-- [ ] **S3-SCOPE-008** Treat the Sprint 2 hardened TLS and trusted-host direct
+- [x] **S3-SCOPE-008** Treat the Sprint 2 hardened TLS and trusted-host direct
       profiles as binding; do not reinterpret direct mode as multi-user
       hardening.
-- [ ] **S3-SCOPE-009** Review whether the command boundary changes any inherited
+- [x] **S3-SCOPE-009** Review whether the command boundary changes any inherited
       threat assumption and amend or replace policy documents before production
       implementation if it does.
-- [ ] **S3-SCOPE-010** Use only task-specific paths beneath
+- [x] **S3-SCOPE-010** Use only task-specific paths beneath
       `/tmp/opencode-mkchad` for temporary fixtures.
 
 ## 2. Live Environment and Credential Safety
 
-- [ ] **S3-SAFE-001** Treat `/home/matthew/.config/mkchad` as read-only unless
+- [x] **S3-SAFE-001** Treat `/home/matthew/.config/mkchad` as read-only unless
       the user explicitly authorizes a focused live deployment action.
-- [ ] **S3-SAFE-002** Do not run development lifecycle tests against live XDG
+- [x] **S3-SAFE-002** Do not run development lifecycle tests against live XDG
       config, state, data, cache, runtime, server, TLS, log, or lock paths.
-- [ ] **S3-SAFE-003** Use isolated `HOME`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME`,
+- [x] **S3-SAFE-003** Use isolated `HOME`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME`,
       `XDG_DATA_HOME`, `XDG_CACHE_HOME`, and `XDG_RUNTIME_DIR` where applicable.
-- [ ] **S3-SAFE-004** Do not inspect or expose real OpenCode provider tokens,
+- [x] **S3-SAFE-004** Do not inspect or expose real OpenCode provider tokens,
       server passwords, private transcripts, unrelated sessions, SSH material,
       CA private keys, or key-store passwords.
-- [ ] **S3-SAFE-005** Use synthetic credentials and marker values for every
+- [x] **S3-SAFE-005** Use synthetic credentials and marker values for every
       disclosure and argv/log/state test.
 - [ ] **S3-SAFE-006** Recheck the live checkout observationally only when required
       by the sprint and confirm it was not changed by verification.
 
 ## 3. Repository and Publication Boundaries
 
-- [ ] **S3-REPO-001** Keep lifecycle implementation, command entrypoint, config
+- [x] **S3-REPO-001** Keep lifecycle implementation, command entrypoint, config
       parser, editor adapter, and lifecycle tests in `mkchad`.
-- [ ] **S3-REPO-002** Keep host/container wrapper, installation, and wrapper tests
+- [x] **S3-REPO-002** Keep host/container wrapper, installation, and wrapper tests
       in `msk_containers`.
-- [ ] **S3-REPO-003** Make no production `opencode.nvim` change unless a focused
+- [x] **S3-REPO-003** Make no production `opencode.nvim` change unless a focused
       test proves the existing `server.ensure`, `server.url`, or
       `server.ca_cert` contract is insufficient.
-- [ ] **S3-REPO-004** Update the Sprint 3 specification before introducing a new
+- [x] **S3-REPO-004** Update the Sprint 3 specification before introducing a new
       opencode.nvim requirement or changing the command's public contract.
-- [ ] **S3-REPO-005** Add no generated state, logs, TLS files, launch intent,
+- [x] **S3-REPO-005** Add no generated state, logs, TLS files, launch intent,
       pending metadata, test runtime, SIF artifact, credential, or transcript to
       source control.
 - [ ] **S3-REPO-006** Commit and publish each changed child repository before the
       parent workspace records its gitlink.
-- [ ] **S3-REPO-007** Keep child commits independently reviewable and avoid
+- [x] **S3-REPO-007** Keep child commits independently reviewable and avoid
       mixing unrelated changes across repositories.
-- [ ] **S3-REPO-008** Inspect status, diff, and exact revision in every changed
+- [x] **S3-REPO-008** Inspect status, diff, and exact revision in every changed
       repository before publication and closeout.
 
 ## 4. Lifecycle Module Extraction
@@ -92,7 +92,7 @@ and participating repositories to every agent.
 - [ ] **S3-MOD-004** Keep attached TUI state, Snacks terminal presentation,
       terminal placement, notifications, user commands, and plugin connection
       state outside the detached lifecycle layer.
-- [ ] **S3-MOD-005** Ensure loading the lifecycle module alone registers no
+- [x] **S3-MOD-005** Ensure loading the lifecycle module alone registers no
       plugin, command, autocmd, mapping, window, buffer, or terminal.
 - [ ] **S3-MOD-006** Preserve narrow deterministic test seams without exporting
       unsafe production mutation APIs.
@@ -108,40 +108,40 @@ and participating repositories to every agent.
 
 ## 5. Standalone Entrypoint and CLI Parsing
 
-- [ ] **S3-CLI-001** Add the minimal headless lifecycle entrypoint without
+- [x] **S3-CLI-001** Add the minimal headless lifecycle entrypoint without
       loading user init files or plugins.
-- [ ] **S3-CLI-002** Implement exact command name `mkchad-opencode-server`.
-- [ ] **S3-CLI-003** Implement `start [--json]`.
-- [ ] **S3-CLI-004** Implement `status [--json]`.
-- [ ] **S3-CLI-005** Implement `stop [--json]`.
-- [ ] **S3-CLI-006** Implement `--help` without lifecycle mutation.
+- [x] **S3-CLI-002** Implement exact command name `mkchad-opencode-server`.
+- [x] **S3-CLI-003** Implement `start [--json]`.
+- [x] **S3-CLI-004** Implement `status [--json]`.
+- [x] **S3-CLI-005** Implement `stop [--json]`.
+- [x] **S3-CLI-006** Implement `--help` without lifecycle mutation.
 - [ ] **S3-CLI-007** Reject missing, unknown, duplicated, or misplaced commands
       and options with exit status `2` and no lifecycle mutation.
 - [ ] **S3-CLI-008** Reject extra positional arguments and control- or NUL-bearing
       values before lifecycle mutation.
 - [ ] **S3-CLI-009** Avoid Ex-command construction, shell interpolation, manual
       quoting, and `sh -c` or `bash -c` execution.
-- [ ] **S3-CLI-010** Preserve lifecycle exit status through the Lua entrypoint and
+- [x] **S3-CLI-010** Preserve lifecycle exit status through the Lua entrypoint and
       installed wrapper.
 - [ ] **S3-CLI-011** Produce concise human output that identifies safe log and
       recovery paths without exposing protected content.
-- [ ] **S3-CLI-012** Ensure command startup itself does not create a TUI, plugin
+- [x] **S3-CLI-012** Ensure command startup itself does not create a TUI, plugin
       connection, editor buffer, or MkChad UI state.
 
 ## 6. JSON Interface
 
-- [ ] **S3-JSON-001** Emit exactly one UTF-8 JSON object and one newline on
+- [x] **S3-JSON-001** Emit exactly one UTF-8 JSON object and one newline on
       stdout in `--json` mode.
-- [ ] **S3-JSON-002** Keep wrapper, runtime-discovery, Neovim, and progress
+- [x] **S3-JSON-002** Keep wrapper, runtime-discovery, Neovim, and progress
       messages off machine-mode stdout.
-- [ ] **S3-JSON-003** Emit schema version `1`, `ok`, `command`, and `status` with
+- [x] **S3-JSON-003** Emit schema version `1`, `ok`, `command`, and `status` with
       the exact documented types.
-- [ ] **S3-JSON-004** Emit healthy state fields `url`, `transport`, `generation`,
+- [x] **S3-JSON-004** Emit healthy state fields `url`, `transport`, `generation`,
       and `ca_cert` with direct-mode CA represented as JSON null.
-- [ ] **S3-JSON-005** Emit `state: null` for inactive status.
+- [x] **S3-JSON-005** Emit `state: null` for inactive status.
 - [ ] **S3-JSON-006** Emit bounded stable error codes and bounded presentation
       messages for lifecycle failures.
-- [ ] **S3-JSON-007** Return exit zero for completed status observation even when
+- [x] **S3-JSON-007** Return exit zero for completed status observation even when
       its result is inactive, unhealthy, or blocked.
 - [ ] **S3-JSON-008** Return exit one for failed or refused start/stop lifecycle
       operations.
@@ -159,7 +159,7 @@ and participating repositories to every agent.
 
 ## 7. Configuration and Path Compatibility
 
-- [ ] **S3-CONFIG-001** Preserve protected config path
+- [x] **S3-CONFIG-001** Preserve protected config path
       `${XDG_CONFIG_HOME:-$HOME/.config}/mkchad/opencode-server.json`.
 - [ ] **S3-CONFIG-002** Preserve regular-file, owner, mode-`0600`, size, JSON
       object, supported-key, port, username, password, and strict Boolean
@@ -169,12 +169,12 @@ and participating repositories to every agent.
       `OPENCODE_SERVER_PASSWORD`.
 - [ ] **S3-CONFIG-004** Preserve absence of an environment override for
       `tls_proxy` and default it to TLS when absent.
-- [ ] **S3-CONFIG-005** Preserve MkChad OpenCode application config path through
+- [x] **S3-CONFIG-005** Preserve MkChad OpenCode application config path through
       `OPENCODE_CONFIG` in external and editor invocation paths.
-- [ ] **S3-CONFIG-006** Preserve state root
+- [x] **S3-CONFIG-006** Preserve state root
       `${XDG_STATE_HOME:-$HOME/.local/state}/mkchad/opencode/<hostname>` under
       minimal `-u NONE` execution.
-- [ ] **S3-CONFIG-007** Prevent accidental use of default `nvim` config or state
+- [x] **S3-CONFIG-007** Prevent accidental use of default `nvim` config or state
       roots when `NVIM_APPNAME` is absent or different.
 - [ ] **S3-CONFIG-008** Resolve proxy source and pidfd helper to the same trusted
       MkChad assets in host and in-container invocation paths.
@@ -279,27 +279,27 @@ and participating repositories to every agent.
 
 ## 12. Installed Wrapper and Container Routing
 
-- [ ] **S3-WRAP-001** Add executable wrapper
+- [x] **S3-WRAP-001** Add executable wrapper
       `msk_containers/nvim/bin/mkchad-opencode-server`.
-- [ ] **S3-WRAP-002** Install it to `$HOME/.local/bin` through
+- [x] **S3-WRAP-002** Install it to `$HOME/.local/bin` through
       `bin/install_nvim.sh` with mode `0755`.
 - [ ] **S3-WRAP-003** Resolve support tools relative to the installed wrapper and
       never depend on caller cwd.
 - [ ] **S3-WRAP-004** Use the active managed `neovim.sif` contract and preserve
       supported `NVIM_CONT_LOCATION`/container-directory overrides.
 - [ ] **S3-WRAP-005** Enter the active SIF exactly once from host mode.
-- [ ] **S3-WRAP-006** Detect in-container mode through a reliable explicit image
+- [x] **S3-WRAP-006** Detect in-container mode through a reliable explicit image
       signal and invoke image Neovim directly.
-- [ ] **S3-WRAP-007** Never recursively invoke SingularityCE or Apptainer from
+- [x] **S3-WRAP-007** Never recursively invoke SingularityCE or Apptainer from
       inside the MkChad image.
 - [ ] **S3-WRAP-008** Preserve MkChad's XDG runtime/cache setup,
       architecture-neutral npm host bind, architecture-specific npm selection,
       and `OPENCODE_CONFIG` environment.
-- [ ] **S3-WRAP-009** Invoke minimal headless Neovim with `-u NONE` and no plugin
+- [x] **S3-WRAP-009** Invoke minimal headless Neovim with `-u NONE` and no plugin
       loading.
 - [ ] **S3-WRAP-010** Forward only documented arguments and preserve signals and
       exit status.
-- [ ] **S3-WRAP-011** Keep runtime discovery and errors off JSON stdout.
+- [x] **S3-WRAP-011** Keep runtime discovery and errors off JSON stdout.
 - [ ] **S3-WRAP-012** Fail clearly for missing runtime, active image, lifecycle
       assets, support tool, or image Neovim.
 - [ ] **S3-WRAP-013** Never silently select another SIF or launch host OpenCode
@@ -406,11 +406,11 @@ and participating repositories to every agent.
       and direct modes.
 - [ ] **S3-TEST-010** Run opencode.nvim protected-curl, HTTP/no-CA,
       HTTPS/pinned-CA, wrong/missing-CA, SSE, and response-redaction tests.
-- [ ] **S3-TEST-011** Add command parser, framing, result validation, exit status,
+- [x] **S3-TEST-011** Add command parser, framing, result validation, exit status,
       and no-MkChad-load tests.
 - [ ] **S3-TEST-012** Add wrapper fake-runtime tests for exact argv, environment,
       binds, host/container routing, errors, and status propagation.
-- [ ] **S3-TEST-013** Add isolated installer test proving the command is installed
+- [x] **S3-TEST-013** Add isolated installer test proving the command is installed
       executable without changing unrelated files.
 - [ ] **S3-TEST-014** Run StyLua, LuaLS, shell syntax, Python compile, Java checks,
       and repository-specific formatters applicable to changed files.
@@ -443,11 +443,11 @@ and participating repositories to every agent.
 
 ## 18. Documentation and Operations
 
-- [ ] **S3-DOC-001** Document installation, prerequisites, active SIF selection,
+- [x] **S3-DOC-001** Document installation, prerequisites, active SIF selection,
       and command discovery.
-- [ ] **S3-DOC-002** Document `start`, `status`, `stop`, `--json`, and exit status
+- [x] **S3-DOC-002** Document `start`, `status`, `stop`, `--json`, and exit status
       semantics.
-- [ ] **S3-DOC-003** Document that standalone start creates no MkChad instance or
+- [x] **S3-DOC-003** Document that standalone start creates no MkChad instance or
       attached TUI.
 - [ ] **S3-DOC-004** Document config, state, log, TLS, pending, and launch-intent
       paths without exposing contents.
@@ -466,7 +466,24 @@ and participating repositories to every agent.
 - [ ] **S3-DOC-011** Do not claim system service, watchdog, boot startup,
       host-native fallback, or automatic browser trust.
 - [ ] **S3-DOC-012** Update package-selection ADR only if a selected package,
-      component, version, source, or architecture scope changes.
+       component, version, source, or architecture scope changes.
+
+### Development tranche evidence (2026-07-16)
+
+- MkChad commit `eba2b83` adds the minimal `-u NONE` lifecycle entrypoint,
+  bounded JSON command contract, and an isolated direct-mode command test. The
+  test covers inactive status without lifecycle state, start, generation reuse,
+  stop, JSON framing, and a usage exit of `2` under isolated
+  `/tmp/opencode-mkchad` XDG paths.
+- `msk_containers` commit `23c4791` installs the executable wrapper. Shell
+  syntax checks, an isolated installer check, and an in-container-mode JSON
+  status check passed. No real SingularityCE or Apptainer runtime evidence is
+  claimed.
+- The lifecycle-only load assertion confirmed no `opencode_opts`, OpenCode user
+  commands, plugin, TUI, or lifecycle state are created for inactive status.
+- The broader existing lifecycle suites still need relocation from their legacy
+  `/tmp/opencode` fixture paths before they can run under this sprint's required
+  `/tmp/opencode-mkchad` temporary-path policy.
 
 ## 19. Acceptance and Closeout
 
