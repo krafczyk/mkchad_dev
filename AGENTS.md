@@ -19,10 +19,15 @@ documents it identifies.
   (`/data0/matthew/Projects/mkchad/opencode_sprint_loop`): the Python workflow
   controller for implementation, audit, and CI sprint loops. It includes its
   own Neovim client as a nested Git submodule.
+- `opencode-project-reload/`
+  (`/data0/matthew/Projects/mkchad/opencode-project-reload`): the standalone
+  OpenCode TUI plugin that safely reloads one project instance.
 
 Treat each child as an independent repository. Run Git operations, tests, and
 formatters from the child repository they apply to, and do not mix unrelated
 changes across children.
+When a change spans `opencode-project-reload/` and this workspace, commit the
+plugin first and update the parent gitlink last.
 
 ## Sprint Documentation
 

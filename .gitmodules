@@ -10,3 +10,6 @@
 [submodule "opencode_sprint_loop"]
 	path = opencode_sprint_loop
 	url = git@github.com:krafczyk/opencode_sprint_loop
+[submodule "opencode-project-reload"]
+	path = opencode-project-reload
+	url = git@github.com:krafczyk/opencode-project-reload.git
