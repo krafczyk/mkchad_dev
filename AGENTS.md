@@ -29,6 +29,26 @@ changes across children.
 When a change spans `opencode-project-reload/` and this workspace, commit the
 plugin first and update the parent gitlink last.
 
+## Build Tool Resolution
+
+This MkChad development workspace has Bun provisioned at
+`/tmp/opencode-mkchad/bun-runtime/node_modules/.bin/bun`. Work in
+`compound-engineering/` must use that executable directly instead of repeatedly
+probing package managers, invoking `npx`, or installing another Bun copy:
+
+```bash
+BUN=/tmp/opencode-mkchad/bun-runtime/node_modules/.bin/bun
+"$BUN" test
+"$BUN" run release:validate
+```
+
+If that provisioned executable is unavailable, check `bun` on `PATH` once. If
+neither exists, report the missing prerequisite rather than downloading tools
+or silently substituting another runtime. `plugin:validate` additionally needs
+the repository-pinned `claude` CLI; an absent `claude` executable is an explicit
+unavailable gate, not a reason to install or float another version during a
+task.
+
 ## Sprint Documentation
 
 Cross-repository sprint plans, specifications, checklists, and sprint-specific
