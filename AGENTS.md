@@ -37,9 +37,9 @@ This MkChad development workspace has Bun provisioned at
 probing package managers, invoking `npx`, or installing another Bun copy:
 
 ```bash
-BUN=/tmp/opencode-mkchad/bun-runtime/node_modules/.bin/bun
-"$BUN" test
-"$BUN" run release:validate
+export PATH="/tmp/opencode-mkchad/bun-runtime/node_modules/.bin:$PATH"
+bun test
+bun run release:validate
 ```
 
 If that provisioned executable is unavailable, check `bun` on `PATH` once. If
