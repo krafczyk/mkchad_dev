@@ -17,3 +17,7 @@
 	path = compound-engineering
 	url = git@github.com:krafczyk/compound-engineering-plugin.git
 	branch = configurable-routing
+[submodule "opencode"]
+	path = opencode
+	url = git@github.com:krafczyk/opencode.git
+	branch = custom-task-view
