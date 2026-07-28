@@ -13,3 +13,7 @@
 [submodule "opencode-project-reload"]
 	path = opencode-project-reload
 	url = git@github.com:krafczyk/opencode-project-reload.git
+[submodule "compound-engineering"]
+	path = compound-engineering
+	url = git@github.com:krafczyk/compound-engineering-plugin.git
+	branch = configurable-routing
