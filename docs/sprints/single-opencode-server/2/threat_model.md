@@ -120,6 +120,9 @@ direct mode and use hardened TLS until the model is reviewed after any trigger.
   procfs evidence.
 - Java 21/keytool, curl, OpenCode, and the selected executables are trusted.
 - SingularityCE/Apptainer uses compatible host network/PID visibility.
+- Supported host launches run inside a current-user, profile-bound
+  SingularityCE/Apptainer instance whose lifetime retains the image mount after
+  a short-lived lifecycle manager or MkChad editor exits.
 - Hostname namespaces shared-home state but is not a credential.
 - A CA-authenticated public TLS endpoint plus exact same-connection backend
   proof is required before managed clients send secrets.
@@ -169,6 +172,11 @@ direct mode and use hardened TLS until the model is reviewed after any trigger.
   listeners, or an unproved backend connection.
 - Bound all locks, TLS handshakes, preflights, parsing, retries, connection
   handlers, pumps, process stops, and recovery attempts.
+- Serialize profile-bound runtime instance creation separately from lifecycle
+  state. Execute both the host lifecycle command and MkChad through that
+  matching instance, reject detached start from an unmarked foreground
+  container, and never translate lifecycle stop into automatic instance
+  termination.
 - Run every wait-for-result lifecycle utility through one argv-only async
   subprocess boundary with protected stdin, bounded output, an event-loop
   deadline, TERM/KILL escalation, reaping, and exactly-once cleanup.
@@ -425,7 +433,8 @@ Residual risk: schema-2/3 launch cuts retain the existing narrow
 authority-transfer window and manual-accounting limitation. Schema-4 removes
 backend-only startup by making the already-persistent proxy the broker, but a
 missing, mismatched, or unreachable broker/control path preserves state and may
-require manual accounting; no new helper or external supervisor is introduced.
+require manual accounting; no new helper or application lifecycle supervisor is
+introduced.
 
 Unsupported procfs, flock, pidfd, Python pidfd APIs, or bounded helper startup
 fails closed and may require manual recovery. No continuously running helper is
@@ -479,6 +488,35 @@ Controls:
 
 Residual risk: broker-dead/backend-live and any unproved identity remain manual
 accounting cases. The design favors a leak over an unsafe signal or cleanup.
+
+### T17: Detached Process Outlives Its Image Mount
+
+Threat: a foreground SingularityCE/Apptainer manager exits after launching the
+detached broker. The broker and backend remain host PIDs, but runtime teardown
+disconnects the squashfuse image root. A later committed stop cannot execute the
+one-shot pidfd helper, leaving public admission closed while the backend remains
+live and lifecycle authority remains `stopping`.
+
+Controls:
+
+- Host lifecycle and MkChad launchers create or reuse a current-user runtime
+  instance before entering the image. Its profile binds runtime, host, active
+  image identity, bootstrap identity, and fixed mount arguments.
+- A private host lock serializes first instance creation. Every payload remains
+  an argv array executed through the exact `instance://` name.
+- Detached `start` inside an ordinary foreground image is refused unless the
+  managed persistent-instance marker is present.
+- Server stop retains the idle runtime instance. Automatic `instance stop`
+  cannot race a new lifecycle caller or substitute for broker quiescence,
+  pidfd-only signaling, receipt gating, and role-death proof.
+- Image/bootstrap rotation creates a distinct profile. Stale instances are not
+  silently reused and may be stopped only by an explicit operator after exact
+  server and caller accounting.
+
+Residual risk: an administrator can kill the instance or its mount process.
+Existing managed roles may then require fail-closed manual accounting. Idle
+profile instances consume bounded runtime resources until explicitly stopped;
+there is no automatic instance garbage collector.
 
 ### T12: Unsafe Scoped Reload
 
@@ -562,6 +600,7 @@ the triggers stated in the deployment-profile section.
 | Lock owner suspended | Kernel fence remains held; contenders cannot reclaim or mutate after lease expiry |
 | Lock owner killed | Kernel releases the fence; lease/pending recovery is bounded and generation-specific |
 | All user processes killed | New MkChad remains lazy; first operation performs bounded recovery |
+| Runtime instance killed | Existing lifecycle evidence blocks or reconciles normally; instance loss authorizes no signal or state removal |
 
 ## Policy Profile Review
 

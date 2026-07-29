@@ -340,6 +340,13 @@ and participating repositories to every agent.
       assets, support tool, or image Neovim.
 - [ ] **S3-WRAP-013** Never silently select another SIF or launch host OpenCode
       outside the active image.
+- [x] **S3-WRAP-014** Route the host lifecycle command and MkChad launcher through
+      a serialized profile-bound SingularityCE/Apptainer instance, with fixture
+      coverage for reuse, concurrent first use, image rotation, literal argv,
+      and machine-output isolation.
+- [x] **S3-WRAP-015** Reject detached start from an unmarked foreground image and
+      retain the idle runtime instance after verified server stop rather than
+      racing another lifecycle caller with automatic instance termination.
 
 ## 13. opencode.nvim and MkChad Adapter
 
@@ -481,6 +488,9 @@ and participating repositories to every agent.
       in recorded evidence.
 - [ ] **S3-REAL-011** Do not close unavailable runtime or browser gates from fake
       wrapper, listener, or TLS fixtures.
+- [ ] **S3-REAL-012** Prove the profile-bound runtime instance remains executable
+      after the start manager and originating editor exit, then completes the
+      existing broker-context pidfd stop without squashfuse disconnection.
 
 ## 18. Documentation and Operations
 
@@ -604,6 +614,30 @@ and participating repositories to every agent.
   update. Final sprint publication/acceptance and final-audit gates remain open;
   **S3-ACCEPT-010**, **S3-ACCEPT-011**, **S3-ACCEPT-013**, and
   **S3-ACCEPT-014** are not closed by this development commit.
+
+### Persistent runtime instance repair (2026-07-29)
+
+- Real SingularityCE diagnosis found that the foreground manager exited and
+  squashfuse teardown disconnected the surviving schema-4 broker's image root.
+  A later broker-context stop could therefore not execute its one-shot Python
+  pidfd helper and preserved the generation in `stopping` with a live backend.
+- The deployment owner approved profile-bound persistent runtime instances as
+  image-mount authority. `container_tools` commit `ddbc14b` adds serialized,
+  bounded, identity-keyed Apptainer/SingularityCE instance execution; it passed
+  creation/reuse, concurrent first use, exact argv, bind/CWD/profile rotation,
+  asset-race, inherited-mount, timeout, lock-inheritance, ShellCheck, bootstrap,
+  and diff checks.
+- `msk_containers` commit `1f0df7b` routes the installed MkChad and standalone
+  lifecycle launchers through the instance contract, rejects detached start
+  from unmarked foreground images, and extends the opt-in real-runtime harness.
+  Wrapper, shell, installer, image-tooling, ShellCheck, and diff checks passed.
+- MkChad commit `4945b29` documents instance lifetime and separate server/runtime
+  cleanup authority. No lifecycle implementation or pidfd signaling contract
+  changed in MkChad.
+- No local SingularityCE or Apptainer executable was available, so
+  **S3-REAL-012** and all existing real-runtime acceptance gates remain open.
+  Fixture results are not claimed as proof that squashfuse remains connected on
+  the target HPC runtime.
 
 ## 19. Acceptance and Closeout
 

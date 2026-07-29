@@ -144,6 +144,33 @@ checks. These rules replace proxy-process-first cleanup and fence-through-signal
 only for committed schema-4 operations. Direct HTTP and schema-2/3 TLS retain
 their existing stop order and exact proof paths.
 
+### 3.2 Approved Persistent Runtime Instance Amendment
+
+Real SingularityCE evidence on 2026-07-29 showed that a detached broker process
+can outlive a foreground `exec` manager while the runtime tears down its
+squashfuse image mount. The surviving broker then has a disconnected image root
+and cannot execute the approved one-shot Python pidfd helper during a later
+stop. The deployment owner approved persistent SingularityCE/Apptainer instances
+as runtime mount authority for supported host launches.
+
+The installed MkChad launcher and standalone lifecycle launcher must create or
+reuse one current-user runtime instance keyed by runtime, host, active image
+identity, bootstrap identity, and fixed bind profile. Instance creation is
+serialized separately from the lifecycle fence. Both launchers execute through
+their matching instance, and an in-image detached `start` is permitted only when
+the managed instance marker is present. This prevents a foreground container
+from publishing a service whose image mount will disappear with its manager.
+
+The instance owns only the container mount lifetime. It is not lifecycle
+authority, a watchdog, a restart policy, or permission to bypass Lua state,
+broker control, process proof, or pidfd signaling. `stop` terminates only the
+verified managed server roles and deliberately retains the idle instance:
+mapping lifecycle success to `instance stop` would race another external or
+in-image caller and could kill a newly started generation or editor. An exact
+idle instance may be stopped only as an explicit operational action after all
+callers and managed roles are accounted for. Image or bootstrap rotation selects
+a new profile rather than silently executing through stale mounts.
+
 ## 4. Meaning of Standalone
 
 For this sprint, standalone means the user can manage the detached server from
@@ -524,6 +551,13 @@ The installed wrapper must:
 - Execute minimal headless Neovim with `-u NONE` and no plugin loading.
 - Forward only documented command arguments.
 - Preserve signals and the lifecycle command's exit status.
+- Create or reuse a profile-bound current-user runtime instance for both the
+  MkChad launcher and host lifecycle command, and execute payloads through its
+  `instance://` URI.
+- Keep instance creation serialized, argv-only, and machine-output safe; reject
+  detached start from an ordinary foreground container.
+- Retain the idle instance after server stop. Never use runtime instance stop as
+  a substitute for verified lifecycle stop or as automatic post-stop cleanup.
 - Keep machine-mode stdout free of wrapper diagnostics.
 - Fail clearly when no active image, supported runtime, MkChad command assets,
   or in-container Neovim is available.
@@ -539,6 +573,8 @@ the following audit focus:
 
 - A short-lived headless manager must not make the detached backend or proxy
   dependent on its lifetime.
+- A supported runtime must retain the image mount through the profile-bound
+  instance after the manager or originating editor exits.
 - External, MkChad, and concurrent mixed callers must converge under the same
   fence and state authority.
 - A host invocation and an in-container invocation must resolve the same config,
@@ -573,6 +609,13 @@ Required failure behavior includes:
 - Missing command or SIF: fail before state mutation.
 - Missing lifecycle assets: fail before lock or process spawn where possible.
 - Manager killed before spawn: no managed process or state is created.
+- Manager killed after creating an idle runtime instance but before lifecycle
+  spawn: no managed role or lifecycle state is created; a later matching caller
+  reuses the same profile instance.
+- Runtime instance loss is not permission to weaken signaling or adopt a
+  detached process from a disconnected mount. A later invocation may establish
+  its current profile but must let existing lifecycle proof block or reconcile
+  the old generation normally.
 - Manager killed after schema-4 launch intent or before activation commit: later
   starts reconcile only matching broker/control evidence or preserve state for
   trusted manual accounting.
@@ -803,7 +846,9 @@ Never delete state or signal a process merely to make rollback appear clean.
 
 Sprint 3 does not add:
 
-- A continuously running supervisor or watchdog.
+- An application-level supervisor or watchdog. The approved idle container
+  runtime instance is only persistent image-mount authority and performs no
+  lifecycle health monitoring or restart.
 - systemd, OpenRC, launchd, or login-session units.
 - Automatic server start at boot or shell login.
 - A Python rewrite of the lifecycle.

@@ -195,6 +195,9 @@ Policy:
 - Verify negative or reused PIDs cannot target unrelated processes or groups.
 - Verify stop escalation remains scoped to the managed process.
 - Verify detached process handles and file descriptors are closed safely.
+- Verify supported host lifecycle and MkChad launches use a profile-bound
+  current-user runtime instance, concurrent first callers create one instance,
+  and foreground containers cannot publish a detached generation.
 - Validate proxy and backend independently by PID start time, boot ID, exact
   executable/argv, role semantics, and owned listener inode.
 - Verify every schema-2/3 TLS stop/recovery path stops proxy first and never
@@ -248,6 +251,9 @@ Policy:
 - Verify CA-pinned HTTPS `/global/health` is authoritative only after complete
   pair ownership/listener validation.
 - Verify all retries and polls are bounded.
+- Verify manager/editor exit leaves the runtime instance and its image mount
+  usable for later broker-context pidfd stop. Verify server stop does not
+  automatically stop the instance or race a new lifecycle caller.
 - Verify server death clears stale connection presentation.
 - Verify next-use recovery after server death.
 - Verify TUI recreation after TUI death or generation change.
@@ -400,6 +406,9 @@ Policy:
 
 - Verify existing mappings and terminal positions.
 - Verify SingularityCE and Apptainer behavior where environments are available.
+- Verify exact active image and bootstrap identities select the runtime instance
+  profile, stale profiles are not silently reused after rotation, and
+  machine-mode stdout contains no instance-management output.
 - Verify mounted npm overrides still take precedence.
 - Verify x86_64 and aarch64 baseline updates.
 - Verify ppc64le remains untouched.
