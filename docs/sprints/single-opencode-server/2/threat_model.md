@@ -2,8 +2,9 @@
 
 ## Scope
 
-This model covers schema-2 compatibility state and schema-3 persistent OpenCode
-service state in `docs/sprints/single-opencode-server/2/sprint_spec.md`:
+This model covers schema-2 compatibility state, schema-3 persistent OpenCode
+service state, and the schema-4 brokered TLS state approved for Sprint 3 in
+`docs/sprints/single-opencode-server/3/sprint_spec.md`:
 
 ```text
 MkChad/Neovim
@@ -112,6 +113,11 @@ direct mode and use hardened TLS until the model is reviewed after any trigger.
   `os.pidfd_open` and `signal.pidfd_send_signal` in every target image.
 - Other unprivileged users cannot modify mode-`0700` state directories or read
   the mode-`0600` server config, state, logs, password, or keystores.
+- A schema-4 TLS proxy remains alive in its original process context while it
+  brokers lifecycle work, can inspect its backend's required procfs evidence,
+  and shares its protected host-specific state root and Unix socket inode with
+  later invocations. A fresh invocation need not be able to dereference that
+  procfs evidence.
 - Java 21/keytool, curl, OpenCode, and the selected executables are trusted.
 - SingularityCE/Apptainer uses compatible host network/PID visibility.
 - Hostname namespaces shared-home state but is not a credential.
@@ -140,12 +146,25 @@ direct mode and use hardened TLS until the model is reviewed after any trigger.
   PID is dead.
 - On every TLS connection, prove the exact reverse ESTABLISHED tuple and inode
   under the immutable expected backend PID before client reads/forwarding.
-- Stop proxy first, then backend; replace both if either identity/health fails.
+- For schema-2/3 TLS, stop the verified proxy first, then the backend; direct
+  mode retains its existing exact backend path. For schema-4 TLS, the persistent
+  proxy is the lifecycle broker: after a fully validated mutating control request
+  commits, it closes public admission, its public acceptor, and every registered
+  relay before broker-context pidfd signaling. It retains the accepted private
+  control connection only for the final receipt.
 - Hold the process-owned kernel fence across logical-lock validation and every
-  shared mutation or signal authorization/dispatch. Lease expiry is diagnostic
-  and cannot bypass a live or suspended fence holder.
+  shared-state mutation or control-path reconciliation. Direct and legacy paths
+  retain the fence-through-signal rule. A schema-4 activation or stop commits
+  once under that fence, then transfers process-lifecycle completion to the
+  broker's single-writer state machine; caller loss cannot cancel it.
 - Open a pidfd before final managed-process identity validation and signal only
   through that pidfd; unsupported/mismatched evidence fails closed.
+- Before any schema-4 authority-bearing socket operation, no-follow validate the
+  state root and control path type, current-user ownership, restrictive mode,
+  and stable device/inode identity. Bind control before launching a backend;
+  accept only bounded, one-request/one-response, generation-matched control
+  exchanges with bounded connections and queued work. The nonce correlates a
+  response and is not authorization.
 - Never send credentials to legacy HTTP, malformed/future state, unknown public
   listeners, or an unproved backend connection.
 - Bound all locks, TLS handshakes, preflights, parsing, retries, connection
@@ -325,8 +344,13 @@ member alive, or kills the direct backend while its state remains.
 Controls:
 
 - TLS reuse requires both exact process identities/listeners, certificate
-  identity, and pinned health. Any TLS member death causes proxy-first cleanup
-  of the surviving verified member and a new pair/generation on next use.
+  identity, and pinned health. Schema-2/3 TLS retains proxy-first cleanup of a
+  surviving verified member. For schema-4 TLS, the four broker/backend liveness
+  outcomes are explicit: live/live is reusable only with matching broker and
+  endpoint proof; broker-live/backend-dead is `unhealthy` and only a locked
+  broker cleanup may recover it; broker-dead/backend-live is blocked for manual
+  operating-system accounting; both-dead is reconciled only under the fence
+  after recorded control-path checks. No outcome adopts an ambiguous role.
 - Direct reuse requires the exact backend identity/listener and HTTP health. A
   dead direct backend is replaced as one new generation without adopting a
   replacement listener.
@@ -336,7 +360,8 @@ Controls:
 - There is no unbounded background watchdog.
 
 Residual risk: repeated selective killing defeats availability; recovery remains
-bounded and user-triggered.
+bounded and user-triggered. Broker-dead/backend-live intentionally requires
+manual accounting rather than a weaker cross-container signal path.
 
 ### T10: PID Reuse, Reboot, Or Forged State
 
@@ -376,9 +401,12 @@ Controls:
   death closes the fd and lets a contender proceed.
 - Use mode-private fsynced atomic writes.
 - Publish a generation-specific launch intent before each backend or proxy
-  spawn. Transfer authority to validated pending metadata only after immutable
-  identity capture, and block every later startup while an unresolved intent
-  remains.
+  spawn. For schema-4 TLS, Lua records intent, starts the persistent proxy as a
+  control-only broker, and publishes pending authority only after a matching
+  receipt proves broker identity, control inode, generation, and backend launch
+  intent; the broker then launches the backend. Starting, control-ready,
+  activating, activation-failed, running, stopping, blocked, and terminated
+  phases have bounded observational or fenced reconciliation outcomes.
 - Record generation-specific pending process identities before final state.
 - Require renewed current lock ownership under the continuously held fence
   before every pending/state write or removal.
@@ -393,15 +421,64 @@ Controls:
   health validation; healthy existing schema-2 TLS state may be reused without
   mutation.
 
-Residual risk: death between process spawn and pending publication can leave a
-short-lived process that the launch intent blocks but cannot authorize the
-lifecycle to signal. Trusted operating-system process accounting and manual
-intent removal are then required. This narrow authority-transfer window cannot
-be made transactional without an external supervisor/process broker.
+Residual risk: schema-2/3 launch cuts retain the existing narrow
+authority-transfer window and manual-accounting limitation. Schema-4 removes
+backend-only startup by making the already-persistent proxy the broker, but a
+missing, mismatched, or unreachable broker/control path preserves state and may
+require manual accounting; no new helper or external supervisor is introduced.
 
 Unsupported procfs, flock, pidfd, Python pidfd APIs, or bounded helper startup
 fails closed and may require manual recovery. No continuously running helper is
 introduced.
+
+### T15: Private Control-Path Replacement, Confusion, Or Exhaustion
+
+Threat: a stale, substituted, symlinked, permissive, wrong-generation, partial,
+malformed, replayed, or overloaded Unix control path causes a caller or broker
+to authorize lifecycle work for another generation.
+
+Controls:
+
+- The control socket is private state-root IPC, not a public TLS or OpenCode
+  route. State-root directories are current-user-owned `0700`; broker-created
+  files and socket are current-user-owned `0600`.
+- Authority requires no-follow type/ownership/mode/device/inode validation of
+  the root and recorded socket, exact generation and protocol matching, and a
+  fresh nonce correlation. A socket pathname, nonce, or successful connect alone
+  is never authority.
+- Each connection carries one strictly framed bounded request and response;
+  duplicate/unknown fields, trailing bytes, invalid UTF-8, partial input,
+  timeout, peer loss, excess connections, and queued-work overload are rejected
+  without mutation.
+- Stale-path reclamation occurs only under the fence after bounded contact and
+  proof that recorded authority is absent. Live or ambiguous paths are preserved.
+
+Residual risk: the cooperative same-user boundary is not cryptographic. Root can
+replace all evidence; ambiguous same-user state remains blocked rather than
+adopted or unlinked.
+
+### T16: Broker Handoff, Crash Cut, Or Lost Stop Receipt
+
+Threat: a caller dies around activation/stop commitment, a broker dies after
+launching a backend, or the final stop receipt is lost, leaving Lua durable state
+behind broker truth.
+
+Controls:
+
+- Lua exclusively owns the fence, lock, shared-state publication/removal, and
+  control-path reconciliation. The broker exclusively owns committed schema-4
+  backend launch, public service, and stop completion.
+- Before commitment, incomplete input and caller loss cause no process mutation.
+  After commitment, activation and stop are idempotent broker transitions; a
+  caller cannot relaunch, signal, or delete state from a missing response.
+- Normal stop closes control acceptance and conditionally unlinks the recorded
+  socket inode only after backend death, returns one matching final receipt over
+  the already accepted connection, then exits. Lost receipts preserve state until
+  a fenced caller proves both recorded roles and the control path absent or
+  safely reconciled.
+
+Residual risk: broker-dead/backend-live and any unproved identity remain manual
+accounting cases. The design favors a leak over an unsafe signal or cleanup.
 
 ### T12: Unsafe Scoped Reload
 
@@ -472,8 +549,12 @@ the triggers stated in the deployment-profile section.
 
 | Event | Expected result |
 | --- | --- |
-| Proxy killed | Next operation stops verified backend and creates one new pair |
-| Backend killed | Existing proxy closes streams; next operation stops proxy first and creates one new pair |
+| Schema-4 broker live, backend live | Reuse only after matching broker evidence and CA-pinned endpoint proof |
+| Schema-4 broker live, backend dead | Status is unhealthy; only a fenced, locked broker cleanup may recover it |
+| Schema-4 broker dead, backend live | Block and preserve for manual operating-system accounting |
+| Schema-4 broker dead, backend dead | Reconcile only under the fence after matching control-path absence or safe reconciliation |
+| Schema-2/3 proxy killed | Next operation stops verified backend and creates one new pair |
+| Schema-2/3 backend killed | Existing proxy closes streams; next operation stops proxy first and creates one new pair |
 | Replacement binds internal before proof | At most fixed preflight; zero client Authorization/body |
 | Replacement binds after expected backend death | Zero bytes because PID/start check fails before connect |
 | TUI killed | Next operation recreates attach with CA, URL, generation, and cwd |
@@ -498,6 +579,10 @@ Audits must prioritize CA/password exposure, public proxy impersonation,
 internal takeover before proof, same-connection violations, reconnects after
 proof, proc tuple ambiguity, process signaling, lock/pending races, legacy HTTP
 credential paths, unbounded handlers/retries, and false healthy diagnostics.
+For schema-4 TLS they must additionally trace T15 and T16 controls to evidence:
+state-root/socket DAC and inode checks, strict bounded control framing/load,
+broker-first launch cuts, the four liveness outcomes, public-quiesce-before-pidfd
+ordering, and receipt/lost-receipt reconciliation.
 They must also exercise every lifecycle utility-child phase for timeout,
 SIGTERM resistance, output overflow, start/nonzero/parse failure, reaping,
 callback failure, fence release, and contender progress.
@@ -513,4 +598,5 @@ recovery, detached-runtime variability, loss of in-memory work, and the explicit
 trusted manual accounting is a fail-safe operational limitation, not accepted
 permission to signal it. Credential
 forwarding before exact proof, reconnecting a client stream to a replacement,
-or probing legacy HTTP with auth are not accepted residual risks.
+probing legacy HTTP with auth, or treating missing schema-4 broker authority as
+permission to signal or remove state are not accepted residual risks.

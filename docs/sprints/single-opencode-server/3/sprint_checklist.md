@@ -186,7 +186,9 @@ and participating repositories to every agent.
 ## 8. State and Schema Compatibility
 
 - [ ] **S3-STATE-001** Make no state-schema change unless the specification,
-      policy, downgrade plan, and tests are revised first.
+      inherited policy, migration/rollback contract, and tests are revised
+      first. Schema-4 is permitted only for new brokered TLS pending/complete
+      metadata; direct HTTP remains schema 3.
 - [ ] **S3-STATE-002** Reuse healthy valid schema-2 state only as TLS mode.
 - [ ] **S3-STATE-003** Reuse healthy valid schema-3 TLS and direct state without
       migration.
@@ -203,6 +205,19 @@ and participating repositories to every agent.
       pending, intent, lock-owner, and diagnostic state.
 - [ ] **S3-STATE-010** Prove prior lifecycle code can interpret a stopped or
       explicitly compatible command-managed state during rollback.
+- [ ] **S3-STATE-011** Record schema-4 broker protocol, exact private control
+      path, and control inode in pending/complete TLS metadata only after
+      matching broker authority is proved.
+- [ ] **S3-STATE-012** Preserve schema-4 bytes as unsupported future state for
+      schema-3 readers: no startup, replacement, signaling, deletion, or byte
+      mutation is permitted.
+- [ ] **S3-STATE-013** Keep Lua as the exclusive kernel-fence, logical-lock,
+      durable-state, and control-path-reconciliation authority; after a
+      committed schema-4 transition, only the broker completes backend launch
+      or stop.
+- [ ] **S3-STATE-014** Treat schema-4 activation failure as terminal for that
+      generation unless exact cleanup proves no backend remains; otherwise
+      preserve blocked state for safe reconciliation or manual accounting.
 
 ## 9. Start and Recovery Behavior
 
@@ -234,6 +249,10 @@ and participating repositories to every agent.
       discoverable generation, not permission to launch a duplicate.
 - [ ] **S3-START-014** Ensure a caller timeout does not automatically stop or
       replace an ambiguously completed shared generation.
+- [ ] **S3-START-015** For new TLS generations, write intent, bind and validate
+      private broker control, verify matching broker/control identity, and only
+      then commit broker-owned backend activation. Malformed, partial,
+      overloaded, mismatched, or lost control exchanges must not mutate state.
 
 ## 10. Observational Status
 
@@ -276,6 +295,23 @@ and participating repositories to every agent.
       is confirmed dead.
 - [ ] **S3-STOP-011** Keep stop and state removal generation-conditional under a
       continuously held kernel fence.
+- [ ] **S3-STOP-012** Preserve schema-2/3 TLS proxy-first cleanup and direct
+      backend-only cleanup; do not apply schema-4 broker authority to either
+      legacy path.
+- [ ] **S3-STOP-013** For a committed schema-4 stop, require the broker to close
+      public admission, its accept loop, and every registered relay and prove
+      quiescence before broker-context pidfd signaling.
+- [ ] **S3-STOP-014** Require a matching final receipt, observed broker death,
+      and fenced absence of the recorded control path before normal schema-4
+      state removal.
+- [ ] **S3-STOP-015** Preserve schema-4 state after a lost receipt, unlink
+      failure, replacement inode, missing broker death, or unproved role until
+      fenced reconciliation proves both recorded roles and control authority
+      absent or safely reconciled.
+- [ ] **S3-STOP-016** Exercise and record the schema-4 broker/backend liveness
+      matrix: live/live reuse only with broker and endpoint proof;
+      broker-live/backend-dead locked cleanup only; broker-dead/backend-live
+      blocked/manual; both-dead fenced control-path reconciliation only.
 
 ## 12. Installed Wrapper and Container Routing
 
@@ -416,6 +452,11 @@ and participating repositories to every agent.
       and repository-specific formatters applicable to changed files.
 - [ ] **S3-TEST-015** Run `git diff --check` in every changed child and the parent
       workspace.
+- [ ] **S3-TEST-016** Run deterministic schema-4 coverage for Java 21 control
+      protocol, broker-first lifecycle/crash cuts, activation failure,
+      control-root DAC/inode checks, bounded control framing/load, public
+      admission/relay quiescence, receipt/lost-receipt cleanup, and selective
+      broker/backend death. Record the exact authoritative rerun separately.
 
 ## 17. Real Runtime and Cross-Client Evidence
 
@@ -467,6 +508,10 @@ and participating repositories to every agent.
       host-native fallback, or automatic browser trust.
 - [ ] **S3-DOC-012** Update package-selection ADR only if a selected package,
        component, version, source, or architecture scope changes.
+- [ ] **S3-DOC-013** Keep documentation and evidence explicit that schema-4 is
+      brokered TLS only; Lua and broker authority are split; direct and legacy
+      paths retain their independent behavior; activation failure and lost
+      receipts preserve state; and rollback never requires unsafe deletion.
 
 ### Development tranche evidence (2026-07-16)
 
@@ -523,6 +568,42 @@ and participating repositories to every agent.
   not supply recordable identifiers, owners, or dispositions for its remaining
   P2 findings, so **S3-ACCEPT-011** remains open. Real SingularityCE,
   Apptainer, and browser evidence remains unclaimed.
+
+### U7 documentation and evidence update (2026-07-29)
+
+- The final deterministic rerun completed against the revisions recorded below.
+  Real-runtime, deployment, browser, architecture, final-audit, and sprint
+  acceptance gates remain open and are not inferred from fixture evidence.
+- The governing schema-4 contract is consistent across this checklist, the
+  Sprint 3 specification, inherited threat model, and inherited audit policy:
+  schema-4 applies only to brokered TLS; Lua owns the fence, durable state, and
+  reconciliation while a committed broker transition owns backend completion;
+  activation failure is terminal unless exact child absence is proved; stop
+  quiesces public admission, accept, and relays before broker-context pidfd
+  signaling; normal cleanup is receipt-gated and lost receipts preserve state;
+  the four selective-death outcomes, migration, and rollback remain fail-closed.
+  Direct HTTP remains schema 3, and schema-2/3 TLS retains its independent
+  exact-proof and cleanup behavior.
+- MkChad revision `4910d13` on branch `mkchad` passed Java 21 compilation and
+  control/proc-table tests; broad Lua lifecycle; broker startup/status/stop;
+  direct and legacy behavior; downgrade; concurrency; kernel fence; disclosure;
+  bounded subprocess; TLS integration; broker-stop integration; formatting;
+  Python syntax; and diff hygiene. Focused concurrency, lifecycle, downgrade,
+  and proc-table gates were repeated after race fixes.
+- `msk_containers` revision `f2956ec` on branch `main` passed shell syntax,
+  ShellCheck, wrapper fixtures, and diff hygiene. Its opt-in runtime harness
+  remained unavailable rather than reporting success.
+- No production `opencode.nvim` change is reported. Its revision is intentionally
+  not recorded as a deployment or compatibility publication claim here.
+- No SingularityCE or Apptainer executable is available. The runtime harness
+  returned exit status `77` for unavailable runtime. Accordingly every real
+  runtime, host/container persistence, browser, architecture, listener, and
+  deployment claim in section 17 remains open; fixture evidence is not runtime
+  evidence.
+- Both child revisions were committed and pushed before this parent gitlink
+  update. Final sprint publication/acceptance and final-audit gates remain open;
+  **S3-ACCEPT-010**, **S3-ACCEPT-011**, **S3-ACCEPT-013**, and
+  **S3-ACCEPT-014** are not closed by this development commit.
 
 ## 19. Acceptance and Closeout
 

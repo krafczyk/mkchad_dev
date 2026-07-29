@@ -197,8 +197,11 @@ Policy:
 - Verify detached process handles and file descriptors are closed safely.
 - Validate proxy and backend independently by PID start time, boot ID, exact
   executable/argv, role semantics, and owned listener inode.
-- Verify every stop/recovery path stops proxy first and never signals a live
-  unverifiable process.
+- Verify every schema-2/3 TLS stop/recovery path stops proxy first and never
+  signals a live unverifiable process. For schema-4 TLS, verify that a
+  complete authorized control request transfers process completion to the
+  persistent proxy broker, which quiesces public admission, accept, and relays
+  before its post-validation pidfd dispatch; direct mode is unchanged.
 - Treat every live schema-1 PID as unverifiable regardless of current path/argv;
   never signal it during migration or explicit stop, and preserve its state with
   actionable trusted manual-accounting guidance.
@@ -231,6 +234,14 @@ Policy:
   progress, stable fd/process counts, and no partial state, pending, or
   certificate publication on timeout, overflow, start/nonzero/parse error, or
   callback exception.
+- Verify Lua retains exclusive fenced shared-state mutation and control-path
+  reconciliation, while only a committed schema-4 broker transition owns backend
+  launch or stop completion. Direct and legacy paths must retain fence-through-
+  signal behavior.
+- Verify broker control load has fixed connection, frame, deadline, and queued
+  work bounds; overload, partial frames, duplicate/unknown fields, trailing
+  bytes, invalid UTF-8, peer loss, nonce/generation mismatch, and retries make
+  no lifecycle mutation and cannot launch or signal twice.
 
 ### Liveness And Recovery
 
@@ -241,8 +252,11 @@ Policy:
 - Verify next-use recovery after server death.
 - Verify TUI recreation after TUI death or generation change.
 - Verify failure does not make ordinary MkChad startup unusable.
-- Verify proxy-only and backend-only death both replace the complete pair while
-  retaining valid CA/public-port identity.
+- Verify schema-2/3 proxy-only and backend-only death retain existing complete-
+  pair recovery. For schema-4, exercise all four broker/backend outcomes:
+  live/live requires broker plus endpoint proof; broker-live/backend-dead is
+  locked broker cleanup only; broker-dead/backend-live is blocked/manual; and
+  both-dead is fenced control-path reconciliation only.
 
 ### State Integrity
 
@@ -265,6 +279,14 @@ Policy:
 - Verify schema 1 is labeled legacy and is never probed or returned as a plugin
   URL; only dead legacy state is removed automatically, live legacy state is
   preserved without signaling, and future state is not overwritten.
+- Verify schema-4 TLS is rejected by current schema-3 readers without byte
+  mutation, replacement, or signaling. Verify schema-4 pending/complete state
+  records broker protocol, generation, control path, and control inode; direct
+  HTTP remains schema 3.
+- Verify every authority-bearing schema-4 root/socket operation uses no-follow
+  type, current-user DAC, restrictive-mode, and stable device/inode checks. A
+  stale path is reclaimed only under the fence after bounded contact and proof
+  of absent recorded authority; live or ambiguous paths remain preserved.
 
 ### TLS, Relay, And Port Safety
 
@@ -293,6 +315,15 @@ Policy:
 - Verify replacement listeners before proof and after backend death receive no
   Authorization/body/client bytes (at most the fixed preflight before proof).
 - Verify unsupported platform evidence fails closed.
+- Verify schema-4 broker startup binds and validates private control before it
+  launches the backend and does not expose public TLS before backend/listener
+  proof. On committed stop, require admission-gate closure, accept-loop exit,
+  and an empty registered-relay set before backend pidfd signaling.
+- Verify normal stop conditionally unlinks the recorded control inode after
+  backend death, sends one matching receipt on the accepted stop connection,
+  exits the broker, and permits caller cleanup only after fenced path-absence
+  proof. Lost receipt, unlink failure, missing broker death, or replacement inode
+  preserves state until both roles and the control path are safely reconciled.
 
 ### Directory Routing
 
@@ -342,6 +373,10 @@ Policy:
   future, missing, certificate-mismatched, or process-invalid state.
 - Verify diagnostics report CA path/certificate identity and proxy/backend
   layers separately without printing key/password content.
+- Verify schema-4 diagnostics distinguish control unavailable, stale/mismatched
+  control state, broker identity loss, backend identity loss, unhealthy,
+  stopping, and blocked/manual outcomes without exposing frames, credentials, or
+  unbounded process data.
 
 ### Client Trust And Secret Transport
 
@@ -371,6 +406,11 @@ Policy:
 - Verify unrelated worktree changes remain untouched.
 - Verify Java source compiles for release 21 and requires no OpenSSL dependency.
 - Verify bounded concurrent TLS clients and concurrent first-use startup.
+- Require evidence for each T15/T16 control in the threat model: private
+  state-root/socket DAC and inode checks, bounded strict control protocol,
+  broker-first crash-cut recovery, broker/backend liveness matrix,
+  public-quiesce-first stop, and receipt/lost-receipt cleanup. Missing evidence
+  is a finding, not a substitute for direct or legacy-path evidence.
 - Verify the MkChad pin includes both opencode.nvim CA support and the `e04b7a7`
   SSE fix before release; a local uncommitted diff is not deployment evidence.
 
@@ -515,6 +555,10 @@ The audit passes when:
 - No secrets or unrelated changes are present in the final diffs.
 - The implementation still fails safely when one or more process-chain members
   are killed.
+- Schema-4 evidence covers broker-first startup, control-path authority, every
+  broker/backend liveness combination, public-quiesce-before-pidfd ordering, and
+  receipt-gated or lost-receipt state reconciliation; direct HTTP and schema-2/3
+  TLS retain their existing independent proof evidence.
 - CA-authenticated TLS, protected client configuration, fixed preflight, exact
   tuple/inode/PID-start/boot proof, and no-reconnect behavior have repeatable
   evidence.

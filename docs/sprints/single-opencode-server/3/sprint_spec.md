@@ -82,12 +82,67 @@ The following decisions were approved on 2026-07-16:
    performs the existing bounded cleanup and startup flow.
 6. Keep server startup separate from attached TUI creation.
 7. Use a stable bounded JSON interface for MkChad integration.
-8. Preserve all existing config paths, state paths, schemas, transport modes,
-   and safe downgrade behavior.
+8. Preserve all existing config paths, transport modes, and safe downgrade
+   behavior. Schema-4 is approved only for brokered TLS generations; direct HTTP
+   remains schema 3 and schema-2/3 TLS remains its existing exact-proof path.
 9. Keep the lifecycle implementation in MkChad and the host/container launcher
    integration in `msk_containers`.
 10. Make no production opencode.nvim change unless focused integration tests
     identify a missing lifecycle-hook behavior.
+
+### 3.1 Approved Schema-4 TLS Lifecycle Amendment
+
+The existing persistent Java TLS proxy is approved to become the private
+lifecycle broker for every new schema-4 TLS generation. This adds no helper,
+host-native verifier, watchdog, or public lifecycle endpoint. Lua retains the
+kernel fence, logical lock, durable shared-state publication/removal, and
+control-path reconciliation. The broker retains process-context authority and,
+after a complete authorized `activate` or `stop` request commits, exclusively
+completes backend launch or stop even if the caller exits.
+
+The broker binds and proves one private Unix socket under the protected
+host-specific state root before launching a backend. Root directories are
+current-user-owned `0700`; broker-created socket/files are current-user-owned
+`0600`. Before authority-bearing operations, root and socket identity require
+no-follow type, ownership, mode, and stable device/inode checks. Control uses a
+strict, bounded, one-request/one-response protocol with generation matching;
+the nonce correlates responses and is not authorization. Connections and queued
+work are bounded, and malformed, partial, trailing, duplicate, mismatched,
+timed-out, or overloaded exchanges are non-mutating.
+
+Schema-4 is valid only for `tls-proxy`. It records the broker protocol, exact
+control path, and control inode in pending/complete metadata. Current schema-3
+readers preserve schema-4 metadata as unsupported future state without startup,
+replacement, signaling, or deletion. Existing schema-2/3 TLS may use their
+legacy route only when every current direct proof succeeds; direct HTTP and its
+credential policy are unchanged.
+
+Schema-4 startup is broker-first: Lua writes durable intent, starts a
+control-only broker, verifies matching broker/control evidence, then commits
+broker-owned backend activation. Crash cuts are reconciled only from matching
+intent, broker receipt, and control identity; contact failure or possible live
+unproved authority blocks and preserves. Activation failure is terminal for the
+generation unless exact cleanup proves no backend remains; it never retries or
+adopts a child.
+
+Schema-4 stop is public-quiesce-first. After a complete authorized stop commit,
+the broker closes public admission, its accept loop, and every registered relay,
+proves they are quiesced, then performs existing post-validation pidfd TERM/
+bounded-wait/KILL signaling. It closes control acceptance and conditionally
+unlinks the recorded control inode after backend death, returns one matching
+receipt on the already accepted stop connection, and exits. Lua may remove state
+only after that receipt, observed broker termination, and fenced control-path
+absence. A lost receipt preserves state until a later fenced reconciliation proves
+both recorded roles and the control path absent or safely reconciled.
+
+The schema-4 broker/backend liveness matrix is: live/live is reusable only with
+matching broker evidence and independent CA-pinned endpoint proof;
+broker-live/backend-dead is unhealthy and recoverable only by locked broker
+cleanup; broker-dead/backend-live is blocked for manual operating-system
+accounting; both-dead may be reconciled under the fence after control-path
+checks. These rules replace proxy-process-first cleanup and fence-through-signal
+only for committed schema-4 operations. Direct HTTP and schema-2/3 TLS retain
+their existing stop order and exact proof paths.
 
 ## 4. Meaning of Standalone
 
@@ -170,9 +225,9 @@ shell
      -> active Neovim SIF
         -> nvim --headless -u NONE
            -> standalone lifecycle entrypoint
-              -> reusable lifecycle module
-                 -> detached opencode serve
-                 -> optional detached Java TLS proxy
+               -> reusable lifecycle module
+                  -> detached opencode serve (direct or legacy TLS)
+                  -> persistent Java TLS proxy/broker (schema-4 TLS)
 ```
 
 ### 6.2 MkChad Invocation
@@ -226,8 +281,9 @@ command, or another shell command string.
 4. Refuse mode mismatch, unverifiable live processes, unresolved launch intent,
    unsupported state, or an exact configured-port conflict.
 5. Recover an owned unhealthy generation through the existing bounded cleanup.
-6. Start the backend and optional proxy with unchanged launch-intent and pending
-   authority transfer.
+6. For direct and legacy TLS, retain the existing launch-intent and pending
+   authority transfer. For schema-4 TLS, record intent, establish and validate
+   the control-only broker, then commit broker-owned backend launch.
 7. Publish complete state only after transport-appropriate process, listener,
    certificate, and health validation.
 8. Return only after a complete healthy state is available or the operation has
@@ -255,9 +311,10 @@ and `blocked`. Persistent state alone is never sufficient for `healthy`.
 ### 7.4 Stop
 
 `stop` follows trusted active state rather than requested configuration. It
-preserves Sprint 2 behavior for complete TLS generations, proxy-only death,
-backend-only death, direct generations, already-dead roles, live schema-1 state,
-unverifiable processes, and failed termination.
+preserves Sprint 2 behavior for schema-2/3 TLS generations, direct generations,
+already-dead roles, live schema-1 state, unverifiable processes, and failed
+termination. Schema-4 TLS follows the approved broker liveness matrix and
+public-quiesce-first committed stop contract in section 3.1.
 
 An already inactive managed service is an idempotent success. A live process
 that cannot be proved and signaled through the approved pidfd path is a refusal,
@@ -376,9 +433,12 @@ The extracted module must resolve these paths identically under full MkChad and
 minimal `-u NONE` execution. It must not accidentally use a default `nvim`
 application-name state directory.
 
-No state schema change is planned. Existing valid schema-2 TLS and schema-3 TLS
-or direct generations must remain usable. Existing malformed, future, legacy,
-pending, and launch-intent behavior remains fail-closed.
+Schema-4 is approved only for new brokered TLS pending/complete metadata and
+records broker protocol plus exact private control-path identity. Existing valid
+schema-2 TLS and schema-3 TLS or direct generations remain usable through their
+existing exact-proof behavior. Existing malformed, future, legacy, pending, and
+launch-intent behavior remains fail-closed; schema-3 readers preserve schema-4
+bytes and do not replace or signal named processes.
 
 The standalone command reads configuration in a fresh process. MkChad client
 credentials may still be process-cached, so user documentation must continue to
@@ -494,6 +554,10 @@ the following audit focus:
 - `status` must remain observational even when state is stale or malformed.
 - `stop` must retain pidfd-only signaling and preserve authority when cleanup
   cannot be proved.
+- New schema-4 TLS generations must bind private broker control before backend
+  launch; all control-path DAC/inode, bounded framing/load, crash-cut,
+  activation-failure, liveness-matrix, receipt, and lost-receipt rules in
+  section 3.1 are audit requirements.
 - Direct HTTP remains prohibited and P0-reportable in the hardened TLS profile.
 - No-password local-user access remains subject to the existing explicit
   `SPOS-AUD-P1-004` exception and operational warning.
@@ -509,14 +573,19 @@ Required failure behavior includes:
 - Missing command or SIF: fail before state mutation.
 - Missing lifecycle assets: fail before lock or process spawn where possible.
 - Manager killed before spawn: no managed process or state is created.
-- Manager killed after launch intent: later starts remain blocked until existing
-  trusted accounting or matching pending authority permits recovery.
-- Manager killed after pending publication: the next start performs the existing
-  generation-conditional bounded cleanup.
+- Manager killed after schema-4 launch intent or before activation commit: later
+  starts reconcile only matching broker/control evidence or preserve state for
+  trusted manual accounting.
+- Manager killed after schema-4 activation or stop commit: the broker completes
+  its idempotent transition; later callers reconcile only under the fence and do
+  not relaunch, signal, or remove state from a missing response.
+- Schema-4 activation failure retains private control for status/stop only after
+  exact child absence; uncertain cleanup is blocked and preserved.
 - Manager killed after complete state publication: later callers validate and
   reuse the detached generation.
-- Proxy or backend selective death: the next start performs transport-specific
-  recovery exactly as Sprint 2 specifies.
+- Schema-2/3 proxy or backend selective death: the next start performs existing
+  transport-specific recovery. Schema-4 uses the section 3.1 four-outcome
+  broker/backend matrix; broker-dead/backend-live is manual and blocked.
 - Explicit-port conflict: fail without fallback.
 - Automatic-port race: retain bounded fallback and persistence behavior.
 - Mode mismatch: refuse automatic transport change and direct the user to stop,
@@ -537,6 +606,9 @@ Required failure behavior includes:
 - Loading MkChad remains lazy and starts no server.
 - `status` and `:OpenCodeInfo` remain observational.
 - Existing schema-2 and schema-3 fixtures require no migration.
+- Schema-4 tests cover broker-first intent/control/activation crash cuts,
+  terminal activation failure, strict bounded control frames and aggregate load,
+  state-root/control DAC and inode replacement, and preservation on ambiguity.
 
 ### 14.2 Command Contract
 
@@ -559,6 +631,9 @@ Required failure behavior includes:
 - External status reports fresh health and performs no mutation.
 - External stop terminates only verified managed roles and removes state only
   after confirmed death.
+- Schema-4 stop proves public admission, accept-loop, and relay quiescence before
+  broker-context pidfd signaling; matching receipt, broker death, and fenced
+  control-path absence gate normal state removal, while lost receipts preserve.
 - Direct and TLS modes both work through the command.
 - Configured and automatic port behavior remains unchanged.
 - Existing and changed runtime version diagnostics remain accurate.
@@ -637,8 +712,9 @@ Sprint 3 is accepted when:
 2. The command works from a host shell through the active SIF and from MkChad
    without nested container launch.
 3. `status` is observational and reports fresh validated lifecycle truth.
-4. `stop` retains exact process authority, proxy-first TLS cleanup, direct-mode
-   cleanup, pidfd-only signaling, and fail-closed state preservation.
+4. `stop` retains exact process authority, direct and legacy TLS cleanup,
+   schema-4 public-quiesce-first broker cleanup, pidfd-only signaling, and
+   fail-closed state preservation.
 5. The command preserves all Sprint 2 transport, config, state, fence, process,
    credential, certificate, and recovery requirements.
 6. JSON mode is bounded, versioned, deterministic, and contains no credentials
@@ -683,7 +759,9 @@ The sprint review must demonstrate:
 9. Demonstrate pinned HTTPS REST/SSE in TLS mode and HTTP/no-CA behavior in an
    isolated direct-mode run.
 10. Demonstrate concurrent shell and MkChad startup convergence.
-11. Kill one managed role and demonstrate the documented next-start recovery.
+11. Kill each schema-4 broker/backend liveness combination and demonstrate its
+    documented reuse, locked cleanup, blocked/manual, or fenced reconciliation
+    outcome; retain existing selective-death evidence for direct and legacy TLS.
 12. Run external stop and prove only verified managed roles terminate and state
     is removed after confirmed death.
 13. Run the complete relevant automated suite and `git diff --check` in every
@@ -710,6 +788,8 @@ command references missing lifecycle assets.
 No state-schema downgrade is planned. Before rollback:
 
 1. Use the current command to stop any verified active generation when feasible.
+   For schema-4, require its matching final receipt, broker death, and fenced
+   control-path absence, or preserve state for later safe reconciliation.
 2. Confirm complete state, pending state, and launch intent are absent, or retain
    them for the older compatible lifecycle only when exact compatibility has
    been tested.
