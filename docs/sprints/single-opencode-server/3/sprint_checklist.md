@@ -634,10 +634,26 @@ and participating repositories to every agent.
 - MkChad commit `4945b29` documents instance lifetime and separate server/runtime
   cleanup authority. No lifecycle implementation or pidfd signaling contract
   changed in MkChad.
-- No local SingularityCE or Apptainer executable was available, so
-  **S3-REAL-012** and all existing real-runtime acceptance gates remain open.
-  Fixture results are not claimed as proof that squashfuse remains connected on
-  the target HPC runtime.
+- The first target-host harness run exposed a test-only marker mismatch:
+  `msk_containers` commit `44b0b0a` now resumes the Java pidfd hook with its
+  exact `.resume` marker. The next run completed broker-context pidfd stop, then
+  exposed that explicit schema-4 `stop` did not invoke the existing fenced
+  exact-inode control reconciliation after both recorded roles died. MkChad
+  commit `14884a9` closes that gap while preserving broker-dead/backend-live as
+  blocked and adds focused lifecycle coverage.
+- The corrected harness passed on `schumann` with SingularityCE
+  `v3.10.0.r115.ge4932a5d3`, x86_64, image SHA-256
+  `26873209f4909efb1cfb781680fa16992fa90e6ef8a5b67bd5104ee33f7923d3`,
+  Java and Python available, tmpfs state, and Yama `ptrace_scope=1`. Separate
+  host calls reused one generation and control inode after manager exit,
+  reproduced protected-procfs denial, completed public-quiesce-first
+  broker-context pidfd stop, removed state only after the terminal receipt, and
+  retained the instance after server stop. The full broker/backend death matrix
+  also passed.
+- **S3-REAL-012** remains open because this run did not separately launch and
+  exit an originating editor. Apptainer and the other existing real-runtime,
+  browser, architecture, and acceptance gates also remain open; no fixture or
+  SingularityCE-only result is claimed for them.
 
 ## 19. Acceptance and Closeout
 
