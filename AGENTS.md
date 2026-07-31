@@ -1,129 +1,120 @@
 # MkChad Development Workspace
 
-## Purpose
+## Environment
 
-This repository is the parent development workspace for MkChad and its related
-OpenCode tooling. Its child repositories are Git submodules. Before changing a
-child repository, read and follow the nearest `AGENTS.md` and any authoritative
-documents it identifies.
+This is the MkChad development environment on host `schumann`. Its workspace
+root is `/data0/matthew/Projects/mkchad`, development short name is
+`mkchad-v1`, and its disposable build and temporary-file root is
+`/tmp/mkchad-v1`.
+
+This repository coordinates independent child repositories. Read the nearest
+child `AGENTS.md` before changing a child. Implement cross-repository work
+serially, and run no more than one resource-intensive build or test suite at a
+time. Child-specific tools, tests, and formatting commands belong in the child
+repository that they apply to.
 
 ## Child Repositories
 
-- `mkchad/` (`/data0/matthew/Projects/mkchad/mkchad`): the MkChad NvChad-based
-  Neovim configuration.
-- `msk_containers/` (`/data0/matthew/Projects/mkchad/msk_containers`): container
-  images, launch scripts, and runtime integration used by MkChad.
-- `opencode.nvim/` (`/data0/matthew/Projects/mkchad/opencode.nvim`): the Neovim
-  plugin that connects the editor to an OpenCode server.
-- `opencode_sprint_loop/`
-  (`/data0/matthew/Projects/mkchad/opencode_sprint_loop`): the Python workflow
-  controller for implementation, audit, and CI sprint loops. It includes its
-  own Neovim client as a nested Git submodule.
-- `opencode-project-reload/`
-  (`/data0/matthew/Projects/mkchad/opencode-project-reload`): the standalone
-  OpenCode TUI plugin that safely reloads one project instance.
+- `mkchad/`: active MkChad NvChad-based Neovim configuration.
+- `msk_containers/`: active container images, launch scripts, and runtime
+  integration.
+- `msk_containers/container_tools/`: active reusable container execution and
+  persistent-instance helpers.
+- `opencode.nvim/`: active Neovim plugin connecting the editor to an OpenCode
+  server.
+- `opencode/`: active OpenCode fork for MkChad-specific TUI integration.
+- `opencode_sprint_loop/`: frozen historical reference for the former Python
+  controller.
+- `opencode_sprint_loop/opencode_sprint_loop.lua/`: frozen historical Neovim
+  client for that controller.
+- `opencode-project-reload/`: active standalone OpenCode TUI plugin that
+  safely reloads one project instance.
+- `compound-engineering/`: active Compound Engineering fork for cross-harness
+  persona routing and shared global settings.
 
-Treat each child as an independent repository. Run Git operations, tests, and
-formatters from the child repository they apply to, and do not mix unrelated
-changes across children.
-When a change spans `opencode-project-reload/` and this workspace, commit the
-plugin first and update the parent gitlink last.
+## Cross-Repository Ownership
 
-## Build Tool Resolution
+Each child has independent Git history. The coordinating Compound Engineering
+agent owns cross-repository integration, authoritative verification, and the
+combined change boundary. Complete and verify each changed child before its
+parent records the updated gitlink; do not mix unrelated child changes.
 
-This MkChad development workspace has Bun provisioned at
-`/tmp/opencode-mkchad/bun-runtime/node_modules/.bin/bun`. Work in
-`compound-engineering/` must use that executable directly instead of repeatedly
-probing package managers, invoking `npx`, or installing another Bun copy:
+## Tooling And Verification
+
+Work in `compound-engineering/`, `opencode/`, and `opencode-project-reload/`
+must use the provisioned Bun executable directly:
 
 ```bash
-export PATH="/tmp/opencode-mkchad/bun-runtime/node_modules/.bin:$PATH"
+export PATH="/tmp/mkchad-v1/tools/bun-runtime/node_modules/.bin:$PATH"
 bun test
 bun run release:validate
 ```
 
-If that provisioned executable is unavailable, check `bun` on `PATH` once. If
-neither exists, report the missing prerequisite rather than downloading tools
-or silently substituting another runtime. `plugin:validate` additionally needs
-the repository-pinned `claude` CLI; an absent `claude` executable is an explicit
-unavailable gate, not a reason to install or float another version during a
-task.
+If that executable is unavailable, check `bun` on `PATH` once. If neither is
+available, report the missing prerequisite rather than downloading or
+substituting a runtime. `plugin:validate` also requires the repository-pinned
+`claude` CLI; its absence is an unavailable verification gate.
 
-## Sprint Documentation
+Use task-specific directories beneath `/tmp/mkchad-v1`. Repository instructions
+define focused verification and any required local toolchain details.
 
-Cross-repository sprint plans, specifications, checklists, and sprint-specific
-policies live under `docs/sprints/<sprint-name>/`. Each series keeps its plan at
-the series root and its sprint artifacts in numbered subdirectories. Durable
-product and repository documentation remains in the child repository it
-describes.
+## Protected Live Paths
 
-## Sprint Selection
+Treat `~/.config/mkchad`, `~/.local/state/mkchad`,
+`~/.local/share/mkchad`, and `~/.cache/mkchad` as live user state. They are
+read-only unless the user explicitly authorizes a live-state change for the
+current task. Do not use them as a fallback when an isolated checkout or test
+fixture fails.
 
-This parent repository is the coordination root for development sprints. A
-current sprint is selected for one task or sprint-loop invocation; it is not a
-repository-wide singleton and must not be inferred from directory order,
-numeric order, modification time, or unchecked checklist rows.
+Do not inspect, expose, stage, or commit user credentials or session data,
+including `~/.config/openai.token`, SSH material, provider tokens, and
+OpenCode session data outside the task's explicit scope.
 
-Resolve sprint work in this order:
+## Environment Threat Model
 
-1. Use an explicit selector or narrower sprint scope supplied by the user.
-2. Otherwise use a default declared by this file only when exactly one default
-   is present.
-3. If no default exists and more than one active sprint is listed, ask the user
-   to select one before starting sprint implementation or audit work.
+Protected assets are user work in every checkout, child Git history and
+gitlinks, live MkChad configuration and runtime state, provider and server
+credentials, prompts and session data, process identity, and reproducible build
+artifacts. The user, explicitly invoked local development tools, and cooperative
+same-user processes are trusted. Other agents may edit the shared worktree
+concurrently. Other local users, package registries, GitHub, OpenCode servers,
+downloaded artifacts, and data returned by external services are untrusted.
 
-Resolve a selector to the exact plan, specification, checklist, policy, and
-participating repositories listed below. Keep that resolution fixed for the
-invocation and pass it to every Builder, Auditor, CI Fixer, and closeout agent.
-Normal Build, Plan, documentation, and review requests do not require a sprint
-selection unless the user makes sprint scope relevant.
+Trust boundaries exist between child repositories, isolated checkouts and live
+user paths, containers and the host, local tools and external services, and
+managed clients and loopback services. Loopback is host-wide rather than
+user-private. TLS authenticates a server but does not authorize clients; a
+strong user-supplied OpenCode password remains necessary on a multi-user host.
+Direct HTTP is acceptable only under an explicit trusted-host profile that
+accepts same-host plaintext and endpoint-replacement capability.
 
-### Active Sprints
+In scope are accidental wrong-repository edits, concurrent worktree changes,
+dirty or incorrect gitlinks, credential disclosure, malformed external input,
+dependency or network failure, process death and PID reuse, stale runtime state,
+port and startup races, bounded recovery, and unsafe cleanup or signaling.
+Privileged host compromise, malicious administrators, deliberate repository or
+filesystem forgery, and denial of service by an administrator are out of scope;
+stop and ask the user if evidence suggests them.
 
-#### `controller-v1/3`
+## Environment Audit Calibration
 
-- Plan: `docs/sprints/controller-v1/sprint_plan.md`
-- Specification: `docs/sprints/controller-v1/3/sprint_spec.md`
-- Checklist: `docs/sprints/controller-v1/3/sprint_checklist.md`
-- Durable controller specification and policies:
-  `opencode_sprint_loop/docs/v1_final_software_specification.md`,
-  `opencode_sprint_loop/docs/threat_model.md`, and
-  `opencode_sprint_loop/docs/audit_policy.md`
-- Participating repositories: `opencode_sprint_loop/` and, when plugin work is
-  in scope, `opencode_sprint_loop/opencode_sprint_loop.lua/`
-- Commit order: nested plugin first, controller second, parent workspace last
+Assess findings against the environment threat model and distinguish impact,
+likelihood, confidence, priority, evidence, and disposition. P0 and P1 findings
+block completion by default. P2 and P3 findings are non-blocking unless the user
+promotes them. Record accepted or deferred findings honestly, and state the
+verification needed for any unresolved finding.
 
-#### `single-opencode-server/2`
+Treat signaling an unrelated process, exposing credentials or private session
+data, corrupting unrelated user work, connecting managed clients to an
+untrusted endpoint, or using direct HTTP under the hardened multi-user profile
+as P0. Treat realistic persistent availability failures, duplicate managed
+services, stale-state adoption, cross-project routing, insecure state
+permissions, and unbounded recovery as at least P1. Root-only capabilities do
+not raise application findings by themselves.
 
-- Plan: `docs/sprints/single-opencode-server/sprint_plan.md`
-- Specification: `docs/sprints/single-opencode-server/2/sprint_spec.md`
-- Checklist: `docs/sprints/single-opencode-server/2/sprint_checklist.md`
-- Sprint policies: `docs/sprints/single-opencode-server/2/threat_model.md` and
-  `docs/sprints/single-opencode-server/2/audit_policy.md`
-- Participating repositories: `mkchad/`, `msk_containers/`, and
-  `opencode.nvim/`
-- Commit order: each changed child before the parent workspace
-
-#### `single-opencode-server/3`
-
-- Plan: `docs/sprints/single-opencode-server/sprint_plan.md`
-- Specification: `docs/sprints/single-opencode-server/3/sprint_spec.md`
-- Checklist: `docs/sprints/single-opencode-server/3/sprint_checklist.md`
-- Inherited policies: `docs/sprints/single-opencode-server/2/threat_model.md` and
-  `docs/sprints/single-opencode-server/2/audit_policy.md`
-- Participating repositories: `mkchad/`, `msk_containers/`, and
-  `opencode.nvim/` when focused compatibility tests require plugin work
-- Commit order: each changed child before the parent workspace
-
-All three selectors are active, so this workspace has no default sprint. Sprint
-1 of `single-opencode-server` is archived historical evidence and is never
-selected from its unchecked gates. Select Sprint 2 or Sprint 3 explicitly; their
-shared series and repositories do not make either one implicit. Run at most one
-sprint loop in this coordination worktree at a time.
-
-## Temporary Files
-
-Anything requiring a temporary directory must use a task-specific directory in
-the tree rooted at `/tmp/opencode-mkchad`, such as
-`/tmp/opencode-mkchad/<purpose>`. Do not create temporary directories directly
-under `/tmp`, under `/var/tmp`, or by using an unscoped `mktemp` default.
+No-password loopback deployments remain accessible to other local users. This
+is an accepted residual only for an explicitly trusted deployment; use a strong
+password before first use on a multi-user host and reevaluate before any
+non-loopback exposure or authentication change. Audits of lifecycle behavior
+must cover selective process death, PID reuse, malformed and future state,
+concurrent startup, credential transport, bounded subprocesses, and recovery.
