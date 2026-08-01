@@ -62,6 +62,7 @@ MSK_ACTION_CONTRACT = [
     {"id": "image-install", "path": "nvim/bin/install_nvim_container", "args": ["--source-revision", {"token": "component_revision"}, {"token": "staged_image"}]},
 ]
 LEGACY_MKCHAD_REVISION = "e91cbc39224d0637d9da59e1500cce6a355191c2"
+FORBIDDEN_AUTHORITY_ALIASES = {"trust", "signer", "signature", "fingerprint", "verified_release"}
 
 
 class DeploymentError(RuntimeError):
@@ -868,12 +869,13 @@ def snapshot_image(source: pathlib.Path, staging_root: pathlib.Path, expected_di
 def _digest(path: pathlib.Path) -> str:
     digest = hashlib.sha256()
     try:
+        before = os.lstat(path)
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     except OSError as exc:
         raise DeploymentError(f"cannot digest unsafe file: {path}") from exc
     try:
         entry = os.fstat(fd)
-        if not stat.S_ISREG(entry.st_mode):
+        if (before.st_dev, before.st_ino) != (entry.st_dev, entry.st_ino) or not stat.S_ISREG(entry.st_mode):
             raise DeploymentError(f"cannot digest non-regular file: {path}")
         while True:
             block = os.read(fd, 1024 * 1024)
@@ -882,6 +884,9 @@ def _digest(path: pathlib.Path) -> str:
             digest.update(block)
     finally:
         os.close(fd)
+    final = os.lstat(path)
+    if (before.st_dev, before.st_ino, before.st_size) != (final.st_dev, final.st_ino, final.st_size):
+        raise DeploymentError(f"file changed while digesting: {path}")
     return digest.hexdigest()
 
 
@@ -913,6 +918,17 @@ def verify_installed_image(home: pathlib.Path, expected_digest: str) -> pathlib.
 def load_recovery_record(state_root: pathlib.Path, deployment_id: str) -> dict:
     """Open the canonical state-bound failed or in-progress deployment record.
 
+    Args:
+        state_root: Validated private deployment state directory.
+        deployment_id: UUID selecting one canonical record filename.
+
+    Returns:
+        Parsed schema-1 failed or in-progress deployment record.
+
+    Raises:
+        DeploymentError: If identity, schema, state, path binding, or authority
+            fields are unsafe. The function does not delete or rewrite evidence.
+
     ``deployment_id`` is the only caller-controlled selector.  The function
     rejects copied/moved records by binding the stored state root and filename to
     the validated state directory; it does not delete evidence.
@@ -924,6 +940,8 @@ def load_recovery_record(state_root: pathlib.Path, deployment_id: str) -> dict:
     record = load_json(path, "deployment record")
     if any(key.startswith("cgroup") for key in record):
         raise DeploymentError("legacy cgroup deployment record requires recovery with the prior implementation")
+    if FORBIDDEN_AUTHORITY_ALIASES & set(record):
+        raise DeploymentError("deployment record contains obsolete release-authority fields")
     if record.get("schema") != SCHEMA:
         raise DeploymentError("unsupported deployment record schema")
     if record.get("id") != deployment_id or record.get("deployer") != DEPLOYER_ID:
@@ -1311,20 +1329,80 @@ class DeploymentJournal:
         self.id = deployment_id or str(uuid.uuid4())
         self.bundle = state_root / (self.id + ".bundle")
         self.bundle.mkdir(mode=0o700)
-        self.record = {"schema": SCHEMA, "id": self.id, "deployer": DEPLOYER_ID, "state": "in_progress", "phase": "journal", "final_mutation_started": False, "state_root": str(state_root), "verified_release": verified_release, "recovery_bundle": self.bundle.name, "resources": resources, "bundle_digests": {}, "process_cleanup": {"machine_observed": False, "operator_asserted": False}}
+        self.record = {"schema": SCHEMA, "id": self.id, "deployer": DEPLOYER_ID, "state": "in_progress", "phase": "journal", "final_mutation_started": False, "state_root": str(state_root), "authority": _closed_authority(verified_release), "recovery_bundle": self.bundle.name, "resources": resources, "bundle_digests": {}, "process_cleanup": {"machine_observed": False, "operator_asserted": False}}
         self.path = state_root / (self.id + ".json")
 
     def retain(self, name: str, source: pathlib.Path):
-        """Copy one authenticated input into the private recovery bundle."""
+        """Copy and digest one safe source into the private recovery bundle.
+
+        Args:
+            name: New basename beneath this deployment's bundle.
+            source: Current-user-owned regular source without group/world write.
+
+        Raises:
+            DeploymentError: If identity changes, the target exists, or a full
+                durable mode-``0600`` copy cannot be made.
+
+        Side effects:
+            Adds the copied file and its SHA-256 to the in-memory journal.
+        """
         if not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
             raise DeploymentError("invalid recovery bundle name")
         target = self.bundle / name
-        shutil.copyfile(source, target, follow_symlinks=False)
-        os.chmod(target, 0o600)
-        with open(target, "rb") as handle:
-            os.fsync(handle.fileno())
+        before = _regular_owned(source)
+        if before.st_mode & 0o022:
+            raise DeploymentError(f"unsafe retained source: {source}")
+        source_fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
+        target_fd = None
+        target_created = False
+        try:
+            opened = os.fstat(source_fd)
+            if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
+                raise DeploymentError("retained source changed before open")
+            target_fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            target_created = True
+            os.fchmod(target_fd, 0o600)
+            while True:
+                block = os.read(source_fd, 1024 * 1024)
+                if not block:
+                    break
+                view = memoryview(block)
+                while view:
+                    view = view[os.write(target_fd, view):]
+            os.fsync(target_fd)
+            after = os.fstat(source_fd)
+            final = os.lstat(source)
+            if (opened.st_dev, opened.st_ino, opened.st_size) != (after.st_dev, after.st_ino, after.st_size) or (opened.st_dev, opened.st_ino) != (final.st_dev, final.st_ino):
+                raise DeploymentError("retained source changed while copying")
+        except FileExistsError as exc:
+            if target_created:
+                target.unlink(missing_ok=True)
+            raise DeploymentError("recovery bundle target collision") from exc
+        except Exception:
+            if target_created:
+                target.unlink(missing_ok=True)
+            raise
+        finally:
+            os.close(source_fd)
+            if target_fd is not None:
+                os.close(target_fd)
         self.record["bundle_digests"][name] = _digest(target)
         fsync_directory(self.bundle)
+
+    def discard_unpublished(self):
+        """Remove a provisional bundle before its journal becomes visible.
+
+        Raises:
+            DeploymentError: If a journal path already exists.
+
+        Side effects:
+            Deletes only this deployment's unpublished private bundle and
+            flushes the state directory.
+        """
+        if self.path.exists() or self.path.is_symlink():
+            raise DeploymentError("cannot discard a published deployment journal")
+        shutil.rmtree(self.bundle)
+        fsync_directory(self.state_root)
 
     def register_retained(self, name: str):
         """Authenticate a private file generated directly in the recovery bundle."""
@@ -1885,23 +1963,75 @@ def classify_recovery_resources(resources: list[dict], components: dict, authori
             raise DeploymentError("unknown recovery resource")
 
 
-def _verified_evidence(path: pathlib.Path, repo: pathlib.Path) -> dict:
+def _closed_authority(value: object) -> dict:
+    """Validate schema-1's closed discriminated release-authority object."""
+    if not isinstance(value, dict) or not isinstance(value.get("kind"), str):
+        raise DeploymentError("release authority is malformed")
+    if value["kind"] == "annotated-tag-plus-sha":
+        if set(value) != {"kind", "tag", "tag_object", "parent_commit"}:
+            raise DeploymentError("annotated release authority has unknown or missing fields")
+        if not isinstance(value["tag"], str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", value["tag"]) or value["tag"].startswith("-") or ".." in value["tag"]:
+            raise DeploymentError("annotated release authority has an invalid tag")
+        if not SHA1.fullmatch(value["tag_object"]) or not SHA1.fullmatch(value["parent_commit"]):
+            raise DeploymentError("annotated release authority has invalid object IDs")
+    elif value["kind"] == "development-sha":
+        if set(value) != {"kind", "parent_commit"} or not SHA1.fullmatch(value["parent_commit"]):
+            raise DeploymentError("development release authority has unknown or invalid fields")
+    else:
+        raise DeploymentError("release authority kind is unsupported")
+    return value
+
+
+def _bootstrap_evidence(path: pathlib.Path, parent_bundle: pathlib.Path) -> dict:
+    """Safely load bootstrap evidence and bind it to exact private bundle bytes."""
     evidence = load_json(path, "bootstrap verification record")
-    if evidence.get("schema") != SCHEMA or evidence.get("deployer") != DEPLOYER_ID:
+    if not isinstance(evidence, dict) or set(evidence) != {"schema", "deployer", "authority", "parent_bundle_sha256"} or evidence.get("schema") != SCHEMA or evidence.get("deployer") != DEPLOYER_ID or not SHA256.fullmatch(evidence.get("parent_bundle_sha256", "")):
         raise DeploymentError("invalid bootstrap verification evidence")
-    if evidence.get("trust") not in {"ssh-signed-tag", "development-sha"} or not SHA1.fullmatch(evidence.get("parent_commit", "")):
-        raise DeploymentError("bootstrap evidence is incomplete")
+    _regular_owned(parent_bundle, 0o600)
+    if _digest(parent_bundle) != evidence["parent_bundle_sha256"]:
+        raise DeploymentError("parent bundle digest does not match bootstrap evidence")
+    return _closed_authority(evidence["authority"])
+
+
+def _verify_authority_bundle(authority: dict, parent_bundle: pathlib.Path):
+    """Prove the retained parent bundle contains exactly the closed authority."""
+    temporary = pathlib.Path(tempfile.mkdtemp(prefix="mkchad-authority-bundle-"))
+    try:
+        repository = temporary / "parent.git"
+        run_git(["clone", "--mirror", str(parent_bundle), str(repository)])
+        if authority["kind"] == "annotated-tag-plus-sha":
+            if run_git(["cat-file", "-t", authority["tag_object"]], repository).stdout.strip() != "tag":
+                raise DeploymentError("parent bundle lacks the annotated release tag object")
+            if run_git(["rev-parse", authority["tag_object"] + "^{commit}"], repository).stdout.strip() != authority["parent_commit"]:
+                raise DeploymentError("parent bundle annotated tag does not match release authority")
+        elif run_git(["cat-file", "-e", authority["parent_commit"] + "^{commit}"], repository, check=False).returncode:
+            raise DeploymentError("parent bundle lacks the development parent commit")
+    finally:
+        shutil.rmtree(temporary, ignore_errors=True)
+
+
+def _verify_deployer_blob(repo: pathlib.Path, parent_commit: str, candidate: pathlib.Path):
+    """Require deployment-engine bytes to match the selected parent tree."""
+    expected_blob = run_git(["rev-parse", parent_commit + ":deploy/mkchad_deploy.py"], repo).stdout.strip()
+    actual_blob = run_git(["hash-object", "--no-filters", str(candidate)], repo).stdout.strip()
+    if actual_blob != expected_blob:
+        raise DeploymentError("deployment engine bytes do not match release authority")
+
+
+def _verified_evidence(path: pathlib.Path, parent_bundle: pathlib.Path, repo: pathlib.Path) -> dict:
+    """Validate evidence, parent bundle, and candidate HEAD before deployment."""
+    authority = _bootstrap_evidence(path, parent_bundle)
+    _verify_authority_bundle(authority, parent_bundle)
     head = run_git(["rev-parse", "HEAD"], repo).stdout.strip()
-    if evidence.get("checkout_commit") != head or evidence["parent_commit"] != head:
+    if head != authority["parent_commit"]:
         raise DeploymentError("candidate checkout is not bound to bootstrap evidence")
     candidate = pathlib.Path(__file__).resolve()
-    try:
-        candidate.relative_to(repo.resolve())
-    except ValueError as exc:
-        raise DeploymentError("deployment engine is outside the verified checkout") from exc
-    if not SHA256.fullmatch(evidence.get("candidate_sha256", "")) or _digest(candidate) != evidence["candidate_sha256"]:
-        raise DeploymentError("deployment engine digest is not bound to bootstrap evidence")
-    return evidence
+    expected_candidate = (repo / "deploy" / "mkchad_deploy.py").resolve()
+    if candidate != expected_candidate:
+        raise DeploymentError("deployment engine is outside the verified checkout")
+    _regular_owned(candidate)
+    _verify_deployer_blob(repo, authority["parent_commit"], candidate)
+    return authority
 
 
 def _roots() -> dict[str, pathlib.Path]:
@@ -1909,17 +2039,31 @@ def _roots() -> dict[str, pathlib.Path]:
     return {"home": home, "xdg_config_home": pathlib.Path(os.environ.get("XDG_CONFIG_HOME", home / ".config")), "xdg_data_home": pathlib.Path(os.environ.get("XDG_DATA_HOME", home / ".local/share")), "xdg_state_home": pathlib.Path(os.environ.get("XDG_STATE_HOME", home / ".local/state"))}
 
 
-def deploy(repo: pathlib.Path, verified_release: pathlib.Path, image: pathlib.Path, state_root: pathlib.Path | None = None, maintenance_quiesced: bool = False) -> dict:
-    """Deploy a bootstrap-authenticated release and return its public receipt.
+def deploy(repo: pathlib.Path, verified_release: pathlib.Path, verified_parent_bundle: pathlib.Path, image: pathlib.Path, state_root: pathlib.Path | None = None, maintenance_quiesced: bool = False) -> dict:
+    """Deploy a bootstrap-authorized release and return its public receipt.
 
-    The function stages Git objects and image bytes before final-path mutation,
-    holds a per-user lock, journals each component mutation, and leaves services
-    untouched.  It raises ``DeploymentError`` on any unavailable supervision,
-    unsafe path, local work, or action failure; catchable post-journal errors are
-    retained as failed records for explicit recovery.
+    Args:
+        repo: Private detached parent checkout at the authorized commit.
+        verified_release: Private closed authority evidence from the bootstrap.
+        verified_parent_bundle: Digest-bound parent Git object bundle.
+        image: Caller-supplied local SIF to snapshot and validate.
+        state_root: Optional private deployment-state override for tests/tools.
+        maintenance_quiesced: Operator assertion for the documented unknown
+            pre-interlock maintenance path.
+
+    Returns:
+        The succeeded schema-1 deployment receipt.
+
+    Raises:
+        DeploymentError: On invalid authority, unavailable inputs, unsafe paths,
+            local work, supervision failure, or action failure.
+
+    Side effects:
+        Stages Git/image inputs, updates declared final paths under lock, writes
+        durable deployment state, and leaves managed services stopped.
     """
-    evidence = _verified_evidence(verified_release, repo)
-    release, gitlinks = validate_candidate(repo, evidence["parent_commit"])
+    authority = _verified_evidence(verified_release, verified_parent_bundle, repo)
+    release, gitlinks = validate_candidate(repo, authority["parent_commit"])
     roots = _roots()
     for root in roots.values():
         _safe_owned_directory(root)
@@ -1935,21 +2079,26 @@ def deploy(repo: pathlib.Path, verified_release: pathlib.Path, image: pathlib.Pa
     artifact = _artifact_for(release)
     with HostInterlock(roots, maintenance_quiesced):
         deployment_id = str(uuid.uuid4())
-        journal = DeploymentJournal(state_root, evidence, [], deployment_id)
+        journal = DeploymentJournal(state_root, authority, [], deployment_id)
+        journal_published = False
         staging = journal.bundle / "staging"
         staging.mkdir(mode=0o700)
         fsync_directory(journal.bundle)
         scope = None
         phase = "stage"
         try:
-            # Persist the authenticated minimum before candidate-controlled code.
+            # Persist the integrity-bound minimum before candidate-controlled code.
             journal.record["component_authority"] = gitlinks
             journal.retain("release.json", _release_file(repo))
             journal.retain("verified-release.json", verified_release)
+            journal.retain("parent.bundle", verified_parent_bundle)
             journal.retain("deployer.py", pathlib.Path(__file__).resolve())
             journal.retain("release-v1.schema.json", repo / "deploy" / "release-v1.schema.json")
             journal.retain("receipt-v1.schema.json", repo / "deploy" / "receipt-v1.schema.json")
+            if _bootstrap_evidence(journal.bundle / "verified-release.json", journal.bundle / "parent.bundle") != authority:
+                raise DeploymentError("retained bootstrap authority does not match candidate authority")
             journal.persist()
+            journal_published = True
             with SessionScope(activity_callback=journal.record_action) as scope:
                 staged_image = snapshot_image(image, staging / "image", artifact["sha256"], artifact["architecture"])
                 staged = {}
@@ -1985,10 +2134,6 @@ def deploy(repo: pathlib.Path, verified_release: pathlib.Path, image: pathlib.Pa
                     journal.record["resources"].append(nested_resource)
                 journal.retain(staged_image.name, staged_image)
                 journal.retain(staged_image.name + ".sha256", pathlib.Path(str(staged_image) + ".sha256"))
-                if evidence["trust"] == "ssh-signed-tag":
-                    journal.retain("allowed_signers", repo.parent / "trust" / "allowed_signers")
-                    journal.retain("revoked_signers", repo.parent / "trust" / "revoked_signers")
-                retain_repository_bundle(journal, "parent", repo, [evidence["parent_commit"], evidence.get("tag_object", "")], scope)
                 for name, staged_repository in staged.items():
                     commits = [gitlinks[name]["commit"]]
                     plan = destination_plans.get(name)
@@ -2031,15 +2176,18 @@ def deploy(repo: pathlib.Path, verified_release: pathlib.Path, image: pathlib.Pa
                     if not final_checkout["compliant"]:
                         raise DeploymentError(f"component verification failed: {component['name']}")
                 phase = "finalize"
-                receipt = {"schema": SCHEMA, "id": journal.id, "deployer": DEPLOYER_ID, "state": "succeeded", "phase": "finalized", "trust": {"kind": evidence["trust"], "parent_commit": evidence["parent_commit"], "tag_object": evidence.get("tag_object"), "key_fingerprint": evidence.get("key_fingerprint")}, "components": results, "artifact": {"sha256": artifact["sha256"], "architecture": artifact["architecture"]}, "actions": actions, "configuration_handoff": release["configuration"], "recovery": {"available": False}, "process_cleanup": {"machine_observed": True, "operator_asserted": False}, "diagnostic": "deployment completed without reading configuration-owned content"}
+                receipt = {"schema": SCHEMA, "id": journal.id, "deployer": DEPLOYER_ID, "state": "succeeded", "phase": "finalized", "authority": authority, "components": results, "artifact": {"sha256": artifact["sha256"], "architecture": artifact["architecture"]}, "actions": actions, "configuration_handoff": release["configuration"], "recovery": {"available": False}, "process_cleanup": {"machine_observed": True, "operator_asserted": False}, "diagnostic": "deployment completed without reading configuration-owned content"}
                 receipt_path = state_root / (journal.id + ".receipt.json")
                 atomic_json(receipt_path, receipt, no_replace=True)
                 journal.succeeded(receipt)
                 return receipt
         except Exception as exc:
             if journal is not None:
-                machine_cleanup_observed = scope.machine_cleanup_observed if scope is not None else True
-                journal.failed(phase, str(exc), machine_cleanup_observed)
+                if journal_published or journal.path.exists() or journal.path.is_symlink():
+                    machine_cleanup_observed = scope.machine_cleanup_observed if scope is not None else True
+                    journal.failed(phase, str(exc), machine_cleanup_observed)
+                else:
+                    journal.discard_unpublished()
             if isinstance(exc, DeploymentError):
                 raise
             raise DeploymentError(str(exc)) from exc
@@ -2105,7 +2253,10 @@ def recover(state_root: pathlib.Path, deployment_id: str, mode: str, confirm_pro
             fsync_directory(state_root)
             return record
         release = load_json(bundle / "release.json", "retained release metadata")
-        evidence = load_json(bundle / "verified-release.json", "retained release evidence")
+        authority = _bootstrap_evidence(bundle / "verified-release.json", bundle / "parent.bundle")
+        _verify_authority_bundle(authority, bundle / "parent.bundle")
+        if _closed_authority(record.get("authority")) != authority:
+            raise DeploymentError("recovery record authority does not match retained release evidence")
         recorded_authorities = record.get("component_authority")
         if not isinstance(recorded_authorities, dict):
             raise DeploymentError("recovery record lacks component authority")
@@ -2113,7 +2264,7 @@ def recover(state_root: pathlib.Path, deployment_id: str, mode: str, confirm_pro
         try:
             repository = retained_parent / "parent.git"
             run_git(["clone", "--mirror", str(bundle / "parent.bundle"), str(repository)])
-            authorities = derive_gitlinks(repository, evidence["parent_commit"])
+            authorities = derive_gitlinks(repository, authority["parent_commit"])
         finally:
             shutil.rmtree(retained_parent, ignore_errors=True)
         if authorities != recorded_authorities:
@@ -2215,26 +2366,79 @@ def cleanup_bootstrap_root(root: pathlib.Path | None, repo: pathlib.Path):
     fsync_directory(root.parent)
 
 
-def validate_release_inputs(repo: pathlib.Path, image: pathlib.Path, trust_root: pathlib.Path) -> dict:
-    """Run publication-time consistency checks without touching final paths."""
-    _safe_owned_directory(trust_root)
-    allowed_path = trust_root / "allowed_signers"
-    revoked_path = trust_root / "revoked_signers"
-    for path in (allowed_path, revoked_path):
-        entry = _regular_owned(path)
-        if entry.st_mode & 0o022:
-            raise DeploymentError("unsafe release trust input")
-    allowed_lines = [line for line in allowed_path.read_text(encoding="utf-8").splitlines() if line.strip() and not line.lstrip().startswith("#")]
-    if len(allowed_lines) != 1 or allowed_lines[0].split(None, 1)[0] != "mkchad-release":
-        raise DeploymentError("release trust must authorize exactly one mkchad-release principal")
-    release, gitlinks = validate_candidate(repo)
-    guidance = repo / release["configuration"]["guidance"]
-    if not guidance.is_file():
-        raise DeploymentError("configuration guidance is missing from the candidate")
-    artifact = _artifact_for(release)
-    staging = pathlib.Path(tempfile.mkdtemp(prefix="mkchad-validate-"))
-    os.chmod(staging, 0o700)
+def validate_release_identity(repo: pathlib.Path, release_tag: str, expected_parent_commit: str):
+    """Validate planned tag syntax and candidate HEAD without resolving the tag.
+
+    Args:
+        repo: Candidate parent checkout.
+        release_tag: Planned annotated release tag name, which may not yet exist.
+        expected_parent_commit: Full SHA that must equal the candidate HEAD.
+
+    Raises:
+        DeploymentError: If syntax is invalid or candidate HEAD differs. This
+            intentionally does not look up ``release_tag`` in any repository.
+    """
+    if not isinstance(release_tag, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", release_tag) or release_tag.startswith("-") or ".." in release_tag:
+        raise DeploymentError("invalid release tag")
+    if not SHA1.fullmatch(expected_parent_commit):
+        raise DeploymentError("expected parent commit must be a full SHA")
+    head = run_git(["rev-parse", "HEAD"], repo).stdout.strip()
+    if head != expected_parent_commit:
+        raise DeploymentError("candidate checkout does not match expected parent commit")
+
+
+def prepare_validation_checkout(repo: pathlib.Path, expected_parent_commit: str, root: pathlib.Path) -> pathlib.Path:
+    """Create a detached private checkout of the exact candidate commit.
+
+    Args:
+        repo: Source parent repository; worktree changes are ignored.
+        expected_parent_commit: Full commit SHA to materialize.
+        root: Existing private temporary root.
+
+    Returns:
+        Path to the detached exact candidate checkout.
+
+    Raises:
+        DeploymentError: If cloning or checkout fails. The caller owns cleanup.
+    """
+    candidate = root / "parent"
+    run_git(["clone", "--no-checkout", "--no-local", str(repo), str(candidate)])
+    run_git(["-C", str(candidate), "checkout", "--detach", "--no-recurse-submodules", expected_parent_commit])
+    return candidate
+
+
+def validate_release_inputs(repo: pathlib.Path, release_tag: str, expected_parent_commit: str, image: pathlib.Path) -> dict:
+    """Validate an exact committed release candidate and local image.
+
+    Args:
+        repo: Parent checkout whose HEAD must equal ``expected_parent_commit``.
+        release_tag: Planned annotated tag name; it need not exist yet.
+        expected_parent_commit: Full candidate commit SHA.
+        image: Local SIF path validated against committed release metadata.
+
+    Returns:
+        A machine-readable validation summary for the exact candidate commit.
+
+    Raises:
+        DeploymentError: If identity, metadata, child reachability, image, or
+            configuration consistency cannot be proven.
+
+    Side effects:
+        Creates and removes private temporary checkouts/staging and performs
+        bounded network/runtime validation without changing deployment targets.
+    """
+    validate_release_identity(repo, release_tag, expected_parent_commit)
+    root = pathlib.Path(tempfile.mkdtemp(prefix="mkchad-validate-"))
+    os.chmod(root, 0o700)
     try:
+        candidate = prepare_validation_checkout(repo, expected_parent_commit, root)
+        release, gitlinks = validate_candidate(candidate, expected_parent_commit)
+        guidance = candidate / release["configuration"]["guidance"]
+        if not guidance.is_file():
+            raise DeploymentError("configuration guidance is missing from the candidate")
+        artifact = _artifact_for(release)
+        staging = root / "staging"
+        staging.mkdir(mode=0o700)
         with SessionScope() as scope:
             staged_image = snapshot_image(image, staging / "image", artifact["sha256"], artifact["architecture"])
             staged = {}
@@ -2250,9 +2454,9 @@ def validate_release_inputs(repo: pathlib.Path, image: pathlib.Path, trust_root:
                     validate_action_files(staged[component["name"]], gitlinks[component["name"]]["commit"], component)
             validate_configuration_pin(staged["mkchad"], gitlinks["mkchad"]["commit"], gitlinks["opencode.nvim"]["commit"])
             manifest = validate_image_runtime(scope, staged_image, artifact, staged["msk_containers"], gitlinks["msk_containers"]["commit"], staged["opencode"], gitlinks["opencode"])
-            return {"state": "validated", "parent_commit": run_git(["rev-parse", "HEAD"], repo).stdout.strip(), "components": sorted(gitlinks), "artifact": {"sha256": artifact["sha256"], "architecture": artifact["architecture"]}, "component_manifest": manifest}
+            return {"state": "validated", "parent_commit": expected_parent_commit, "components": sorted(gitlinks), "artifact": {"sha256": artifact["sha256"], "architecture": artifact["architecture"]}, "component_manifest": manifest}
     finally:
-        shutil.rmtree(staging, ignore_errors=True)
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def cleanup_journal_owned_indexes(record: dict, components: dict, roots: dict[str, pathlib.Path]):
@@ -2400,16 +2604,31 @@ def nested_component_contract(msk_component: dict) -> dict:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Run the public validation, deployment, or recovery command-line API."""
+    """Run the public validation, deployment, or recovery command-line API.
+
+    Args:
+        argv: Optional command-line arguments; process arguments are used when
+            omitted.
+
+    Returns:
+        Zero on success, child supervisor status for detached operations, or
+        ``2`` for a deployment validation failure.
+
+    Side effects:
+        Validation uses private temporary staging; deployment and recovery
+        start detached supervisors that own their documented state mutations.
+    """
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     commands = parser.add_subparsers(dest="command", required=True)
     validate = commands.add_parser("validate-release")
     validate.add_argument("--repo", type=pathlib.Path, default=pathlib.Path.cwd())
+    validate.add_argument("--release", required=True)
+    validate.add_argument("--expected-parent-commit", required=True)
     validate.add_argument("--image", type=pathlib.Path, required=True)
-    validate.add_argument("--trust-root", type=pathlib.Path, required=True)
     deploy_parser = commands.add_parser("deploy")
     deploy_parser.add_argument("--repo", type=pathlib.Path, default=pathlib.Path.cwd())
     deploy_parser.add_argument("--verified-release", type=pathlib.Path, required=True)
+    deploy_parser.add_argument("--verified-parent-bundle", type=pathlib.Path, required=True)
     deploy_parser.add_argument("--image", type=pathlib.Path, required=True)
     deploy_parser.add_argument("--state-root", type=pathlib.Path)
     deploy_parser.add_argument("--maintenance-quiesced", action="store_true")
@@ -2417,6 +2636,7 @@ def main(argv: list[str] | None = None) -> int:
     supervisor = commands.add_parser("supervise", help=argparse.SUPPRESS)
     supervisor.add_argument("--repo", type=pathlib.Path, required=True)
     supervisor.add_argument("--verified-release", type=pathlib.Path, required=True)
+    supervisor.add_argument("--verified-parent-bundle", type=pathlib.Path, required=True)
     supervisor.add_argument("--image", type=pathlib.Path, required=True)
     supervisor.add_argument("--state-root", type=pathlib.Path)
     supervisor.add_argument("--maintenance-quiesced", action="store_true")
@@ -2434,9 +2654,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.command == "validate-release":
-            print(json.dumps(validate_release_inputs(args.repo, args.image, args.trust_root), sort_keys=True))
+            print(json.dumps(validate_release_inputs(args.repo, args.release, args.expected_parent_commit, args.image), sort_keys=True))
         elif args.command == "deploy":
-            command = [sys.executable, str(pathlib.Path(__file__).resolve()), "supervise", "--repo", str(args.repo), "--verified-release", str(args.verified_release), "--image", str(args.image)]
+            command = [sys.executable, str(pathlib.Path(__file__).resolve()), "supervise", "--repo", str(args.repo), "--verified-release", str(args.verified_release), "--verified-parent-bundle", str(args.verified_parent_bundle), "--image", str(args.image)]
             if args.state_root:
                 command.extend(["--state-root", str(args.state_root)])
             if args.maintenance_quiesced:
@@ -2446,7 +2666,7 @@ def main(argv: list[str] | None = None) -> int:
             return spawn_supervisor(command)
         elif args.command == "supervise":
             try:
-                print(json.dumps(deploy(args.repo, args.verified_release, args.image, args.state_root, args.maintenance_quiesced), sort_keys=True))
+                print(json.dumps(deploy(args.repo, args.verified_release, args.verified_parent_bundle, args.image, args.state_root, args.maintenance_quiesced), sort_keys=True))
             finally:
                 cleanup_bootstrap_root(args.bootstrap_root, args.repo)
         elif args.command == "recover":

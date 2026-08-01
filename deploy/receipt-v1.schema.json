@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "MkChad deployment receipt schema 1",
   "type": "object",
-  "required": ["schema", "id", "deployer", "state", "phase", "trust", "components", "artifact", "actions", "configuration_handoff", "recovery", "process_cleanup", "diagnostic"],
+  "required": ["schema", "id", "deployer", "state", "phase", "authority", "components", "artifact", "actions", "configuration_handoff", "recovery", "process_cleanup", "diagnostic"],
   "additionalProperties": false,
   "properties": {
     "schema": {"const": 1},
@@ -10,7 +10,30 @@
     "deployer": {"const": "mkchad-deploy-v1"},
     "state": {"enum": ["in_progress", "failed", "succeeded", "recovered_complete", "recovered_restore"]},
     "phase": {"type": "string"},
-    "trust": {"type": "object"},
+    "authority": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["kind", "tag", "tag_object", "parent_commit"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {"const": "annotated-tag-plus-sha"},
+            "tag": {"type": "string", "pattern": "^(?!-)(?!.*\\.\\.)[A-Za-z0-9][A-Za-z0-9._/-]*$"},
+            "tag_object": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+            "parent_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"}
+          }
+        },
+        {
+          "type": "object",
+          "required": ["kind", "parent_commit"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {"const": "development-sha"},
+            "parent_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"}
+          }
+        }
+      ]
+    },
     "components": {"type": "array"},
     "artifact": {"type": "object"},
     "actions": {"type": "array"},

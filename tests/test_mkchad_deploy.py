@@ -104,12 +104,104 @@ class DeploymentValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(self.deploy.DeploymentError, "token"):
             self.deploy.validate_release_document(release, list(self.deploy.COMPONENT_DISPOSITIONS))
 
-    def test_public_signed_tree_metadata_does_not_require_private_receipt_mode(self):
+    def test_public_tree_metadata_does_not_require_private_receipt_mode(self):
         release_path = self.root / "release.json"
         release_path.write_text(json.dumps(self.release()), encoding="utf-8")
         os.chmod(release_path, 0o644)
         parsed = self.deploy.load_release_json(release_path)
         self.assertEqual(parsed["schema"], 1)
+
+    def test_keyless_authority_evidence_and_parent_bundle_are_closed_and_bound(self):
+        repo = self.root / "parent"
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        (repo / "deploy").mkdir()
+        candidate = repo / "deploy" / "mkchad_deploy.py"
+        candidate.write_text("# candidate\n", encoding="ascii")
+        subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(repo), "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-q", "-m", "candidate"], check=True)
+        commit = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+        bundle = self.root / "parent.bundle"
+        subprocess.run(["git", "-C", str(repo), "bundle", "create", str(bundle), "HEAD"], check=True)
+        bundle.chmod(0o600)
+        evidence = self.root / "verified-release.json"
+        authority = {"kind": "development-sha", "parent_commit": commit}
+        evidence.write_text(json.dumps({"schema": 1, "deployer": self.deploy.DEPLOYER_ID, "authority": authority, "parent_bundle_sha256": hashlib.sha256(bundle.read_bytes()).hexdigest()}), encoding="utf-8")
+        evidence.chmod(0o600)
+        self.assertEqual(self.deploy._bootstrap_evidence(evidence, bundle), authority)
+        self.deploy._verify_authority_bundle(authority, bundle)
+        tampered = json.loads(evidence.read_text(encoding="utf-8"))
+        tampered["authority"]["signer"] = "legacy"
+        evidence.write_text(json.dumps(tampered), encoding="utf-8")
+        with self.assertRaisesRegex(self.deploy.DeploymentError, "authority"):
+            self.deploy._bootstrap_evidence(evidence, bundle)
+        evidence.write_text(json.dumps({"schema": 1, "deployer": self.deploy.DEPLOYER_ID, "authority": authority, "parent_bundle_sha256": "0" * 64}), encoding="utf-8")
+        with self.assertRaisesRegex(self.deploy.DeploymentError, "bundle"):
+            self.deploy._bootstrap_evidence(evidence, bundle)
+
+    def test_deployer_bytes_must_match_the_selected_parent_tree(self):
+        repo = self.root / "parent"
+        candidate = repo / "deploy" / "mkchad_deploy.py"
+        candidate.parent.mkdir(parents=True)
+        candidate.write_text("# exact candidate\n", encoding="ascii")
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(repo), "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-q", "-m", "candidate"], check=True)
+        commit = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+        self.deploy._verify_deployer_blob(repo, commit, candidate)
+        candidate.write_text("# dirty candidate\n", encoding="ascii")
+        with self.assertRaisesRegex(self.deploy.DeploymentError, "bytes"):
+            self.deploy._verify_deployer_blob(repo, commit, candidate)
+
+    def test_validation_checkout_uses_committed_bytes_not_dirty_worktree(self):
+        repo = self.root / "source"
+        commit = self.make_checkout(repo, "mkchad", {"deploy/release.json": "committed\n"})
+        (repo / "deploy" / "release.json").write_text("dirty\n", encoding="ascii")
+        root = self.root / "validation"
+        root.mkdir(mode=0o700)
+        candidate = self.deploy.prepare_validation_checkout(repo, commit, root)
+        self.assertEqual((candidate / "deploy" / "release.json").read_text(encoding="ascii"), "committed\n")
+        self.assertEqual(subprocess.check_output(["git", "-C", str(candidate), "rev-parse", "HEAD"], text=True).strip(), commit)
+
+    def test_recovery_bundle_retention_preserves_collisions_and_exact_mode(self):
+        state = self.root / "state"
+        state.mkdir(mode=0o700)
+        source = self.root / "source"
+        source.write_bytes(b"source")
+        source.chmod(0o600)
+        journal = self.deploy.DeploymentJournal(state, {"kind": "development-sha", "parent_commit": "a" * 40}, [])
+        collision = journal.bundle / "parent.bundle"
+        collision.write_bytes(b"existing")
+        collision.chmod(0o600)
+        with self.assertRaisesRegex(self.deploy.DeploymentError, "collision"):
+            journal.retain("parent.bundle", source)
+        self.assertEqual(collision.read_bytes(), b"existing")
+        old_umask = os.umask(0o777)
+        try:
+            journal.retain("evidence.json", source)
+        finally:
+            os.umask(old_umask)
+        self.assertEqual((journal.bundle / "evidence.json").stat().st_mode & 0o777, 0o600)
+        journal.discard_unpublished()
+        self.assertFalse(journal.bundle.exists())
+
+    def test_validate_release_identity_accepts_an_absent_planned_tag_and_rejects_old_cli_inputs(self):
+        repo = self.root / "candidate"
+        commit = self.make_checkout(repo, "mkchad")
+        self.deploy.validate_release_identity(repo, "v9-not-published", commit)
+        with self.assertRaisesRegex(self.deploy.DeploymentError, "expected parent"):
+            self.deploy.validate_release_identity(repo, "v9-not-published", "0" * 40)
+        with self.assertRaises(SystemExit):
+            self.deploy.main(["validate-release", "--trust-root", str(self.root)])
+
+    def test_public_deploy_entrypoint_forwards_parent_bundle(self):
+        evidence = self.root / "evidence.json"
+        bundle = self.root / "parent.bundle"
+        image = self.root / "image.sif"
+        with mock.patch.object(self.deploy, "spawn_supervisor", return_value=0) as supervisor:
+            result = self.deploy.main(["deploy", "--verified-release", str(evidence), "--verified-parent-bundle", str(bundle), "--image", str(image)])
+        self.assertEqual(result, 0)
+        command = supervisor.call_args.args[0]
+        self.assertEqual(command[command.index("--verified-parent-bundle") + 1], str(bundle))
 
     def test_repository_identity_and_destination_are_constrained(self):
         self.assertEqual(self.deploy.canonical_github_repository("git@github.com:krafczyk/mkchad.git"), "github.com/krafczyk/mkchad")
@@ -143,6 +235,11 @@ class DeploymentValidationTests(unittest.TestCase):
         record["schema"] = 2
         self.deploy.atomic_json(path, record)
         with self.assertRaisesRegex(self.deploy.DeploymentError, "schema"):
+            self.deploy.load_recovery_record(state, record["id"])
+        record["schema"] = 1
+        record["trust"] = {"kind": "legacy"}
+        self.deploy.atomic_json(path, record)
+        with self.assertRaisesRegex(self.deploy.DeploymentError, "obsolete"):
             self.deploy.load_recovery_record(state, record["id"])
 
     def test_receipt_collision_and_moved_record_leave_evidence_untouched(self):
@@ -607,7 +704,12 @@ ln -sfn "${target##*/}" "$HOME/containers/neovim.sif"
         subprocess.run(["git", "-C", str(parent), "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-q", "-m", "release"], check=True)
         parent_commit = subprocess.check_output(["git", "-C", str(parent), "rev-parse", "HEAD"], text=True).strip()
         evidence = fixture / "verified-release.json"
-        evidence.write_text(json.dumps({"schema": 1, "deployer": self.deploy.DEPLOYER_ID, "trust": "development-sha", "parent_commit": parent_commit}), encoding="utf-8")
+        evidence.write_text(json.dumps({"schema": 1, "deployer": self.deploy.DEPLOYER_ID, "authority": {"kind": "development-sha", "parent_commit": parent_commit}, "parent_bundle_sha256": "0" * 64}), encoding="utf-8")
+        evidence.chmod(0o600)
+        parent_bundle = fixture / "parent.bundle"
+        subprocess.run(["git", "-C", str(parent), "bundle", "create", str(parent_bundle), "HEAD"], check=True)
+        parent_bundle.chmod(0o600)
+        evidence.write_text(json.dumps({"schema": 1, "deployer": self.deploy.DEPLOYER_ID, "authority": {"kind": "development-sha", "parent_commit": parent_commit}, "parent_bundle_sha256": hashlib.sha256(parent_bundle.read_bytes()).hexdigest()}), encoding="utf-8")
         evidence.chmod(0o600)
 
         class DirectScope:
@@ -636,15 +738,15 @@ ln -sfn "${target##*/}" "$HOME/containers/neovim.sif"
         stage_map = {name: children[name] for name in children}
         stage_map["msk_containers-container_tools"] = container_tools
         with mock.patch.dict(os.environ, environment, clear=False), mock.patch.object(self.deploy, "SessionScope", DirectScope), mock.patch.object(
-            self.deploy, "_verified_evidence", return_value={"trust": "development-sha", "parent_commit": parent_commit}
+            self.deploy, "_verified_evidence", return_value={"kind": "development-sha", "parent_commit": parent_commit}
         ), mock.patch.object(self.deploy, "stage_child", side_effect=lambda url, commit, staging, name, scope: stage_map[name]), mock.patch.object(
             self.deploy, "validate_image_runtime", return_value={"schema": 1}
         ), mock.patch.object(
             self.deploy, "expected_managed_image_name", return_value="neovim_fixture.sif"
         ):
-            first = self.deploy.deploy(parent, evidence, image)
+            first = self.deploy.deploy(parent, evidence, parent_bundle, image)
             launcher_before = os.stat(home / ".local" / "bin" / "mkchad-opencode-server")
-            second = self.deploy.deploy(parent, evidence, image)
+            second = self.deploy.deploy(parent, evidence, parent_bundle, image)
             launcher_after = os.stat(home / ".local" / "bin" / "mkchad-opencode-server")
         self.assertEqual(first["state"], "succeeded")
         self.assertEqual(second["state"], "succeeded")

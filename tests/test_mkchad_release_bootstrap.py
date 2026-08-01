@@ -1,13 +1,14 @@
-"""Focused tests for bootstrap trust-root checks."""
+"""Focused tests for keyless MkChad release bootstrap authority."""
 
 import hashlib
 import importlib.util
 import json
 import os
 import pathlib
+import subprocess
 import tempfile
 import unittest
-import subprocess
+from unittest import mock
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -22,144 +23,249 @@ def load_bootstrap():
     return module
 
 
-class BootstrapTrustTests(unittest.TestCase):
-    """Ensure bootstrap trust material is owned, private, and unambiguous."""
+class BootstrapAuthorityTests(unittest.TestCase):
+    """Ensure bootstrap accepts only closed keyless release authority."""
 
     def setUp(self):
         self.bootstrap = load_bootstrap()
         self.root = pathlib.Path(tempfile.mkdtemp(prefix="mkchad-bootstrap-test-"))
         os.chmod(self.root, 0o700)
 
-    def test_snapshots_exactly_one_principal_and_revocation_file(self):
-        (self.root / "allowed_signers").write_text("mkchad-release ssh-ed25519 AAAATEST\n", encoding="ascii")
-        (self.root / "revoked_signers").write_text("", encoding="ascii")
-        snapshot = self.bootstrap.snapshot_trust_root(self.root, self.root / "snapshot")
-        self.assertEqual(snapshot["principal"], "mkchad-release")
-        self.assertTrue(pathlib.Path(snapshot["allowed_signers"]).is_file())
-        (self.root / "allowed_signers").write_text("mkchad-release ssh-ed25519 AAAA\nmkchad-release ssh-ed25519 BBBB\n", encoding="ascii")
-        with self.assertRaisesRegex(self.bootstrap.BootstrapError, "exactly one"):
-            self.bootstrap.snapshot_trust_root(self.root, self.root / "other")
-
-    def test_self_digest_fails_closed(self):
-        script = self.root / "bootstrap.py"
-        script.write_text("print('bootstrap')\n", encoding="ascii")
-        digest = hashlib.sha256(script.read_bytes()).hexdigest()
-        (self.root / "bootstrap.sha256").write_text(digest + "\n", encoding="ascii")
-        self.bootstrap.verify_self_digest(script, self.root / "bootstrap.sha256")
-        (self.root / "bootstrap.sha256").write_text("0" * 64 + "\n", encoding="ascii")
-        with self.assertRaisesRegex(self.bootstrap.BootstrapError, "digest"):
-            self.bootstrap.verify_self_digest(script, self.root / "bootstrap.sha256")
-
-    def test_trust_root_rejects_symlinked_ancestor(self):
-        real_parent = self.root / "real"
-        trust = real_parent / "trust"
-        trust.mkdir(parents=True, mode=0o700)
-        alias = self.root / "alias"
-        alias.symlink_to(real_parent, target_is_directory=True)
-        with self.assertRaisesRegex(self.bootstrap.BootstrapError, "symlink"):
-            self.bootstrap.snapshot_trust_root(alias / "trust", self.root / "snapshot")
-
-    def test_development_execution_uses_only_verified_checkout(self):
+    def remote_with_tag(self, annotated=True):
+        """Create a local parent remote with one commit and optional annotated tag."""
         source = self.root / "source"
         remote = self.root / "remote.git"
-        checkout = self.root / "checkout"
         (source / "deploy").mkdir(parents=True)
-        candidate_source = source / "deploy" / "mkchad_deploy.py"
-        candidate_source.write_text("print('verified candidate')\n", encoding="ascii")
+        (source / "deploy" / "mkchad_deploy.py").write_text("print('candidate')\n", encoding="ascii")
         subprocess.run(["git", "init", "-q", str(source)], check=True)
-        subprocess.run(["git", "-C", str(source), "add", "deploy/mkchad_deploy.py"], check=True)
-        subprocess.run(
-            ["git", "-C", str(source), "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-q", "-m", "candidate"],
-            check=True,
-        )
+        subprocess.run(["git", "-C", str(source), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(source), "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-q", "-m", "candidate"], check=True)
         commit = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
+        tag_args = ["git", "-C", str(source), "tag", "v1"]
+        if annotated:
+            tag_args = ["git", "-C", str(source), "-c", "user.name=test", "-c", "user.email=test@example.invalid", "tag", "-a", "-m", "unsigned release", "v1"]
+        subprocess.run(tag_args, check=True)
         subprocess.run(["git", "clone", "-q", "--bare", str(source), str(remote)], check=True)
-        candidate_source.write_text("print('unverified worktree')\n", encoding="ascii")
+        return source, remote, commit
 
-        evidence = self.bootstrap.development_evidence(commit)
-        candidate = self.bootstrap.prepare_verified_checkout(str(remote), evidence, checkout)
+    def test_unsigned_annotated_tag_requires_matching_full_sha_and_closed_authority(self):
+        _, remote, commit = self.remote_with_tag()
+        evidence = self.bootstrap.verify_annotated_tag(str(remote), "v1", commit, self.root / "work")
 
-        self.assertEqual(candidate.read_text(encoding="ascii"), "print('verified candidate')\n")
-        self.assertEqual(evidence["checkout_commit"], commit)
-        self.assertEqual(evidence["candidate_sha256"], hashlib.sha256(candidate.read_bytes()).hexdigest())
+        self.assertEqual(evidence, {"kind": "annotated-tag-plus-sha", "tag": "v1", "tag_object": evidence["tag_object"], "parent_commit": commit})
+        with self.assertRaisesRegex(self.bootstrap.BootstrapError, "expected parent"):
+            self.bootstrap.verify_annotated_tag(str(remote), "v1", "0" * 40, self.root / "mismatch")
 
-    def test_recovery_executes_only_digest_bound_retained_deployer(self):
+    def test_lightweight_and_malformed_tags_are_rejected_without_signing_inputs(self):
+        _, remote, commit = self.remote_with_tag(annotated=False)
+        with self.assertRaisesRegex(self.bootstrap.BootstrapError, "annotated"):
+            self.bootstrap.verify_annotated_tag(str(remote), "v1", commit, self.root / "lightweight")
+        with self.assertRaisesRegex(self.bootstrap.BootstrapError, "invalid"):
+            self.bootstrap.verify_annotated_tag(str(remote), "../main", commit, self.root / "malformed")
+
+    def test_tag_movement_between_private_observations_is_rejected(self):
+        commit = "a" * 40
+        first = "b" * 40
+        second = "c" * 40
+
+        fetches = []
+
+        def git(argv, cwd=None, check=True):
+            if argv and argv[0] == "fetch":
+                fetches.append(argv)
+            if argv[:2] == ["cat-file", "-t"]:
+                return subprocess.CompletedProcess(argv, 0, "tag\n", "")
+            if argv[:2] == ["rev-parse", "refs/mkchad-bootstrap/first^{tag}"]:
+                return subprocess.CompletedProcess(argv, 0, first + "\n", "")
+            if argv[:2] == ["rev-parse", "refs/mkchad-bootstrap/second^{tag}"]:
+                return subprocess.CompletedProcess(argv, 0, second + "\n", "")
+            if argv[:2] == ["rev-parse", first + "^{commit}"] or argv[:2] == ["rev-parse", second + "^{commit}"]:
+                return subprocess.CompletedProcess(argv, 0, commit + "\n", "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        with mock.patch.object(self.bootstrap, "_git", side_effect=git):
+            with self.assertRaisesRegex(self.bootstrap.BootstrapError, "moved"):
+                self.bootstrap.verify_annotated_tag("remote", "v1", commit, self.root / "moved")
+        self.assertEqual(
+            fetches,
+            [
+                ["fetch", "--no-tags", "remote", "refs/tags/v1:refs/mkchad-bootstrap/first"],
+                ["fetch", "--no-tags", "remote", "refs/tags/v1:refs/mkchad-bootstrap/second"],
+            ],
+        )
+
+    def test_development_authority_is_closed_and_unfetchable_commit_fails(self):
+        _, remote, commit = self.remote_with_tag()
+        self.assertEqual(self.bootstrap.development_evidence(commit), {"kind": "development-sha", "parent_commit": commit})
+        with self.assertRaisesRegex(self.bootstrap.BootstrapError, "unavailable"):
+            self.bootstrap.prepare_verified_checkout(str(remote), self.bootstrap.development_evidence("0" * 40), self.root / "missing")
+
+    def test_installed_bootstrap_rejects_linked_or_writable_path_without_digest_file(self):
+        script = self.root / "bootstrap.py"
+        script.write_text("pass\n", encoding="ascii")
+        self.bootstrap.validate_installed_bootstrap(script)
+        script.chmod(0o666)
+        with self.assertRaisesRegex(self.bootstrap.BootstrapError, "safe regular"):
+            self.bootstrap.validate_installed_bootstrap(script)
+        unsafe = self.root / "unsafe"
+        unsafe.mkdir()
+        unsafe.chmod(0o777)
+        nested_script = unsafe / "bootstrap.py"
+        nested_script.write_text("pass\n", encoding="ascii")
+        with self.assertRaisesRegex(self.bootstrap.BootstrapError, "ancestor"):
+            self.bootstrap.validate_installed_bootstrap(nested_script)
+        foreign = mock.Mock(st_uid=os.getuid() + 1, st_mode=0o040755)
+        self.assertTrue(self.bootstrap._unsafe_writable_ancestor(foreign))
+
+    def test_git_timeout_terminates_the_process_group(self):
+        binary = self.root / "bin"
+        binary.mkdir()
+        git = binary / "git"
+        git.write_text("#!/bin/sh\ntrap '' TERM\nsleep 30\n", encoding="ascii")
+        git.chmod(0o755)
+        with mock.patch.dict(os.environ, {"PATH": str(binary) + os.pathsep + os.environ["PATH"]}):
+            with self.assertRaisesRegex(self.bootstrap.BootstrapError, "timed out"):
+                self.bootstrap._git(["version"], timeout=0.05, term_grace=0.05, kill_grace=0.2)
+
+    def test_git_rejects_diagnostic_output_overflow(self):
+        binary = self.root / "overflow-bin"
+        binary.mkdir()
+        git = binary / "git"
+        git.write_text("#!/bin/sh\nyes x | head -c 1100000 >&2\n", encoding="ascii")
+        git.chmod(0o755)
+        with mock.patch.dict(os.environ, {"PATH": str(binary) + os.pathsep + os.environ["PATH"]}):
+            with self.assertRaisesRegex(self.bootstrap.BootstrapError, "output limit"):
+                self.bootstrap._git(["version"], timeout=2, term_grace=0.05, kill_grace=0.2)
+
+    def test_git_rejects_and_kills_a_surviving_group_helper(self):
+        binary = self.root / "helper-bin"
+        binary.mkdir()
+        git = binary / "git"
+        git.write_text("#!/bin/sh\n(trap '' TERM; exec sleep 30) </dev/null >/dev/null 2>&1 &\n", encoding="ascii")
+        git.chmod(0o755)
+        with mock.patch.dict(os.environ, {"PATH": str(binary) + os.pathsep + os.environ["PATH"]}):
+            with self.assertRaisesRegex(self.bootstrap.BootstrapError, "live git process-group member"):
+                self.bootstrap._git(["version"], timeout=2, term_grace=0.05, kill_grace=0.2)
+
+    def test_private_output_retries_short_writes(self):
+        writes = []
+
+        def short_write(_fd, value):
+            writes.append(bytes(value))
+            return min(2, len(value))
+
+        with mock.patch.object(self.bootstrap.os, "write", side_effect=short_write):
+            self.bootstrap._write_all(7, b"abcdef")
+        self.assertEqual([len(value) for value in writes], [6, 4, 2])
+
+    def test_parent_bundle_digest_and_evidence_are_private_and_bound(self):
+        _, remote, commit = self.remote_with_tag()
+        work = self.root / "work"
+        authority = self.bootstrap.verify_annotated_tag(str(remote), "v1", commit, work)
+        candidate = self.bootstrap.prepare_verified_checkout(str(remote), authority, work)
+        bundle = self.bootstrap.write_parent_bundle(work, authority, self.root / "parent.bundle")
+        evidence = self.bootstrap.write_evidence(self.root / "evidence", authority, bundle)
+
+        parsed = json.loads(evidence.read_text(encoding="utf-8"))
+        self.assertEqual(parsed["authority"], authority)
+        self.assertEqual(parsed["parent_bundle_sha256"], hashlib.sha256(bundle.read_bytes()).hexdigest())
+        self.assertEqual(stat_mode(bundle), 0o600)
+        self.assertEqual(stat_mode(evidence), 0o600)
+        self.assertTrue(candidate.is_file())
+
+    def test_recovery_accepts_retained_keyless_evidence_and_rejects_tampering(self):
         deployment_id = "123e4567-e89b-12d3-a456-426614174000"
+        _, remote, commit = self.remote_with_tag()
+        work = self.root / "work"
+        authority = self.bootstrap.verify_annotated_tag(str(remote), "v1", commit, work)
+        self.bootstrap.prepare_verified_checkout(str(remote), authority, work)
         state = self.root / "state"
         state.mkdir(mode=0o700)
         bundle = state / f"{deployment_id}.bundle"
         bundle.mkdir(mode=0o700)
+        parent_bundle = self.bootstrap.write_parent_bundle(work, authority, bundle / "parent.bundle")
+        evidence = self.bootstrap.write_evidence(bundle, authority, parent_bundle)
         retained = {
-            "deployer.py": b"print('retained')\n",
-            "verified-release.json": json.dumps({"schema": 1, "deployer": "mkchad-deploy-v1", "trust": "development-sha", "parent_commit": "1" * 40}).encode(),
+            "deployer.py": (work / "deploy" / "mkchad_deploy.py").read_bytes(),
+            "verified-release.json": evidence.read_bytes(),
             "release.json": b"{}\n",
             "release-v1.schema.json": b"{}\n",
             "receipt-v1.schema.json": b"{}\n",
-            "parent.bundle": b"fixture bundle\n",
+            "parent.bundle": parent_bundle.read_bytes(),
         }
         for name, content in retained.items():
             path = bundle / name
-            path.write_bytes(content)
+            if not path.exists():
+                path.write_bytes(content)
             path.chmod(0o600)
-        staging = bundle / "staging"
-        staging.mkdir(mode=0o700)
-        (staging / "partial-input").write_bytes(b"private staging")
-        deployer = bundle / "deployer.py"
         record = {
-            "schema": 1,
-            "id": deployment_id,
-            "deployer": "mkchad-deploy-v1",
-            "state": "failed",
-            "state_root": str(state),
-            "recovery_bundle": bundle.name,
+            "schema": 1, "id": deployment_id, "deployer": "mkchad-deploy-v1", "state": "failed",
+            "state_root": str(state), "recovery_bundle": bundle.name,
+            "authority": authority,
             "bundle_digests": {name: hashlib.sha256(content).hexdigest() for name, content in retained.items()},
         }
-        record_path = state / f"{deployment_id}.json"
-        record_path.write_text(json.dumps(record), encoding="utf-8")
-        record_path.chmod(0o600)
-        self.assertEqual(self.bootstrap.authenticated_recovery_deployer(state, deployment_id), deployer)
-        deployer.write_text("print('tampered')\n", encoding="ascii")
-        with self.assertRaisesRegex(self.bootstrap.BootstrapError, "authentication"):
+        (state / f"{deployment_id}.json").write_text(json.dumps(record), encoding="utf-8")
+        (state / f"{deployment_id}.json").chmod(0o600)
+        self.assertEqual(self.bootstrap.authenticated_recovery_deployer(state, deployment_id), bundle / "deployer.py")
+        (bundle / "parent.bundle").write_bytes(b"tampered")
+        record["bundle_digests"]["parent.bundle"] = hashlib.sha256(b"tampered").hexdigest()
+        (state / f"{deployment_id}.json").write_text(json.dumps(record), encoding="utf-8")
+        with self.assertRaisesRegex(self.bootstrap.BootstrapError, "integrity"):
             self.bootstrap.authenticated_recovery_deployer(state, deployment_id)
 
-    def test_development_evidence_is_explicit_and_lightweight_tag_is_rejected(self):
-        commit = "a" * 40
-        self.assertEqual(self.bootstrap.development_evidence(commit)["trust"], "development-sha")
-        with self.assertRaises(self.bootstrap.BootstrapError):
-            self.bootstrap.development_evidence("main")
-        source = self.root / "source"
-        remote = self.root / "remote.git"
-        work = self.root / "work"
-        subprocess.run(["git", "init", str(source)], check=True, stdout=subprocess.DEVNULL)
-        subprocess.run(["git", "-C", str(source), "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-m", "initial"], check=True, stdout=subprocess.DEVNULL)
-        subprocess.run(["git", "-C", str(source), "tag", "v1"], check=True)
-        subprocess.run(["git", "clone", "--bare", str(source), str(remote)], check=True, stdout=subprocess.DEVNULL)
-        snapshot = {"allowed_signers": str(self.root / "allowed_signers"), "revoked_signers": str(self.root / "revoked_signers")}
-        (self.root / "allowed_signers").write_text("mkchad-release ssh-ed25519 AAAATEST\n", encoding="ascii")
-        (self.root / "revoked_signers").write_text("", encoding="ascii")
-        with self.assertRaisesRegex(self.bootstrap.BootstrapError, "annotated"):
-            self.bootstrap.verify_signed_tag(str(remote), "v1", snapshot, work)
+    def test_recovery_rejects_release_selection_arguments(self):
+        deployment_id = "123e4567-e89b-12d3-a456-426614174000"
+        with mock.patch.object(self.bootstrap, "validate_installed_bootstrap"), mock.patch.object(self.bootstrap, "authenticated_recovery_deployer") as recovery:
+            result = self.bootstrap.main(["--release", "v1", "recover", "--deployment-id", deployment_id, "--mode", "restore", "--state-root", str(self.root)])
+        self.assertEqual(result, 2)
+        recovery.assert_not_called()
 
-    def test_authorized_and_revoked_ssh_signed_tags(self):
-        source = self.root / "source"
-        remote = self.root / "remote.git"
-        key = self.root / "release-key"
-        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key)], check=True)
-        public = key.with_suffix(".pub").read_text(encoding="ascii").strip()
-        subprocess.run(["git", "init", "-q", str(source)], check=True)
-        subprocess.run(["git", "-C", str(source), "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-m", "initial"], check=True, stdout=subprocess.DEVNULL)
-        subprocess.run(["git", "-C", str(source), "-c", "user.name=test", "-c", "user.email=test@example.invalid", "-c", "gpg.format=ssh", "-c", "user.signingkey=" + str(key), "tag", "-s", "-m", "release", "v1"], check=True)
-        subprocess.run(["git", "clone", "-q", "--bare", str(source), str(remote)], check=True)
-        allowed = self.root / "allowed_signers"
-        revoked = self.root / "revoked_signers"
-        allowed.write_text("mkchad-release " + public + "\n", encoding="ascii")
-        revoked.write_text("", encoding="ascii")
-        snapshot = {"allowed_signers": str(allowed), "revoked_signers": str(revoked)}
-        evidence = self.bootstrap.verify_signed_tag(str(remote), "v1", snapshot, self.root / "verified")
-        self.assertEqual(evidence["trust"], "ssh-signed-tag")
-        subprocess.run(["ssh-keygen", "-k", "-f", str(revoked), str(key.with_suffix(".pub"))], check=True, stdout=subprocess.DEVNULL)
-        with self.assertRaisesRegex(self.bootstrap.BootstrapError, "authorized"):
-            self.bootstrap.verify_signed_tag(str(remote), "v1", snapshot, self.root / "revoked-verified")
+    def test_public_release_entrypoint_forwards_both_authority_files(self):
+        private = self.root / "main-private"
+        private.mkdir(mode=0o700)
+        candidate = self.root / "candidate.py"
+        candidate.write_text("pass\n", encoding="ascii")
+        authority = {"kind": "annotated-tag-plus-sha", "tag": "v1", "tag_object": "b" * 40, "parent_commit": "a" * 40}
+
+        def write_bundle(_work, _authority, path):
+            path.write_bytes(b"bundle")
+            path.chmod(0o600)
+            return path
+
+        def write_evidence(directory, _authority, _bundle):
+            path = directory / "verified-release.json"
+            path.write_text("{}\n", encoding="ascii")
+            path.chmod(0o600)
+            return path
+
+        process = mock.Mock()
+        process.wait.return_value = 0
+        with mock.patch.object(self.bootstrap, "validate_installed_bootstrap"), mock.patch.object(self.bootstrap.tempfile, "mkdtemp", return_value=str(private)), mock.patch.object(
+            self.bootstrap, "verify_annotated_tag", return_value=authority
+        ), mock.patch.object(self.bootstrap, "prepare_verified_checkout", return_value=candidate), mock.patch.object(
+            self.bootstrap, "write_parent_bundle", side_effect=write_bundle
+        ), mock.patch.object(self.bootstrap, "write_evidence", side_effect=write_evidence), mock.patch.object(
+            self.bootstrap.subprocess, "Popen", return_value=process
+        ) as popen:
+            self.assertEqual(self.bootstrap.main(["--release", "v1", "--expected-parent-commit", "a" * 40, "--image", str(self.root / "image.sif")]), 0)
+        command = popen.call_args.args[0]
+        self.assertIn("--verified-release", command)
+        self.assertIn("--verified-parent-bundle", command)
+        self.assertIn("--bootstrap-root", command)
+
+    def test_prehandoff_failure_removes_private_bootstrap_root(self):
+        private = self.root / "failed-private"
+        private.mkdir(mode=0o700)
+        with mock.patch.object(self.bootstrap, "validate_installed_bootstrap"), mock.patch.object(self.bootstrap.tempfile, "mkdtemp", return_value=str(private)), mock.patch.object(
+            self.bootstrap, "verify_annotated_tag", side_effect=self.bootstrap.BootstrapError("expected failure")
+        ):
+            self.assertEqual(self.bootstrap.main(["--release", "v1", "--expected-parent-commit", "a" * 40, "--image", str(self.root / "image.sif")]), 2)
+        self.assertFalse(private.exists())
+
+
+def stat_mode(path):
+    """Return only the Unix permission bits for one test fixture path."""
+    return path.stat().st_mode & 0o777
 
 
 if __name__ == "__main__":
