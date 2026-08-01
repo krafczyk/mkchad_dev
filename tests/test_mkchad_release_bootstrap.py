@@ -101,6 +101,9 @@ class BootstrapTrustTests(unittest.TestCase):
             path = bundle / name
             path.write_bytes(content)
             path.chmod(0o600)
+        staging = bundle / "staging"
+        staging.mkdir(mode=0o700)
+        (staging / "partial-input").write_bytes(b"private staging")
         deployer = bundle / "deployer.py"
         record = {
             "schema": 1,

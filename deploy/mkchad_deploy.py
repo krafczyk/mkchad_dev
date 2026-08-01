@@ -23,6 +23,8 @@ import json
 import os
 import pathlib
 import re
+import selectors
+import signal
 import shutil
 import stat
 import subprocess
@@ -612,7 +614,7 @@ def _write_tree_entry(repository: pathlib.Path, path: str, entry: tuple[str, str
         temporary.unlink(missing_ok=True)
 
 
-def materialize_checkout_tree(destination: pathlib.Path, previous: str, intended: str, target_commit: str, scope: CgroupScope):
+def materialize_checkout_tree(destination: pathlib.Path, previous: str, intended: str, target_commit: str, scope: SessionScope):
     """Reconstruct a classified old/new mixture without reset, stash, or merge."""
     old_entries = _tree_entries(destination, previous)
     new_entries = _tree_entries(destination, intended)
@@ -637,7 +639,7 @@ def materialize_checkout_tree(destination: pathlib.Path, previous: str, intended
     install_checkout_index(destination, target_commit, scope, ".mkchad-recovery.index")
 
 
-def install_checkout_index(destination: pathlib.Path, target_commit: str, scope: CgroupScope, index_name: str):
+def install_checkout_index(destination: pathlib.Path, target_commit: str, scope: SessionScope, index_name: str):
     """Build an alternate index and atomically publish it without index.lock."""
     git_dir = destination / ".git"
     index = git_dir / "index"
@@ -659,7 +661,7 @@ def install_checkout_index(destination: pathlib.Path, target_commit: str, scope:
         alternate_lock.unlink(missing_ok=True)
 
 
-def transactional_git_checkout(destination: pathlib.Path, target_commit: str, scope: CgroupScope, journal: DeploymentJournal, resource: dict):
+def transactional_git_checkout(destination: pathlib.Path, target_commit: str, scope: SessionScope, journal: DeploymentJournal, resource: dict):
     """Checkout through a journal-owned alternate index to avoid stale index.lock."""
     git_dir = destination / ".git"
     index = git_dir / "index"
@@ -768,7 +770,7 @@ def preflight_nested_checkout(parent_plan: tuple[pathlib.Path, dict], authority:
     return {"kind": "absent", "parent_identity": _identity(parent_destination)}
 
 
-def install_or_update_nested_checkout(parent_destination: pathlib.Path, staged: pathlib.Path, authority: dict, preflight: dict, resource: dict | None, journal: DeploymentJournal, scope: CgroupScope) -> dict:
+def install_or_update_nested_checkout(parent_destination: pathlib.Path, staged: pathlib.Path, authority: dict, preflight: dict, resource: dict | None, journal: DeploymentJournal, scope: SessionScope) -> dict:
     """Install the exact nested container_tools gitlink before host actions."""
     destination = parent_destination / "container_tools"
     if preflight["kind"] == "parent-absent":
@@ -920,6 +922,8 @@ def load_recovery_record(state_root: pathlib.Path, deployment_id: str) -> dict:
     _safe_owned_directory(state_root)
     path = state_root / (deployment_id + ".json")
     record = load_json(path, "deployment record")
+    if any(key.startswith("cgroup") for key in record):
+        raise DeploymentError("legacy cgroup deployment record requires recovery with the prior implementation")
     if record.get("schema") != SCHEMA:
         raise DeploymentError("unsupported deployment record schema")
     if record.get("id") != deployment_id or record.get("deployer") != DEPLOYER_ID:
@@ -1046,82 +1050,211 @@ class HostInterlock:
             os.close(self.legacy_fd)
 
 
-class CgroupScope:
-    """A delegated cgroup-v2 scope used for every mutating subprocess.
+class SessionScope:
+    """Run direct actions in new sessions with bounded diagnostics and cleanup.
 
-    The caller supplies a user-delegated cgroup-v2 parent through
-    ``MKCHAD_DEPLOY_CGROUP_ROOT``.  The scope refuses a parent without the pids
-    controller, a kill interface, or unpopulated-state evidence.  ``setsid`` or
-    forked descendants remain cgroup members, so process groups are never the
-    containment boundary.
+    The unreaped direct leader is the PID/process-group anchor until Linux
+    procfs shows that no live current-user member remains in its session and
+    process group. Descendants that escape that boundary are an accepted
+    residual and are not claimed as absent.
     """
 
-    def __init__(self, root: pathlib.Path, deployment_id: str):
-        self.root = root
-        self.path = root / ("mkchad-deploy-" + deployment_id)
+    diagnostic_limit = 1024 * 1024
+
+    def __init__(self, timeout: float = 300, term_grace: float = 5, kill_grace: float = 5, activity_callback=None):
+        self.timeout = timeout
+        self.term_grace = term_grace
+        self.kill_grace = kill_grace
+        self.activity_callback = activity_callback
+        self.active_pid = None
+        self.cleanup_unconfirmed = False
 
     def __enter__(self):
-        if not self.root.is_absolute() or self.root.is_symlink() or not self.root.is_dir():
-            raise DeploymentError("missing delegated cgroup-v2 root")
-        controllers = (self.root / "cgroup.controllers")
-        subtree = self.root / "cgroup.subtree_control"
-        if not controllers.is_file() or not subtree.is_file() or "pids" not in controllers.read_text(encoding="ascii"):
-            raise DeploymentError("cgroup delegation lacks the pids controller")
-        try:
-            if "pids" not in subtree.read_text(encoding="ascii"):
-                subtree.write_text("+pids", encoding="ascii")
-            self.path.mkdir()
-        except OSError as exc:
-            raise DeploymentError("cannot create delegated deployment cgroup") from exc
-        required = ("cgroup.procs", "cgroup.events", "cgroup.kill")
-        if any(not (self.path / item).is_file() for item in required):
-            raise DeploymentError("delegated cgroup lacks containment interfaces")
         return self
 
-    def run(self, argv: list[str], timeout: int = 300, extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
-        """Run one explicit argv action after placing it in this cgroup scope."""
-        if not argv or any(not isinstance(item, str) or "\x00" in item for item in argv):
-            raise DeploymentError("invalid contained subprocess argv")
-
-        def enroll():
-            with open(self.path / "cgroup.procs", "w", encoding="ascii") as handle:
-                handle.write(str(os.getpid()))
-
-        try:
-            environment = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": os.environ["HOME"], "LC_ALL": "C", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_TERMINAL_PROMPT": "0"}
-            environment.update(extra_env or {})
-            result = subprocess.run(argv, env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout, preexec_fn=enroll, start_new_session=True)
-        except subprocess.TimeoutExpired as exc:
-            self.kill_and_confirm_empty()
-            raise DeploymentError("contained subprocess timed out") from exc
-        if result.returncode:
-            digest = hashlib.sha256(result.stderr.encode()).hexdigest()
-            raise DeploymentError(f"contained subprocess failed with exit {result.returncode}; stderr-sha256={digest}")
-        return result
-
-    def kill_and_confirm_empty(self):
-        """Terminate the complete scope and require cgroup-v2 empty evidence."""
-        try:
-            (self.path / "cgroup.kill").write_text("1", encoding="ascii")
-        except OSError as exc:
-            raise DeploymentError("cannot terminate delegated cgroup") from exc
-        for _ in range(50):
-            events = (self.path / "cgroup.events").read_text(encoding="ascii")
-            if re.search(r"(?m)^populated 0$", events):
-                return
-            time.sleep(0.02)
-        raise DeploymentError("deployment cgroup remains populated")
-
     def __exit__(self, *_):
-        # A completed command should leave no descendants.  This detects a
-        # forking or setsid escape attempt before journal finalization.
-        if self.path.exists():
-            self.kill_and_confirm_empty()
-            with contextlib.suppress(OSError):
-                self.path.rmdir()
+        return None
+
+    @staticmethod
+    def _leader_identity(pid: int):
+        try:
+            entry = os.stat(f"/proc/{pid}")
+            fields = pathlib.Path(f"/proc/{pid}/stat").read_text(encoding="ascii").rsplit(") ", 1)[1].split()
+            return (entry.st_uid, int(fields[19]), int(fields[3]), int(fields[2]), fields[0] == "Z")
+        except (FileNotFoundError, IndexError, ValueError, OSError):
+            return None
+
+    def _live_group_members(self, session: int, group: int) -> list[int]:
+        members = []
+        try:
+            candidates = list(pathlib.Path("/proc").iterdir())
+        except OSError as exc:
+            raise DeploymentError("cannot inspect supervised process group") from exc
+        for candidate in candidates:
+            if candidate.name.isdecimal():
+                identity = self._leader_identity(int(candidate.name))
+                if identity is not None and identity[0] == os.getuid() and identity[2] == session and identity[3] == group and not identity[4]:
+                    members.append(int(candidate.name))
+        return members
+
+    def _terminal_status(self, pid: int):
+        try:
+            return os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        except ChildProcessError as exc:
+            raise DeploymentError("supervised leader was reaped unexpectedly") from exc
+
+    def _report_activity(self, argv: list[str], environment: dict[str, str]):
+        if self.activity_callback is None:
+            return
+        executable = argv[0] if os.path.isabs(argv[0]) else shutil.which(argv[0], path=environment["PATH"])
+        if not executable:
+            raise DeploymentError("supervised executable is unavailable")
+        try:
+            entry = os.stat(executable)
+        except OSError as exc:
+            raise DeploymentError("cannot identify supervised executable") from exc
+        self.activity_callback({"kind": pathlib.Path(argv[0]).name, "executable": {"device": entry.st_dev, "inode": entry.st_ino, "size": entry.st_size, "mtime_ns": entry.st_mtime_ns}, "started": int(time.time())})
+
+    def _clear_activity(self):
+        if self.activity_callback is not None:
+            self.activity_callback(None)
+
+    def _cleanup(self, pid: int, identity, reason: str = "cleanup"):
+        current = self._leader_identity(pid)
+        if current is None or current[:4] != identity[:4]:
+            self.cleanup_unconfirmed = True
+            raise DeploymentError("supervised leader identity changed; refusing to signal")
+        session, group = identity[2], identity[3]
+        for signal_value, deadline in ((signal.SIGTERM, self.term_grace), (signal.SIGKILL, self.kill_grace)):
+            try:
+                os.killpg(group, signal_value)
+            except ProcessLookupError:
+                pass
+            end = time.monotonic() + deadline
+            while time.monotonic() < end:
+                if not self._live_group_members(session, group):
+                    return
+                time.sleep(0.02)
+        if self._live_group_members(session, group):
+            self.cleanup_unconfirmed = True
+            raise DeploymentError("cleanup-unconfirmed: supervised process group remains live")
+
+    @staticmethod
+    def _reap(pid: int):
+        try:
+            return os.waitid(os.P_PID, pid, os.WEXITED)
+        except ChildProcessError as exc:
+            raise DeploymentError("supervised leader was reaped unexpectedly") from exc
+
+    def run(self, argv: list[str], timeout: int | float | None = None, extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+        """Execute one argv action as a session leader and return bounded output.
+
+        A timeout, failure, signal, diagnostic overflow, or surviving group
+        member receives TERM for five seconds then KILL for five seconds. The
+        leader is reaped only after the group is observed empty.
+        """
+        if not argv or any(not isinstance(item, str) or "\x00" in item for item in argv):
+            raise DeploymentError("invalid supervised subprocess argv")
+        environment = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": os.environ.get("HOME", "/nonexistent"), "LC_ALL": "C", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_TERMINAL_PROMPT": "0"}
+        environment.update(extra_env or {})
+        self._report_activity(argv, environment)
+        try:
+            process = subprocess.Popen(argv, env=environment, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True, close_fds=True)
+        except Exception:
+            self._clear_activity()
+            raise
+        self.active_pid = process.pid
+        self.cleanup_unconfirmed = False
+        identity = self._leader_identity(process.pid)
+        if identity is None or identity[0] != os.getuid() or identity[2] != process.pid or identity[3] != process.pid:
+            process.kill()
+            try:
+                process.wait(timeout=self.kill_grace)
+                self.active_pid = None
+            except subprocess.TimeoutExpired:
+                self.cleanup_unconfirmed = True
+            if self.active_pid is None:
+                self._clear_activity()
+            raise DeploymentError("cannot establish supervised session identity")
+        selector = selectors.DefaultSelector()
+        stdout_fd = process.stdout.fileno()
+        stderr_fd = process.stderr.fileno()
+        streams = {stdout_fd: bytearray(), stderr_fd: bytearray()}
+        selector.register(process.stdout, selectors.EVENT_READ)
+        selector.register(process.stderr, selectors.EVENT_READ)
+        failure = None
+        deadline = time.monotonic() + (self.timeout if timeout is None else timeout)
+        terminal = None
+        try:
+            while terminal is None and failure is None:
+                remaining = max(0, deadline - time.monotonic())
+                for key, _ in selector.select(min(0.05, remaining)):
+                    chunk = os.read(key.fd, 65536)
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        continue
+                    remaining_capacity = self.diagnostic_limit - len(streams[key.fd])
+                    streams[key.fd].extend(chunk[:remaining_capacity])
+                    if len(chunk) > remaining_capacity:
+                        failure = "diagnostic output exceeded 1 MiB"
+                        break
+                terminal = self._terminal_status(process.pid)
+                if terminal is None and time.monotonic() >= deadline:
+                    failure = "supervised subprocess timed out"
+            if terminal is not None and terminal.si_code != os.CLD_EXITED:
+                failure = failure or "supervised subprocess exited by signal"
+            if terminal is not None and terminal.si_code == os.CLD_EXITED and terminal.si_status != 0:
+                failure = failure or "supervised subprocess failed"
+            live = self._live_group_members(identity[2], identity[3])
+            if live and (live != [process.pid] or terminal is not None):
+                failure = failure or "supervised process group has an unexpected live member"
+            if failure:
+                self._cleanup(process.pid, identity, failure)
+
+            drain_deadline = time.monotonic() + 1
+            while selector.get_map() and time.monotonic() < drain_deadline:
+                for key, _ in selector.select(min(0.05, max(0, drain_deadline - time.monotonic()))):
+                    chunk = os.read(key.fd, 65536)
+                    if chunk:
+                        remaining_capacity = self.diagnostic_limit - len(streams[key.fd])
+                        streams[key.fd].extend(chunk[:remaining_capacity])
+                        if len(chunk) > remaining_capacity:
+                            failure = failure or "diagnostic output exceeded 1 MiB"
+                    else:
+                        selector.unregister(key.fileobj)
+            if selector.get_map():
+                failure = failure or "diagnostic streams remained open after leader exit"
+                self._cleanup(process.pid, identity, failure)
+
+            stdout, stderr = bytes(streams[stdout_fd]), bytes(streams[stderr_fd])
+            if terminal is not None and terminal.si_code == os.CLD_EXITED and terminal.si_status != 0:
+                failure = failure or f"supervised subprocess failed with exit {terminal.si_status}; stderr-sha256={hashlib.sha256(stderr).hexdigest()}"
+            live = self._live_group_members(identity[2], identity[3])
+            if live and (live != [process.pid] or terminal is not None):
+                failure = failure or "supervised process group has an unexpected live member"
+                self._cleanup(process.pid, identity, failure)
+            if live and not failure:
+                raise DeploymentError("supervised leader remains live without terminal status")
+            reaped = self._reap(process.pid)
+            self.active_pid = None
+            process.returncode = reaped.si_status if reaped.si_code == os.CLD_EXITED else -reaped.si_status
+            if failure:
+                raise DeploymentError(failure)
+            return subprocess.CompletedProcess(argv, 0, stdout.decode("utf-8", "replace"), stderr.decode("utf-8", "replace"))
+        finally:
+            selector.close()
+            process.stdout.close()
+            process.stderr.close()
+            if self.active_pid is None:
+                self._clear_activity()
+
+    @property
+    def machine_cleanup_observed(self) -> bool:
+        """Return whether this supervisor owns no unresolved direct child."""
+        return self.active_pid is None and not self.cleanup_unconfirmed
 
 
-def validate_image_runtime(scope: CgroupScope, staged_image: pathlib.Path, artifact: dict, staged_msk: pathlib.Path, msk_commit: str, staged_opencode: pathlib.Path, opencode_authority: dict) -> dict:
+def validate_image_runtime(scope: SessionScope, staged_image: pathlib.Path, artifact: dict, staged_msk: pathlib.Path, msk_commit: str, staged_opencode: pathlib.Path, opencode_authority: dict) -> dict:
     """Validate architecture, embedded manifest, and unique OpenCode release tag.
 
     Runtime execution receives only the staged image under a clean environment,
@@ -1178,7 +1311,7 @@ class DeploymentJournal:
         self.id = deployment_id or str(uuid.uuid4())
         self.bundle = state_root / (self.id + ".bundle")
         self.bundle.mkdir(mode=0o700)
-        self.record = {"schema": SCHEMA, "id": self.id, "deployer": DEPLOYER_ID, "state": "in_progress", "state_root": str(state_root), "verified_release": verified_release, "recovery_bundle": self.bundle.name, "resources": resources, "bundle_digests": {}}
+        self.record = {"schema": SCHEMA, "id": self.id, "deployer": DEPLOYER_ID, "state": "in_progress", "phase": "journal", "final_mutation_started": False, "state_root": str(state_root), "verified_release": verified_release, "recovery_bundle": self.bundle.name, "resources": resources, "bundle_digests": {}, "process_cleanup": {"machine_observed": False, "operator_asserted": False}}
         self.path = state_root / (self.id + ".json")
 
     def retain(self, name: str, source: pathlib.Path):
@@ -1208,9 +1341,18 @@ class DeploymentJournal:
         """Durably update the journal before the next final-path mutation."""
         atomic_json(self.path, self.record)
 
-    def failed(self, phase: str, reason: str):
+    def record_action(self, action: dict | None):
+        """Persist redacted subprocess context for interruption diagnostics."""
+        if action is None:
+            self.record.pop("active_action", None)
+        else:
+            self.record["active_action"] = action
+        self.persist()
+
+    def failed(self, phase: str, reason: str, machine_cleanup_observed: bool = True):
         """Finalize a catchable failure while retaining all recovery evidence."""
-        self.record.update({"state": "failed", "phase": phase, "diagnostic": redact(reason)})
+        state = "failed" if machine_cleanup_observed else "in_progress"
+        self.record.update({"state": state, "phase": phase, "process_cleanup": {"machine_observed": machine_cleanup_observed, "operator_asserted": False}, "diagnostic": redact(reason)})
         self.persist()
 
     def succeeded(self, receipt: dict):
@@ -1256,12 +1398,12 @@ def _artifact_for(release: dict) -> dict:
     return found[0]
 
 
-def _contained_git(scope: CgroupScope, argv: list[str], extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
-    """Run one mutation-bearing Git operation inside the delegated scope."""
+def _contained_git(scope: SessionScope, argv: list[str], extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+    """Run one mutation-bearing Git operation in a supervised POSIX session."""
     return scope.run(["git", "-c", "core.hooksPath=/dev/null", "-c", "init.templateDir=", *argv], extra_env=extra_env)
 
 
-def stage_child(url: str, commit: str, staging_root: pathlib.Path, name: str, scope: CgroupScope) -> pathlib.Path:
+def stage_child(url: str, commit: str, staging_root: pathlib.Path, name: str, scope: SessionScope) -> pathlib.Path:
     """Fetch one exact child object into an independent private bare repository."""
     bare = staging_root / (name.replace("/", "_") + ".git")
     _contained_git(scope, ["init", "--bare", str(bare)])
@@ -1288,7 +1430,7 @@ def validate_configuration_pin(staged_mkchad: pathlib.Path, mkchad_commit: str, 
         raise DeploymentError("MkChad opencode_nvim_revision does not match the parent gitlink")
 
 
-def retain_repository_bundle(journal: DeploymentJournal, name: str, repository: pathlib.Path, commits: list[str], scope: CgroupScope):
+def retain_repository_bundle(journal: DeploymentJournal, name: str, repository: pathlib.Path, commits: list[str], scope: SessionScope):
     """Retain exact Git objects for network-independent complete or restore."""
     refs = []
     try:
@@ -1323,7 +1465,7 @@ def _no_replace_rename(source: pathlib.Path, destination: pathlib.Path):
         raise DeploymentError(f"renameat2(RENAME_NOREPLACE) failed: {os.strerror(err)}")
 
 
-def install_or_update_component(destination: pathlib.Path, staged: pathlib.Path, component: dict, authority: dict, journal: DeploymentJournal, scope: CgroupScope, preflight: dict):
+def install_or_update_component(destination: pathlib.Path, staged: pathlib.Path, component: dict, authority: dict, journal: DeploymentJournal, scope: SessionScope, preflight: dict):
     """Install an absent checkout or detached-update a preflighted clean checkout."""
     commit, repository = authority["commit"], authority["repository"]
     preserved = {"opencode-server.json"} if component["name"] == "mkchad" else set()
@@ -1365,7 +1507,7 @@ def install_or_update_component(destination: pathlib.Path, staged: pathlib.Path,
     return {"name": component["name"], "repository": repository, "destination": str(destination), "previous_revision": None, "revision": commit, "result": "installed"}
 
 
-def run_installer_actions(scope: CgroupScope, component: dict, msk_destination: pathlib.Path, staged_image: pathlib.Path, expected_digest: str, expected_target: str, revision: str, journal: DeploymentJournal) -> list[dict]:
+def run_installer_actions(scope: SessionScope, component: dict, msk_destination: pathlib.Path, staged_image: pathlib.Path, expected_digest: str, expected_target: str, revision: str, journal: DeploymentJournal) -> list[dict]:
     """Run the U1 installer-owned public actions from the pinned checkout.
 
     The host-tool check is deliberately separate from apply.  The recovery
@@ -1531,7 +1673,7 @@ def _atomic_restore_file(source: pathlib.Path, target: pathlib.Path, mode: int):
             temporary_path.unlink()
 
 
-def recover_host_tools(resource: dict, mode: str, component: dict, bundle: pathlib.Path, roots: dict[str, pathlib.Path], scope: CgroupScope) -> dict:
+def recover_host_tools(resource: dict, mode: str, component: dict, bundle: pathlib.Path, roots: dict[str, pathlib.Path], scope: SessionScope) -> dict:
     """Complete through the pinned installer or restore retained host-tool bytes."""
     home = roots["home"]
     msk_destination = resolve_named_destination(roots, component["destination"]["root"], component["destination"]["path"])
@@ -1593,7 +1735,7 @@ def _replace_managed_link(container_dir: pathlib.Path, link_name: str, target_na
         temporary.unlink(missing_ok=True)
 
 
-def recover_image(resource: dict, mode: str, component: dict, bundle: pathlib.Path, roots: dict[str, pathlib.Path], scope: CgroupScope) -> dict:
+def recover_image(resource: dict, mode: str, component: dict, bundle: pathlib.Path, roots: dict[str, pathlib.Path], scope: SessionScope) -> dict:
     """Complete image installation or restore retained active/previous links."""
     classify_image_resource(resource, roots)
     msk_destination = resolve_named_destination(roots, component["destination"]["root"], component["destination"]["path"])
@@ -1772,7 +1914,7 @@ def deploy(repo: pathlib.Path, verified_release: pathlib.Path, image: pathlib.Pa
 
     The function stages Git objects and image bytes before final-path mutation,
     holds a per-user lock, journals each component mutation, and leaves services
-    untouched.  It raises ``DeploymentError`` on any unavailable containment,
+    untouched.  It raises ``DeploymentError`` on any unavailable supervision,
     unsafe path, local work, or action failure; catchable post-journal errors are
     retained as failed records for explicit recovery.
     """
@@ -1790,20 +1932,25 @@ def deploy(repo: pathlib.Path, verified_release: pathlib.Path, image: pathlib.Pa
             raise DeploymentError("malformed deployment state blocks new deployment")
         if record.get("state") in {"failed", "in_progress"}:
             raise DeploymentError("unreconciled deployment requires bootstrap recover")
-    runtime_root = pathlib.Path(os.environ.get("XDG_RUNTIME_DIR", f"/tmp/mkchad-{os.getuid()}"))
-    _safe_owned_directory(runtime_root, create=True)
     artifact = _artifact_for(release)
-    cgroup_root_text = os.environ.get("MKCHAD_DEPLOY_CGROUP_ROOT")
-    if not cgroup_root_text:
-        raise DeploymentError("missing delegated cgroup-v2 containment root")
     with HostInterlock(roots, maintenance_quiesced):
         deployment_id = str(uuid.uuid4())
-        staging = pathlib.Path(tempfile.mkdtemp(prefix="mkchad-deploy-", dir=runtime_root))
-        os.chmod(staging, 0o700)
-        journal = None
+        journal = DeploymentJournal(state_root, evidence, [], deployment_id)
+        staging = journal.bundle / "staging"
+        staging.mkdir(mode=0o700)
+        fsync_directory(journal.bundle)
+        scope = None
         phase = "stage"
         try:
-            with CgroupScope(pathlib.Path(cgroup_root_text), deployment_id) as scope:
+            # Persist the authenticated minimum before candidate-controlled code.
+            journal.record["component_authority"] = gitlinks
+            journal.retain("release.json", _release_file(repo))
+            journal.retain("verified-release.json", verified_release)
+            journal.retain("deployer.py", pathlib.Path(__file__).resolve())
+            journal.retain("release-v1.schema.json", repo / "deploy" / "release-v1.schema.json")
+            journal.retain("receipt-v1.schema.json", repo / "deploy" / "receipt-v1.schema.json")
+            journal.persist()
+            with SessionScope(activity_callback=journal.record_action) as scope:
                 staged_image = snapshot_image(image, staging / "image", artifact["sha256"], artifact["architecture"])
                 staged = {}
                 for component in release["components"]:
@@ -1833,19 +1980,9 @@ def deploy(repo: pathlib.Path, verified_release: pathlib.Path, image: pathlib.Pa
                 elif nested_preflight["kind"] in {"absent", "parent-absent"}:
                     nested_resource = {"kind": "nested-checkout", "name": "msk_containers", "previous": None, "intended": nested_authority["commit"], "state": "pending"}
                 phase = "journal"
-                resources = []
-                journal = DeploymentJournal(state_root, evidence, resources, deployment_id)
-                journal.record["cgroup_name"] = scope.path.name
-                journal.record["cgroup_identity"] = _identity(scope.path)
-                journal.record["component_authority"] = gitlinks
                 journal.record["nested_authority"] = nested_authority
                 if nested_resource is not None:
                     journal.record["resources"].append(nested_resource)
-                journal.retain("release.json", _release_file(repo))
-                journal.retain("verified-release.json", verified_release)
-                journal.retain("deployer.py", pathlib.Path(__file__).resolve())
-                journal.retain("release-v1.schema.json", repo / "deploy" / "release-v1.schema.json")
-                journal.retain("receipt-v1.schema.json", repo / "deploy" / "receipt-v1.schema.json")
                 journal.retain(staged_image.name, staged_image)
                 journal.retain(staged_image.name + ".sha256", pathlib.Path(str(staged_image) + ".sha256"))
                 if evidence["trust"] == "ssh-signed-tag":
@@ -1862,6 +1999,7 @@ def deploy(repo: pathlib.Path, verified_release: pathlib.Path, image: pathlib.Pa
                 if nested_resource and nested_resource["previous"]:
                     nested_commits.append(nested_resource["previous"])
                 retain_repository_bundle(journal, "container-tools", staged_container_tools, nested_commits, scope)
+                journal.record["final_mutation_started"] = True
                 journal.persist()
                 phase = "components"
                 results = []
@@ -1893,22 +2031,26 @@ def deploy(repo: pathlib.Path, verified_release: pathlib.Path, image: pathlib.Pa
                     if not final_checkout["compliant"]:
                         raise DeploymentError(f"component verification failed: {component['name']}")
                 phase = "finalize"
-                receipt = {"schema": SCHEMA, "id": journal.id, "deployer": DEPLOYER_ID, "state": "succeeded", "phase": "finalized", "trust": {"kind": evidence["trust"], "parent_commit": evidence["parent_commit"], "tag_object": evidence.get("tag_object"), "key_fingerprint": evidence.get("key_fingerprint")}, "components": results, "artifact": {"sha256": artifact["sha256"], "architecture": artifact["architecture"]}, "actions": actions, "configuration_handoff": release["configuration"], "recovery": {"available": False}, "diagnostic": "deployment completed without reading configuration-owned content"}
+                receipt = {"schema": SCHEMA, "id": journal.id, "deployer": DEPLOYER_ID, "state": "succeeded", "phase": "finalized", "trust": {"kind": evidence["trust"], "parent_commit": evidence["parent_commit"], "tag_object": evidence.get("tag_object"), "key_fingerprint": evidence.get("key_fingerprint")}, "components": results, "artifact": {"sha256": artifact["sha256"], "architecture": artifact["architecture"]}, "actions": actions, "configuration_handoff": release["configuration"], "recovery": {"available": False}, "process_cleanup": {"machine_observed": True, "operator_asserted": False}, "diagnostic": "deployment completed without reading configuration-owned content"}
                 receipt_path = state_root / (journal.id + ".receipt.json")
                 atomic_json(receipt_path, receipt, no_replace=True)
                 journal.succeeded(receipt)
                 return receipt
         except Exception as exc:
             if journal is not None:
-                journal.failed(phase, str(exc))
+                machine_cleanup_observed = scope.machine_cleanup_observed if scope is not None else True
+                journal.failed(phase, str(exc), machine_cleanup_observed)
             if isinstance(exc, DeploymentError):
                 raise
             raise DeploymentError(str(exc)) from exc
         finally:
-            shutil.rmtree(staging, ignore_errors=True)
+            if journal.record.get("state") != "in_progress":
+                shutil.rmtree(staging, ignore_errors=True)
+                if journal.bundle.exists():
+                    fsync_directory(journal.bundle)
 
 
-def recover(state_root: pathlib.Path, deployment_id: str, mode: str) -> dict:
+def recover(state_root: pathlib.Path, deployment_id: str, mode: str, confirm_processes_quiesced: bool = False) -> dict:
     """Classify an authenticated journal for explicit offline complete/restore.
 
     Args:
@@ -1916,6 +2058,8 @@ def recover(state_root: pathlib.Path, deployment_id: str, mode: str) -> dict:
         deployment_id: UUID naming exactly one failed/in-progress record.
         mode: ``complete`` accepts only resources already at intended state;
             ``restore`` accepts only resources still at recorded pre-state.
+        confirm_processes_quiesced: Required only for ``in_progress`` records
+            after the operator has independently established quiescence.
 
     Returns:
         A durable recovery receipt.
@@ -1927,9 +2071,16 @@ def recover(state_root: pathlib.Path, deployment_id: str, mode: str) -> dict:
     if mode not in {"complete", "restore"}:
         raise DeploymentError("recovery mode must be complete or restore")
     record = load_recovery_record(state_root, deployment_id)
+    if record["state"] == "in_progress" and not confirm_processes_quiesced:
+        raise DeploymentError("in-progress recovery requires --confirm-processes-quiesced after independent operator inspection")
+    if record["state"] == "failed" and confirm_processes_quiesced:
+        raise DeploymentError("--confirm-processes-quiesced is rejected for finalized failed records")
+    if not record.get("final_mutation_started", False) and mode != "restore":
+        raise DeploymentError("pre-mutation deployment records permit restore only")
     bundle = state_root / record.get("recovery_bundle", "")
     if bundle.parent != state_root or not bundle.is_dir():
         raise DeploymentError("missing recovery bundle")
+    _safe_owned_directory(bundle)
     for name, expected in record.get("bundle_digests", {}).items():
         path = bundle / name
         if path.parent != bundle or not SHA256.fullmatch(expected):
@@ -1937,82 +2088,107 @@ def recover(state_root: pathlib.Path, deployment_id: str, mode: str) -> dict:
         _regular_owned(path, 0o600)
         if _digest(path) != expected:
             raise DeploymentError("tampered recovery bundle")
-    release = load_json(bundle / "release.json", "retained release metadata")
-    evidence = load_json(bundle / "verified-release.json", "retained release evidence")
-    recorded_authorities = record.get("component_authority")
-    if not isinstance(recorded_authorities, dict):
-        raise DeploymentError("recovery record lacks component authority")
-    retained_parent = pathlib.Path(tempfile.mkdtemp(prefix="mkchad-recovery-parent-"))
-    try:
-        repository = retained_parent / "parent.git"
-        run_git(["clone", "--mirror", str(bundle / "parent.bundle"), str(repository)])
-        authorities = derive_gitlinks(repository, evidence["parent_commit"])
-    finally:
-        shutil.rmtree(retained_parent, ignore_errors=True)
-    if authorities != recorded_authorities:
-        raise DeploymentError("recorded component authority does not match the retained parent release")
-    retained_msk = pathlib.Path(tempfile.mkdtemp(prefix="mkchad-recovery-msk-"))
-    try:
-        repository = retained_msk / "msk.git"
-        run_git(["clone", "--mirror", str(bundle / "msk_containers.bundle"), str(repository)])
-        nested_authorities = derive_gitlinks(repository, authorities["msk_containers"]["commit"])
-    finally:
-        shutil.rmtree(retained_msk, ignore_errors=True)
-    if set(nested_authorities) != {"container_tools"} or nested_authorities["container_tools"] != record.get("nested_authority"):
-        raise DeploymentError("nested component authority does not match the retained msk_containers release")
-    nested_authority = nested_authorities["container_tools"]
-    validate_release_document(release, list(authorities))
-    roots = _roots()
-    for root in roots.values():
-        _safe_owned_directory(root)
-    cgroup_root_text = os.environ.get("MKCHAD_DEPLOY_CGROUP_ROOT")
-    if not cgroup_root_text:
-        raise DeploymentError("recovery requires the delegated cgroup-v2 root")
-    cgroup_root = pathlib.Path(cgroup_root_text)
-    quiesce_recorded_cgroup(record, deployment_id, cgroup_root)
-    components = {component["name"]: component for component in release["components"]}
-    fresh_recovery = any(resource.get("kind") == "checkout" and resource.get("name") == "mkchad" and resource.get("previous") is None for resource in record["resources"])
-    with HostInterlock(roots, allow_missing_lifecycle=fresh_recovery):
-        cleanup_journal_owned_indexes(record, components, roots)
-        classify_recovery_resources(record["resources"], components, authorities, roots, mode, nested_authority)
-        record["recovery_attempt"] = {"mode": mode, "started": int(time.time()), "results": []}
-        atomic_json(state_root / (deployment_id + ".json"), record)
-        with CgroupScope(cgroup_root, deployment_id + "-recovery") as scope:
-            priorities = (
-                {"directory": 0, "checkout": 1, "nested-checkout": 2, "host-tools": 3, "image": 4}
-                if mode == "complete"
-                else {"image": 0, "host-tools": 1, "nested-checkout": 2, "checkout": 3, "directory": 4}
-            )
-            ordered_resources = sorted(enumerate(record["resources"]), key=lambda item: (priorities.get(item[1].get("kind"), 99), item[0] if mode == "complete" else -item[0]))
-            ordered_resources = [resource for _, resource in ordered_resources]
-            for resource in ordered_resources:
-                name = resource.get("name")
-                if name not in components or name not in authorities:
-                    raise DeploymentError("unknown recovery component")
-                if resource.get("kind") == "checkout":
-                    result = recover_checkout_resource(resource, mode, components[name], authorities[name], bundle, roots, scope)
-                elif resource.get("kind") == "nested-checkout":
-                    result = recover_checkout_resource(resource, mode, nested_component_contract(components["msk_containers"]), nested_authority, bundle, roots, scope, "container-tools")
-                elif resource.get("kind") == "directory":
-                    result = recover_directory_resource(resource, mode, components[name], roots)
-                elif resource.get("kind") == "host-tools":
-                    result = recover_host_tools(resource, mode, components[name], bundle, roots, scope)
-                elif resource.get("kind") == "image":
-                    result = recover_image(resource, mode, components[name], bundle, roots, scope)
-                else:
-                    raise DeploymentError("unknown recovery resource")
-                record["recovery_attempt"]["results"].append(result)
-                atomic_json(state_root / (deployment_id + ".json"), record)
-            if mode == "complete":
-                synthetic = {"kind": "nested-checkout", "name": "msk_containers", "previous": None, "intended": nested_authority["commit"]}
-                result = recover_checkout_resource(synthetic, mode, nested_component_contract(components["msk_containers"]), nested_authority, bundle, roots, scope, "container-tools")
-                record["recovery_attempt"]["results"].append(result)
-                atomic_json(state_root / (deployment_id + ".json"), record)
-    record["state"] = "recovered_" + mode
-    record["recovery"] = {"mode": mode, "time": int(time.time())}
+    record["state"] = "in_progress"
+    record["phase"] = "recovering"
+    record["process_cleanup"] = {"machine_observed": False, "operator_asserted": confirm_processes_quiesced}
+    record["recovery_attempt"] = {"id": str(uuid.uuid4()), "mode": mode, "started": int(time.time()), "results": []}
     atomic_json(state_root / (deployment_id + ".json"), record)
-    shutil.rmtree(bundle)
-    return record
+    scope = None
+    try:
+        if not record.get("final_mutation_started", False):
+            record["recovery_attempt"]["results"].append({"result": "pre-mutation-private-staging-removed"})
+            record["state"] = "recovered_restore"
+            record["process_cleanup"] = {"machine_observed": True, "operator_asserted": confirm_processes_quiesced}
+            record["recovery"] = {"mode": "restore", "time": int(time.time()), "final_paths_changed": False}
+            atomic_json(state_root / (deployment_id + ".json"), record)
+            shutil.rmtree(bundle)
+            fsync_directory(state_root)
+            return record
+        release = load_json(bundle / "release.json", "retained release metadata")
+        evidence = load_json(bundle / "verified-release.json", "retained release evidence")
+        recorded_authorities = record.get("component_authority")
+        if not isinstance(recorded_authorities, dict):
+            raise DeploymentError("recovery record lacks component authority")
+        retained_parent = pathlib.Path(tempfile.mkdtemp(prefix="mkchad-recovery-parent-"))
+        try:
+            repository = retained_parent / "parent.git"
+            run_git(["clone", "--mirror", str(bundle / "parent.bundle"), str(repository)])
+            authorities = derive_gitlinks(repository, evidence["parent_commit"])
+        finally:
+            shutil.rmtree(retained_parent, ignore_errors=True)
+        if authorities != recorded_authorities:
+            raise DeploymentError("recorded component authority does not match the retained parent release")
+        retained_msk = pathlib.Path(tempfile.mkdtemp(prefix="mkchad-recovery-msk-"))
+        try:
+            repository = retained_msk / "msk.git"
+            run_git(["clone", "--mirror", str(bundle / "msk_containers.bundle"), str(repository)])
+            nested_authorities = derive_gitlinks(repository, authorities["msk_containers"]["commit"])
+        finally:
+            shutil.rmtree(retained_msk, ignore_errors=True)
+        if set(nested_authorities) != {"container_tools"} or nested_authorities["container_tools"] != record.get("nested_authority"):
+            raise DeploymentError("nested component authority does not match the retained msk_containers release")
+        nested_authority = nested_authorities["container_tools"]
+        validate_release_document(release, list(authorities))
+        roots = _roots()
+        for root in roots.values():
+            _safe_owned_directory(root)
+        components = {component["name"]: component for component in release["components"]}
+        fresh_recovery = any(resource.get("kind") == "checkout" and resource.get("name") == "mkchad" and resource.get("previous") is None for resource in record["resources"])
+        with HostInterlock(roots, allow_missing_lifecycle=fresh_recovery):
+            cleanup_journal_owned_indexes(record, components, roots)
+            classify_recovery_resources(record["resources"], components, authorities, roots, mode, nested_authority)
+            def record_recovery_action(action):
+                if action is None:
+                    record.pop("active_action", None)
+                else:
+                    record["active_action"] = action
+                atomic_json(state_root / (deployment_id + ".json"), record)
+
+            with SessionScope(activity_callback=record_recovery_action) as scope:
+                priorities = (
+                    {"directory": 0, "checkout": 1, "nested-checkout": 2, "host-tools": 3, "image": 4}
+                    if mode == "complete"
+                    else {"image": 0, "host-tools": 1, "nested-checkout": 2, "checkout": 3, "directory": 4}
+                )
+                ordered_resources = sorted(enumerate(record["resources"]), key=lambda item: (priorities.get(item[1].get("kind"), 99), item[0] if mode == "complete" else -item[0]))
+                ordered_resources = [resource for _, resource in ordered_resources]
+                for resource in ordered_resources:
+                    name = resource.get("name")
+                    if name not in components or name not in authorities:
+                        raise DeploymentError("unknown recovery component")
+                    if resource.get("kind") == "checkout":
+                        result = recover_checkout_resource(resource, mode, components[name], authorities[name], bundle, roots, scope)
+                    elif resource.get("kind") == "nested-checkout":
+                        result = recover_checkout_resource(resource, mode, nested_component_contract(components["msk_containers"]), nested_authority, bundle, roots, scope, "container-tools")
+                    elif resource.get("kind") == "directory":
+                        result = recover_directory_resource(resource, mode, components[name], roots)
+                    elif resource.get("kind") == "host-tools":
+                        result = recover_host_tools(resource, mode, components[name], bundle, roots, scope)
+                    elif resource.get("kind") == "image":
+                        result = recover_image(resource, mode, components[name], bundle, roots, scope)
+                    else:
+                        raise DeploymentError("unknown recovery resource")
+                    record["recovery_attempt"]["results"].append(result)
+                    atomic_json(state_root / (deployment_id + ".json"), record)
+                if mode == "complete":
+                    synthetic = {"kind": "nested-checkout", "name": "msk_containers", "previous": None, "intended": nested_authority["commit"]}
+                    result = recover_checkout_resource(synthetic, mode, nested_component_contract(components["msk_containers"]), nested_authority, bundle, roots, scope, "container-tools")
+                    record["recovery_attempt"]["results"].append(result)
+                    atomic_json(state_root / (deployment_id + ".json"), record)
+        record["state"] = "recovered_" + mode
+        record["process_cleanup"] = {"machine_observed": True, "operator_asserted": confirm_processes_quiesced}
+        record["recovery"] = {"mode": mode, "time": int(time.time())}
+        atomic_json(state_root / (deployment_id + ".json"), record)
+        shutil.rmtree(bundle)
+        fsync_directory(state_root)
+        return record
+    except Exception as exc:
+        machine_cleanup_observed = scope.machine_cleanup_observed if scope is not None else True
+        record["state"] = "failed" if machine_cleanup_observed else "in_progress"
+        record["process_cleanup"] = {"machine_observed": machine_cleanup_observed, "operator_asserted": confirm_processes_quiesced}
+        record["diagnostic"] = redact(str(exc))
+        atomic_json(state_root / (deployment_id + ".json"), record)
+        raise
 
 
 def spawn_supervisor(argv: list[str]) -> int:
@@ -2020,7 +2196,7 @@ def spawn_supervisor(argv: list[str]) -> int:
 
     The child inherits only standard streams and the explicitly minimized
     deployment environment. If this user-facing controller dies, the supervisor
-    remains alive and continues owning the interlocks, cgroup, and journal.
+    remains alive and continues owning the interlocks and journal.
     """
     process = subprocess.Popen(argv, close_fds=True, start_new_session=True)
     return process.wait()
@@ -2056,13 +2232,10 @@ def validate_release_inputs(repo: pathlib.Path, image: pathlib.Path, trust_root:
     if not guidance.is_file():
         raise DeploymentError("configuration guidance is missing from the candidate")
     artifact = _artifact_for(release)
-    cgroup_root_text = os.environ.get("MKCHAD_DEPLOY_CGROUP_ROOT")
-    if not cgroup_root_text:
-        raise DeploymentError("release validation requires delegated cgroup-v2 containment")
     staging = pathlib.Path(tempfile.mkdtemp(prefix="mkchad-validate-"))
     os.chmod(staging, 0o700)
     try:
-        with CgroupScope(pathlib.Path(cgroup_root_text), "validate-" + str(uuid.uuid4())) as scope:
+        with SessionScope() as scope:
             staged_image = snapshot_image(image, staging / "image", artifact["sha256"], artifact["architecture"])
             staged = {}
             for component in release["components"]:
@@ -2080,35 +2253,6 @@ def validate_release_inputs(repo: pathlib.Path, image: pathlib.Path, trust_root:
             return {"state": "validated", "parent_commit": run_git(["rev-parse", "HEAD"], repo).stdout.strip(), "components": sorted(gitlinks), "artifact": {"sha256": artifact["sha256"], "architecture": artifact["architecture"]}, "component_manifest": manifest}
     finally:
         shutil.rmtree(staging, ignore_errors=True)
-
-
-def quiesce_recorded_cgroup(record: dict, deployment_id: str, cgroup_root: pathlib.Path):
-    """Kill only the identity-proven deployment scope and prove it empty."""
-    expected_name = "mkchad-deploy-" + deployment_id
-    if record.get("cgroup_name") != expected_name:
-        raise DeploymentError("deployment record has an invalid cgroup identity")
-    scope = cgroup_root / expected_name
-    if not scope.exists():
-        return
-    if scope.is_symlink() or not scope.is_dir():
-        raise DeploymentError("recorded deployment cgroup is unsafe")
-    if _identity(scope) != tuple(record.get("cgroup_identity", ())):
-        raise DeploymentError("recorded deployment cgroup identity changed")
-    for attempt in range(100):
-        events = (scope / "cgroup.events").read_text(encoding="ascii")
-        if re.search(r"(?m)^populated 0$", events):
-            return
-        if attempt == 0:
-            try:
-                fd = os.open(scope / "cgroup.kill", os.O_WRONLY | os.O_NOFOLLOW)
-                try:
-                    os.write(fd, b"1")
-                finally:
-                    os.close(fd)
-            except OSError as exc:
-                raise DeploymentError("cannot quiesce the recorded deployment cgroup") from exc
-        time.sleep(0.02)
-    raise DeploymentError("recorded deployment cgroup remains populated after kill")
 
 
 def cleanup_journal_owned_indexes(record: dict, components: dict, roots: dict[str, pathlib.Path]):
@@ -2146,7 +2290,7 @@ def cleanup_journal_owned_indexes(record: dict, components: dict, roots: dict[st
                 fsync_directory(git_dir)
 
 
-def recover_checkout_resource(resource: dict, mode: str, component: dict, authority: dict, bundle: pathlib.Path, roots: dict[str, pathlib.Path], scope: CgroupScope, bundle_name: str | None = None) -> dict:
+def recover_checkout_resource(resource: dict, mode: str, component: dict, authority: dict, bundle: pathlib.Path, roots: dict[str, pathlib.Path], scope: SessionScope, bundle_name: str | None = None) -> dict:
     """Complete or restore one checkout using only its authenticated bundle."""
     name = resource.get("name")
     if name != component.get("name") or resource.get("intended") != authority.get("commit"):
@@ -2281,6 +2425,12 @@ def main(argv: list[str] | None = None) -> int:
     recovery.add_argument("--deployment-id", required=True)
     recovery.add_argument("--mode", required=True, choices=("complete", "restore"))
     recovery.add_argument("--state-root", type=pathlib.Path, required=True)
+    recovery.add_argument("--confirm-processes-quiesced", action="store_true")
+    recovery_supervisor = commands.add_parser("recover-supervise", help=argparse.SUPPRESS)
+    recovery_supervisor.add_argument("--deployment-id", required=True)
+    recovery_supervisor.add_argument("--mode", required=True, choices=("complete", "restore"))
+    recovery_supervisor.add_argument("--state-root", type=pathlib.Path, required=True)
+    recovery_supervisor.add_argument("--confirm-processes-quiesced", action="store_true")
     args = parser.parse_args(argv)
     try:
         if args.command == "validate-release":
@@ -2299,8 +2449,13 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps(deploy(args.repo, args.verified_release, args.image, args.state_root, args.maintenance_quiesced), sort_keys=True))
             finally:
                 cleanup_bootstrap_root(args.bootstrap_root, args.repo)
+        elif args.command == "recover":
+            command = [sys.executable, str(pathlib.Path(__file__).resolve()), "recover-supervise", "--deployment-id", args.deployment_id, "--mode", args.mode, "--state-root", str(args.state_root)]
+            if args.confirm_processes_quiesced:
+                command.append("--confirm-processes-quiesced")
+            return spawn_supervisor(command)
         else:
-            print(json.dumps(recover(args.state_root, args.deployment_id, args.mode), sort_keys=True))
+            print(json.dumps(recover(args.state_root, args.deployment_id, args.mode, args.confirm_processes_quiesced), sort_keys=True))
         return 0
     except DeploymentError as exc:
         print("mkchad-deploy: " + redact(str(exc)), file=sys.stderr)

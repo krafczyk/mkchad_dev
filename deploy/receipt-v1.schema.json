@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "MkChad deployment receipt schema 1",
   "type": "object",
-  "required": ["schema", "id", "deployer", "state", "phase", "trust", "components", "artifact", "actions", "configuration_handoff", "recovery", "diagnostic"],
+  "required": ["schema", "id", "deployer", "state", "phase", "trust", "components", "artifact", "actions", "configuration_handoff", "recovery", "process_cleanup", "diagnostic"],
   "additionalProperties": false,
   "properties": {
     "schema": {"const": 1},
@@ -16,6 +16,15 @@
     "actions": {"type": "array"},
     "configuration_handoff": {"type": "object"},
     "recovery": {"type": "object"},
+    "process_cleanup": {
+      "type": "object",
+      "required": ["machine_observed", "operator_asserted"],
+      "additionalProperties": false,
+      "properties": {
+        "machine_observed": {"type": "boolean"},
+        "operator_asserted": {"type": "boolean"}
+      }
+    },
     "diagnostic": {"type": "string"}
   }
 }

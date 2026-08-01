@@ -5,6 +5,8 @@ import importlib.util
 import json
 import os
 import pathlib
+import contextlib
+import signal
 import shutil
 import tempfile
 import unittest
@@ -230,44 +232,148 @@ class DeploymentValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(self.deploy.DeploymentError, "does not match"):
             self.deploy.validate_configuration_pin(mkchad, mkchad_commit, "2" * 40)
 
-    def test_missing_cgroup_delegation_blocks_before_subprocesses(self):
-        with self.assertRaisesRegex(self.deploy.DeploymentError, "cgroup"):
-            with self.deploy.CgroupScope(self.root / "absent", "scope"):
-                pass
+    def test_session_scope_needs_no_cgroup_environment_and_captures_output(self):
+        activities = []
+        with mock.patch.dict(os.environ, {}, clear=True):
+            scope = self.deploy.SessionScope(activity_callback=activities.append)
+            result = scope.run([sys.executable, "-c", "print('ok')", "secret-argument"])
+        self.assertEqual(result.stdout, "ok\n")
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(activities[-1], None)
+        self.assertEqual(activities[0]["kind"], pathlib.Path(sys.executable).name)
+        self.assertNotIn("secret-argument", json.dumps(activities[0]))
 
-    def test_cgroup_scope_enrolls_before_exec_and_kills_on_timeout(self):
-        root = self.root / "cgroup"
-        scope = self.deploy.CgroupScope(root, "fixture")
-        scope.path.mkdir(parents=True)
-        for name, content in (("cgroup.procs", ""), ("cgroup.events", "populated 0\n"), ("cgroup.kill", "")):
-            (scope.path / name).write_text(content, encoding="ascii")
+    def test_session_scope_bounds_diagnostics_and_escalates_term_then_kill(self):
+        scope = self.deploy.SessionScope(timeout=0.01, term_grace=0.01, kill_grace=0.01)
+        with self.assertRaisesRegex(self.deploy.DeploymentError, "timed out"):
+            scope.run([sys.executable, "-c", "import time; time.sleep(60)"])
+        scope = self.deploy.SessionScope(timeout=1, term_grace=0.01, kill_grace=0.01)
+        with self.assertRaisesRegex(self.deploy.DeploymentError, "diagnostic output exceeded"):
+            scope.run([sys.executable, "-c", "import sys; sys.stderr.write('x' * (1024 * 1024 + 1))"])
 
-        def timeout_run(*args, **kwargs):
-            kwargs["preexec_fn"]()
-            raise subprocess.TimeoutExpired(args[0], kwargs["timeout"])
+    def test_session_scope_reaps_only_after_group_cleanup_and_detects_reuse_fence(self):
+        scope = self.deploy.SessionScope()
+        process = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        while scope._terminal_status(process.pid) is None:
+            time.sleep(0.01)
+        identity = scope._leader_identity(process.pid)
+        self.assertTrue(identity[4])
+        scope._cleanup(process.pid, identity)
+        scope._reap(process.pid)
+        process.returncode = 0
+        with mock.patch.object(scope, "_leader_identity", return_value=(os.getuid(), 1, process.pid, process.pid, False)):
+            with self.assertRaisesRegex(self.deploy.DeploymentError, "identity changed"):
+                scope._cleanup(process.pid, (os.getuid(), 2, process.pid, process.pid, False))
 
-        with mock.patch.object(subprocess, "run", side_effect=timeout_run):
-            with self.assertRaisesRegex(self.deploy.DeploymentError, "timed out"):
-                scope.run(["/bin/true"], timeout=1)
-        self.assertEqual((scope.path / "cgroup.procs").read_text(encoding="ascii"), str(os.getpid()))
-        self.assertEqual((scope.path / "cgroup.kill").read_text(encoding="ascii"), "1")
+    def test_session_scope_bounds_pipe_drain_when_escaped_descendant_holds_streams(self):
+        marker = self.root / "escaped-pid"
+        program = (
+            "import os,pathlib,time; "
+            "pid=os.fork(); "
+            f"path=pathlib.Path({str(marker)!r}); "
+            "(os.setsid(),path.write_text(str(os.getpid())),time.sleep(60)) if pid == 0 else None"
+        )
+        started = time.monotonic()
+        try:
+            with self.assertRaisesRegex(self.deploy.DeploymentError, "diagnostic streams remained open"):
+                self.deploy.SessionScope(timeout=2, term_grace=0.01, kill_grace=0.01).run([sys.executable, "-c", program])
+            self.assertLess(time.monotonic() - started, 3)
+        finally:
+            if marker.exists():
+                escaped = int(marker.read_text())
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(escaped, signal.SIGKILL)
 
-    def test_recovery_quiesces_only_identity_proven_cgroup(self):
+    def test_session_scope_records_cleanup_unconfirmed_after_term_and_kill_deadlines(self):
+        scope = self.deploy.SessionScope(term_grace=0, kill_grace=0)
+        identity = (os.getuid(), 1, 12345, 12345, False)
+        with mock.patch.object(scope, "_leader_identity", return_value=identity), mock.patch.object(scope, "_live_group_members", return_value=[12345]), mock.patch.object(os, "killpg") as kill:
+            with self.assertRaisesRegex(self.deploy.DeploymentError, "cleanup-unconfirmed"):
+                scope._cleanup(12345, identity)
+        self.assertEqual([call.args[1] for call in kill.call_args_list], [self.deploy.signal.SIGTERM, self.deploy.signal.SIGKILL])
+
+    def test_legacy_cgroup_records_are_rejected_without_signaling(self):
         deployment_id = "123e4567-e89b-12d3-a456-426614174000"
-        root = self.root / "recovery-cgroup"
-        scope = root / ("mkchad-deploy-" + deployment_id)
-        scope.mkdir(parents=True)
-        events = scope / "cgroup.events"
-        events.write_text("populated 1\n", encoding="ascii")
-        (scope / "cgroup.kill").write_text("", encoding="ascii")
-        record = {"cgroup_name": scope.name, "cgroup_identity": self.deploy._identity(scope)}
+        state = self.root / "state"
+        state.mkdir(mode=0o700)
+        record = {"schema": 1, "id": deployment_id, "state": "in_progress", "deployer": self.deploy.DEPLOYER_ID, "resources": [], "cgroup_name": "legacy"}
+        self.deploy.atomic_json(state / (deployment_id + ".json"), record)
+        with self.assertRaisesRegex(self.deploy.DeploymentError, "prior implementation"):
+            self.deploy.load_recovery_record(state, deployment_id)
 
-        def become_empty(_):
-            events.write_text("populated 0\n", encoding="ascii")
+    def test_recovery_confirmation_is_gated_by_durable_state(self):
+        deployment_id = "123e4567-e89b-12d3-a456-426614174000"
+        state = self.root / "state"
+        state.mkdir(mode=0o700)
+        bundle = state / (deployment_id + ".bundle")
+        bundle.mkdir(mode=0o700)
+        retained = {"deployer.py": b"x", "verified-release.json": b"x", "release.json": b"x", "release-v1.schema.json": b"x", "receipt-v1.schema.json": b"x"}
+        for name, contents in retained.items():
+            path = bundle / name
+            path.write_bytes(contents)
+            path.chmod(0o600)
+        staging = bundle / "staging"
+        staging.mkdir(mode=0o700)
+        (staging / "partial-image").write_bytes(b"partial")
+        base = {"schema": 1, "id": deployment_id, "state": "in_progress", "deployer": self.deploy.DEPLOYER_ID, "state_root": str(state), "resources": [], "final_mutation_started": False, "recovery_bundle": bundle.name, "bundle_digests": {name: hashlib.sha256(contents).hexdigest() for name, contents in retained.items()}}
+        self.deploy.atomic_json(state / (deployment_id + ".json"), base)
+        with self.assertRaisesRegex(self.deploy.DeploymentError, "requires --confirm"):
+            self.deploy.recover(state, deployment_id, "restore")
+        restored = self.deploy.recover(state, deployment_id, "restore", True)
+        self.assertEqual(restored["state"], "recovered_restore")
+        self.assertFalse(bundle.exists())
+        base["state"] = "failed"
+        base["final_mutation_started"] = True
+        self.deploy.atomic_json(state / (deployment_id + ".json"), base)
+        with self.assertRaisesRegex(self.deploy.DeploymentError, "rejected"):
+            self.deploy.recover(state, deployment_id, "restore", True)
 
-        with mock.patch.object(time, "sleep", side_effect=become_empty):
-            self.deploy.quiesce_recorded_cgroup(record, deployment_id, root)
-        self.assertEqual((scope / "cgroup.kill").read_text(encoding="ascii"), "1")
+    def test_catchable_recovery_failure_returns_to_failed_with_cleanup_evidence(self):
+        deployment_id = "123e4567-e89b-12d3-a456-426614174000"
+        state = self.root / "recovery-state"
+        state.mkdir(mode=0o700)
+        bundle = state / (deployment_id + ".bundle")
+        bundle.mkdir(mode=0o700)
+        retained = {"release.json": b"{}", "verified-release.json": b"{}"}
+        for name, contents in retained.items():
+            path = bundle / name
+            path.write_bytes(contents)
+            path.chmod(0o600)
+        record = {
+            "schema": 1,
+            "id": deployment_id,
+            "state": "failed",
+            "deployer": self.deploy.DEPLOYER_ID,
+            "state_root": str(state),
+            "resources": [],
+            "final_mutation_started": True,
+            "recovery_bundle": bundle.name,
+            "bundle_digests": {name: hashlib.sha256(contents).hexdigest() for name, contents in retained.items()},
+        }
+        self.deploy.atomic_json(state / (deployment_id + ".json"), record)
+        original_load_json = self.deploy.load_json
+
+        def fail_retained_release(path, label):
+            if label == "deployment record":
+                return original_load_json(path, label)
+            raise self.deploy.DeploymentError("catchable recovery failure")
+
+        with mock.patch.object(self.deploy, "load_json", side_effect=fail_retained_release):
+            with self.assertRaisesRegex(self.deploy.DeploymentError, "catchable recovery failure"):
+                self.deploy.recover(state, deployment_id, "restore")
+        persisted = json.loads((state / (deployment_id + ".json")).read_text())
+        self.assertEqual(persisted["state"], "failed")
+        self.assertEqual(persisted["phase"], "recovering")
+        self.assertEqual(persisted["process_cleanup"], {"machine_observed": True, "operator_asserted": False})
+
+    def test_recovery_runs_through_detached_supervisor(self):
+        deployment_id = "123e4567-e89b-12d3-a456-426614174000"
+        state = self.root / "state"
+        with mock.patch.object(self.deploy, "spawn_supervisor", return_value=0) as supervisor:
+            self.assertEqual(self.deploy.main(["recover", "--deployment-id", deployment_id, "--mode", "restore", "--state-root", str(state), "--confirm-processes-quiesced"]), 0)
+        command = supervisor.call_args.args[0]
+        self.assertIn("recover-supervise", command)
+        self.assertIn("--confirm-processes-quiesced", command)
 
     def test_subprocess_diagnostics_and_redaction_do_not_expose_secret_sentinels(self):
         sentinel = "DO-NOT-STORE-THIS"
@@ -505,11 +611,11 @@ ln -sfn "${target##*/}" "$HOME/containers/neovim.sif"
         evidence.chmod(0o600)
 
         class DirectScope:
-            def __init__(self, root, deployment_id):
-                self.path = pathlib.Path(root) / ("mkchad-deploy-" + deployment_id)
+            def __init__(self, *args, **kwargs):
+                self.path = fixture / "direct-session"
 
             def __enter__(self):
-                self.path.mkdir(parents=True)
+                self.path.mkdir(parents=True, exist_ok=True)
                 return self
 
             def __exit__(self, *_):
@@ -526,11 +632,10 @@ ln -sfn "${target##*/}" "$HOME/containers/neovim.sif"
             "XDG_DATA_HOME": str(data),
             "XDG_STATE_HOME": str(state),
             "XDG_RUNTIME_DIR": str(runtime),
-            "MKCHAD_DEPLOY_CGROUP_ROOT": str(fixture / "fake-cgroup"),
         }
         stage_map = {name: children[name] for name in children}
         stage_map["msk_containers-container_tools"] = container_tools
-        with mock.patch.dict(os.environ, environment, clear=False), mock.patch.object(self.deploy, "CgroupScope", DirectScope), mock.patch.object(
+        with mock.patch.dict(os.environ, environment, clear=False), mock.patch.object(self.deploy, "SessionScope", DirectScope), mock.patch.object(
             self.deploy, "_verified_evidence", return_value={"trust": "development-sha", "parent_commit": parent_commit}
         ), mock.patch.object(self.deploy, "stage_child", side_effect=lambda url, commit, staging, name, scope: stage_map[name]), mock.patch.object(
             self.deploy, "validate_image_runtime", return_value={"schema": 1}

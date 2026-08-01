@@ -210,6 +210,8 @@ def authenticated_recovery_deployer(state_root: pathlib.Path, deployment_id: str
         raise BootstrapError("malformed deployment record") from exc
     if record.get("schema") != SCHEMA or record.get("id") != deployment_id or record.get("deployer") != DEPLOYER_ID:
         raise BootstrapError("deployment record identity is invalid")
+    if any(key.startswith("cgroup") for key in record):
+        raise BootstrapError("legacy cgroup deployment record requires recovery with the prior implementation")
     if record.get("state") not in {"failed", "in_progress"} or record.get("state_root") != str(state_root):
         raise BootstrapError("deployment record is not recoverable at this state root")
     bundle_name = record.get("recovery_bundle")
@@ -232,20 +234,22 @@ def authenticated_recovery_deployer(state_root: pathlib.Path, deployment_id: str
         entry = os.lstat(child)
         if stat.S_ISREG(entry.st_mode):
             actual_files.add(child.name)
-        elif stat.S_ISDIR(entry.st_mode) and (child.name == "host-tools" or child.name.startswith("host-tools-complete-") or child.name.startswith("removed-")):
+        elif stat.S_ISDIR(entry.st_mode) and (child.name in {"host-tools", "staging"} or child.name.startswith("host-tools-complete-") or child.name.startswith("removed-")):
             if entry.st_uid != os.getuid() or stat.S_IMODE(entry.st_mode) != 0o700:
                 raise BootstrapError("deployment recovery bundle has an unsafe recovery directory")
         else:
             raise BootstrapError("deployment recovery bundle has an undeclared entry")
     if actual_files != set(digests):
         raise BootstrapError("deployment recovery bundle inventory does not match its digest table")
-    mandatory = {"deployer.py", "verified-release.json", "release.json", "release-v1.schema.json", "receipt-v1.schema.json", "parent.bundle"}
+    mandatory = {"deployer.py", "verified-release.json", "release.json", "release-v1.schema.json", "receipt-v1.schema.json"}
+    if record.get("final_mutation_started", False):
+        mandatory.add("parent.bundle")
     if not mandatory <= actual_files:
         raise BootstrapError("deployment recovery bundle is incomplete")
     evidence = json.loads(_read_private(bundle / "verified-release.json"), object_pairs_hook=lambda pairs: _unique_json(pairs))
     if evidence.get("schema") != SCHEMA or evidence.get("deployer") != DEPLOYER_ID or not SHA1.fullmatch(evidence.get("parent_commit", "")):
         raise BootstrapError("retained release evidence is malformed")
-    if evidence.get("trust") == "ssh-signed-tag":
+    if evidence.get("trust") == "ssh-signed-tag" and record.get("final_mutation_started", False):
         if not {"allowed_signers", "revoked_signers"} <= actual_files or not SHA1.fullmatch(evidence.get("tag_object", "")):
             raise BootstrapError("signed release recovery evidence is incomplete")
         verification = pathlib.Path(tempfile.mkdtemp(prefix="mkchad-recovery-verify-"))
@@ -288,6 +292,7 @@ def main(argv: list[str] | None = None) -> int:
     recover.add_argument("--mode", choices=("complete", "restore"), required=True)
     recover.add_argument("--trust-root", type=pathlib.Path, required=True)
     recover.add_argument("--state-root", type=pathlib.Path, required=True)
+    recover.add_argument("--confirm-processes-quiesced", action="store_true")
     parser.add_argument("--release")
     parser.add_argument("--development-commit")
     parser.add_argument("--remote", default=DEFAULT_REMOTE)
@@ -299,7 +304,10 @@ def main(argv: list[str] | None = None) -> int:
             _safe_directory(args.trust_root)
             verify_self_digest(pathlib.Path(__file__), args.trust_root / "bootstrap.sha256")
             deployer = authenticated_recovery_deployer(args.state_root, args.deployment_id)
-            return subprocess.run([sys.executable, str(deployer), "recover", "--deployment-id", args.deployment_id, "--mode", args.mode, "--state-root", str(args.state_root)], check=False).returncode
+            command = [sys.executable, str(deployer), "recover", "--deployment-id", args.deployment_id, "--mode", args.mode, "--state-root", str(args.state_root)]
+            if args.confirm_processes_quiesced:
+                command.append("--confirm-processes-quiesced")
+            return subprocess.run(command, check=False).returncode
         if bool(args.release) == bool(args.development_commit) or not args.trust_root:
             raise BootstrapError("provide exactly one of --release or --development-commit and --trust-root")
         verify_self_digest(pathlib.Path(__file__), args.trust_root / "bootstrap.sha256")
