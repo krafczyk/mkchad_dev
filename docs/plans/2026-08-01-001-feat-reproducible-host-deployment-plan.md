@@ -4,7 +4,7 @@ type: feat
 date: 2026-08-01
 topic: reproducible-host-deployment
 artifact_contract: ce-unified-plan/v1
-artifact_readiness: requirements-only
+artifact_readiness: implementation-ready
 product_contract_source: ce-brainstorm
 execution: code
 ---
@@ -15,7 +15,10 @@ execution: code
 
 - **Objective:** Make a known-good MkChad v1 release reproducible on an HPC host without requiring a development-environment checkout, while retaining the existing branch-per-host dotfile model.
 - **Product authority:** The MkChad parent release defines host-neutral components and artifacts; `config_files` defines host-specific configuration and materialization.
-- **Open blockers:** None. Exact component destinations and release metadata representation are deferred to planning, but every deployed Git component must have an explicit destination.
+- **Execution profile:** Implement and verify each repository serially. Child commits precede parent gitlink updates; live-state migration, credential rotation, pushes, image binding, and signed-tag publication are explicit operator gates.
+- **Stop conditions:** Stop before final-path mutation on unverified release identity, destination ambiguity, local work, unsafe ownership or path types, active managed services, artifact mismatch, malformed materialization state, or missing recovery evidence.
+- **Tail ownership:** The implementation run owns local code, tests, documentation, and coherent commits. The operator supplies trusted signing material, the release SIF, the age recipient and identity, live-state authorization, credential rotation, and any push or tag authorization.
+- **Open blockers:** None. Publication inputs are explicit gates rather than unresolved design questions.
 
 ---
 
@@ -137,17 +140,16 @@ flowchart TB
 - Existing component installers continue to expose stable top-level entrypoints suitable for noninteractive invocation.
 - The target host can access declared Git remotes and has the required Git and age tooling.
 - A host age identity and recovery recipient can be provisioned outside the tracked repository.
+- The target host provides a delegated cgroup v2 scope directly or through a working user service manager for containment of mutating subprocess trees.
 - If a real credential has appeared in plaintext Git history, it will be rotated when encrypted materialization is adopted.
 
-### Outstanding Questions
+### Planning Resolutions
 
-**Deferred to Planning**
-
-- Which active components require persistent host checkouts, and what are their exact current destinations?
-- Which components are embedded or configuration-owned and therefore need verification rather than a deployed checkout?
-- Where should release metadata and migration guidance live, and how should tags bind to it?
-- How should the deployment command itself be distributed to a host with no MkChad workspace?
-- What rollback operations can existing installers support beyond restoring recorded Git revisions and the container installer's previous image?
+- `msk_containers` and `mkchad` are the only persistent deployed Git components. Their destinations and every other component disposition are fixed in KTD2.
+- OpenCode is image-embedded. `opencode.nvim`, `opencode-project-reload`, and Compound Engineering are configuration-owned; the frozen sprint-loop is disabled.
+- Parent-tracked `deploy/release.json` and `docs/deployment/configuration-contract-v1.md` bind release behavior to the signed parent tag that contains them.
+- A separately provisioned bootstrap runs the deployment command from a temporary, signature-verified parent release checkout and creates no persistent parent checkout.
+- Recovery accepts both failed and interrupted records, restores recorded Git revisions deliberately, restores retained host-tool bytes, and uses the container installer's existing previous-image rollback.
 
 ### Sources
 
@@ -156,3 +158,302 @@ flowchart TB
 - `msk_containers/nvim/bin/install_nvim_container` owns validated image installation and activation.
 - `msk_containers/bin/install_nvim.sh` owns host launcher and container-tool installation and already invokes its lower-level tool installer.
 - `.gitmodules` and the parent release commit provide the authoritative child repository identities and revisions.
+
+---
+
+## Planning Contract
+
+**Product Contract preservation:** unchanged. Planning resolves the deferred implementation questions without changing R1-R23, F1-F4, or AE1-AE8.
+
+Path references below are parent-repository-relative unless qualified as `config_files:` or `config_files_scripts:` for the two independent repositories outside this workspace.
+
+### Key Technical Decisions
+
+- KTD1. **Use SSH-signed annotated parent tags and protected signer snapshots.** A separately provisioned bootstrap fetches only `refs/tags/<name>`, then opens `allowed_signers` and `revoked_signers` beneath a current-user-owned mode-`0700` trust root with no-follow semantics. Both must be current-user-owned regular files without group/world write; the bootstrap copies them through retained descriptors into private mode-`0600` snapshots before verification. The allowlist contains exactly one `mkchad-release` principal and approved key, validity intervals must cover verification time, and the explicit revocation file may be empty. The receipt records the key fingerprint, tag object ID, and peeled commit. Development mode accepts a full parent SHA, labels development trust, and never treats a branch as a release.
+- KTD2. **Deploy only the two host checkouts that own runtime files.** `msk_containers` deploys to `xdg_data_home/mkchad/components/msk_containers`; `mkchad` deploys to `xdg_config_home/mkchad`. OpenCode is embedded in the SIF. `opencode.nvim`, `opencode-project-reload`, and Compound Engineering are configuration-owned. `opencode_sprint_loop` is disabled. Every parent submodule must have exactly one disposition.
+- KTD3. **Keep one release manifest at the tagged parent commit.** `deploy/release.json` schema 1 declares dispositions, root-relative destinations, ordered actions, artifact variants, configuration-contract version, and guidance path. It must not contain child revisions; the deployer derives those from `160000` gitlinks and `.gitmodules` at the peeled parent commit.
+- KTD4. **Provision a minimal bootstrap separately from candidate release code.** `deploy/mkchad_release_bootstrap.py` is installed once alongside the trust root through the operator's trusted provisioning channel and its digest is recorded there. It validates its protected installed file, snapshots trust inputs, creates a private temporary clone, and verifies the selected tag before executing candidate `deploy/mkchad_deploy.py`. Before final-path mutation, it retains an authenticated recovery bundle under deployment state; the temporary checkout is then removable and no parent development workspace persists.
+- KTD5. **Resolve every desired child object before final-path mutation.** The deployer fetches exact gitlink commits into private temporary bare repositories, validates action paths and desired trees there, and then preflights every final destination. Existing compliant clones perform no fetch or checkout. Existing noncompliant clones fetch from the temporary repository and detach at the exact SHA; absent clones are prepared independently and installed with Linux no-replace rename semantics.
+- KTD6. **Treat one ignored MkChad path as configuration-owned.** `opencode-server.json` is the sole initial preserved path inside the MkChad checkout. It may be absent, the expected legacy symlink, or a current-user-owned regular file; its contents are never read by deployment. Every other ignored or untracked MkChad path blocks deployment unless a later release contract names it.
+- KTD7. **Make installer preflight an installer-owned API.** `msk_containers/bin/install_nvim.sh --check` validates all host-tool outputs before any write. Apply repeats validation under one installer lock, installs each file atomically, and skips byte-identical compliant files. `install_tools.sh` participates in the same check/apply contract rather than being duplicated in parent metadata.
+- KTD8. **Snapshot and authenticate the supplied image before executing it.** The deployer copies the SIF through a no-follow file descriptor into mode-`0700` private staging, flushes the file and directory, and compares its SHA-256 to signed release metadata before invoking a container runtime. It then validates normalized architecture and extracts `/usr/share/mkchad/component-manifest.json` with a clean-environment, no-home, no-host-bind, bounded Apptainer or Singularity invocation. It compares the parsed manifest to the pinned `msk_containers/nvim/component-manifest.json`, revalidates staged inode metadata and digest immediately before installation, writes the expected checksum sidecar, and verifies the installed digest afterward.
+- KTD9. **Extend the image installer only for detached transport.** `install_nvim_container` gains `--source-revision FULL_SHA` for raw transported images. The value supplies the managed filename's source label when the image is no longer inside its build checkout; the release SIF digest remains the artifact identity. Existing behavior without the option remains unchanged and a detached raw image still fails without it.
+- KTD10. **Journal before mutation and reconcile after failure.** A current-user global lock lives under `/run/user/<uid>` when safe, otherwise a current-user mode-`0700` directory under `/tmp`. Before the first final-path change, the deployer durably writes a schema-1 mode-`0600` in-progress journal under `xdg_state_home/mkchad/deployments/`, records verified pre-state before each mutation, and updates outcomes with file and directory `fsync` ordering. Catchable post-mutation failures finalize to `failed`; supervisor or host loss may honestly leave `in_progress`. Both states block later deployment until `recover` classifies each resource as pre-state, intended-state, or unknown.
+- KTD11. **Use a strict TSV manifest for exceptional dotfiles.** `config_files:.materialization.tsv` begins with a schema-1 marker and has five required tab-separated fields: `target`, `kind`, `source`, `mode`, and `expected_link_source`. Targets are home-relative; sources and expected link sources are repository-relative; kinds are `copy` or `age`. Modes are limited to `0600`, `0644`, `0700`, and `0755`; age entries require exactly `0600`. The fifth field lets an age ciphertext source differ from the legacy plaintext source an existing symlink is allowed to reference.
+- KTD12. **Keep linking and materialization explicit.** Existing link commands remain link-only but parse the whole manifest and exclude every manifest-owned path. `config_files_scripts:materialize_config_files.sh` owns `apply`, `verify`, and `capture`. `add_config_file_to_repo.sh` refuses manifest targets instead of guessing whether to copy or encrypt them.
+- KTD13. **Bind configuration mutation to repository, branch, scripts revision, and target domain.** Mutating commands require canonical repository identity `github.com/krafczyk/config_files`, the exact Git top level, a current branch equal to the short hostname by default, and a `config_files_scripts` HEAD equal to the parent gitlink. A deterministic expected-host option exists for fixtures. A per-user lock keyed by the canonical target home, not the worktree, serializes all mutating commands across independent clones.
+- KTD14. **Model initial secret migration as a resumable state transition.** Initial age capture accepts only the declared expected symlink and legacy repository plaintext. Before creating a named private plaintext stage, it durably records the random stage name and expected inode state; every later command cleans only a journal-owned mode-`0600` remnant before proceeding. It replaces the home symlink first, installs and verifies ciphertext second, and removes the legacy plaintext source last. Unsupported safe staging or unclassifiable residue fails closed rather than promising cleanup after SIGKILL.
+- KTD15. **Rotate and recapture credentials before staging the migration.** Encryption prevents future plaintext commits but does not remove old Git history. After initial migration, the operator rotates any credential that appeared in the former tracked file, updates the now-regular live target, captures it again, decrypts and compares the new ciphertext through the intended host identity, and completes a recovery-recipient drill or records equivalent operator evidence. Only the post-rotation ciphertext may be staged.
+- KTD16. **Validate configuration pins before publication.** The parent release validator requires the MkChad `opencode_nvim_revision` declaration to equal the parent `opencode.nvim` gitlink and emits configuration-owned revisions from gitlinks into the handoff. The current mismatch is corrected before creating a release candidate.
+- KTD17. **Make recovery an explicit state-bound bootstrap operation.** The installed bootstrap accepts only a deployment UUID, opens the canonical record relative to the validated mode-`0700` state directory, and requires matching deployer ID, filename, recovery directory, verified release identity, and resource allowlist. It authenticates the retained bundle against the recorded signed tag or original explicit development-SHA evidence before invoking that release's internal recovery command; recovery requires no network or advertised remote ref. Destinations and actions are re-derived from the verified contract rather than journal paths. Both post-mutation `failed` and `in_progress` records block new deployment and route to recovery; later user edits and malformed/future records remain untouched.
+- KTD18. **Share deployment/start locks across current and legacy revisions.** The deployer holds the new host-visible interlock exclusively from status preflight through verification, while every new managed start takes it non-exclusively through startup. U3 contains one explicit first-upgrade adapter for current MkChad revision `e91cbc39224d0637d9da59e1500cce6a355191c2` and its legacy startup lock; later lock-aware revisions self-identify their interlock schema. Deployment acquires the applicable legacy lock before the new interlock and proves inactivity. An unknown pre-interlock revision blocks unattended deployment and requires an explicit operator-controlled maintenance/quiescence run.
+- KTD19. **Run Git under a constrained configuration profile.** Bootstrap, signature verification, child staging, existing-checkout updates, and diff inspection disable system/global configuration and templates. Existing local configuration is read with `--no-includes`, dangerous transport/helper/filter/hook/fsmonitor/textconv keys are rejected, remotes are passed explicitly, hooks are disabled, and secret-bearing diffs use `--no-ext-diff --no-textconv`.
+- KTD20. **Version receipts and journals independently of release metadata.** `deploy/receipt-v1.schema.json` defines required trust, component, artifact, action, handoff, phase, recovery, and diagnostic fields. Readers reject future schemas and malformed/truncated files without mutation; successful, failed, and in-progress records remain distinguishable.
+- KTD21. **Align embedded OpenCode by its MkChad release tag.** Publication fetches `v*-mkchad.*` tags for the parent `opencode` gitlink, requires exactly one release tag at that commit, and requires its version to equal the SIF's `ships-opencode` declaration and bounded `opencode --version` output. A stale image or ambiguous source tag blocks the parent release candidate.
+- KTD22. **Anchor every sensitive mutation to revalidated filesystem identity.** Immediately before an existing checkout update, receipt write, installer replacement, or materialization rename, revalidate owner, type, device/inode, and ancestor identity relative to previously opened directories. Any replacement after preflight blocks rather than redirecting the write.
+- KTD23. **Contain every mutating subprocess beyond controller lifetime.** A deployer-owned supervisor retains the deployment lock and journal when the user-facing controller exits. Each Git, installer, runtime, or encryption action runs in a uniquely identified delegated cgroup v2 scope created directly or through the user's service manager. Process groups remain a signaling convenience inside the cgroup, never the containment boundary. Recovery acquires the lock, validates the recorded cgroup identity, and proves `cgroup.events` unpopulated before state reconciliation; it never signals a PID from the journal alone. Missing delegation or cgroup escape capability fails before mutation.
+- KTD24. **Retain a self-contained authenticated recovery bundle until resolution.** Before mutation, the deployer durably stores the exact deployer, release manifest and schemas, parent tag/commit objects and verification evidence, old and intended child objects, staged SIF, action inputs, and replaced host-tool bytes beneath the deployment's protected state directory. The record binds every file by digest. Success deletes the bundle only after final verification and receipt durability; failed or interrupted runs retain it until complete/restore recovery finalizes. Missing or mismatched bundle content blocks automated recovery without deleting evidence.
+
+### Component And Artifact Contract
+
+| Component | Disposition | Destination or verification | Release behavior |
+|---|---|---|---|
+| `msk_containers` | deployed | `xdg_data_home/mkchad/components/msk_containers` | Update first; run installer check, host-tool apply, and image installation from this checkout. |
+| `mkchad` | deployed | `xdg_config_home/mkchad` | Detach at the gitlink SHA while preserving only declared configuration-owned paths. |
+| `opencode` | embedded | SIF component manifest plus bounded `opencode --version` evidence | No host checkout; release validation aligns the image declaration with the parent child source. |
+| `opencode.nvim` | configuration-owned | MkChad `opencode_nvim_revision` and Lazy installation | No direct deployment; publication requires the MkChad pin and parent gitlink to match. |
+| `opencode-project-reload` | configuration-owned | Configuration contract and OpenCode package/cache evidence | No direct checkout; the handoff emits the gitlink-derived revision. |
+| `compound-engineering` | configuration-owned | Configuration contract and OpenCode package/cache evidence | No direct checkout; the handoff emits the gitlink-derived revision. |
+| `opencode_sprint_loop` | disabled | Parent gitlink recorded as excluded | No fetch, checkout, action, or migration. |
+
+`deploy/release.json` uses named roots (`home`, `xdg_config_home`, `xdg_data_home`, and `xdg_state_home`) plus validated relative paths. It never evaluates shell expressions. Action arguments may contain only documented typed tokens such as the staged image path and a resolved component revision; arbitrary interpolation is rejected.
+
+The `nvim-image` artifact has one entry per supported architecture. Each entry records the full SIF SHA-256, normalized architecture, expected source filename class, and expected component-manifest digest. A real digest is added only from the exact image selected for release publication.
+
+The trusted bootstrap and parent CLI have four stable entrypoints:
+
+- `python3 ~/.local/libexec/mkchad-release-bootstrap --release TAG --image PATH --trust-root DIR` snapshots protected trust inputs, verifies the exact tag, and executes only the authenticated candidate deployer. The development form uses `--development-commit FULL_SHA`.
+- `python3 deploy/mkchad_deploy.py validate-release --image PATH --trust-root DIR` validates the current candidate checkout, every non-disabled gitlink required by its disposition, signer policy, configuration pins, and the real SIF without final-path installation.
+- `python3 deploy/mkchad_deploy.py deploy --verified-release FILE --image PATH` consumes the bootstrap's descriptor-bound verification record and performs deployment; direct normal-release invocation without bootstrap evidence fails.
+- `python3 ~/.local/libexec/mkchad-release-bootstrap recover --deployment-id UUID --mode complete|restore --trust-root DIR` validates the canonical failed or in-progress record and its retained authenticated bundle, then invokes the matching internal recovery without network access before another deployment may begin.
+
+### High-Level Technical Design
+
+```mermaid
+flowchart TB
+  T[SSH allowed signer plus parent tag] --> B[Verify tag before executing release checkout]
+  B --> R[Parse release.json and derive gitlinks]
+  R --> C[Fetch exact child objects into private staging]
+  I[Caller SIF] --> S[Private immutable snapshot]
+  S --> V[Digest architecture and contained manifest validation]
+  C --> P[Preflight every final destination and action]
+  V --> P
+  P --> J[Create in-progress journal]
+  J --> G[Install exact Git checkouts]
+  G --> A[Run installer-owned checks and actions]
+  A --> F[Finalize receipt and configuration handoff]
+  F --> H[Operator updates the matching config_files host branch]
+  H --> M[Link ordinary files and materialize exceptions]
+  M --> X[Rotate, recapture, verify host and recovery paths]
+  X --> Y[Explicitly activate MkChad]
+```
+
+The deployment command never opens or changes the `config_files` repository. It reports the configuration contract and gitlink-derived required revisions, but the independent configuration phase owns branch selection, manifest changes, decryption, capture, and live target replacement.
+
+### Deployment State Machine
+
+1. **Acquire:** Fetch an exact annotated tag ref, verify its trusted signature, peel to one parent commit, and reject ref movement or branch fallback. Development mode requires a full SHA and a conspicuous receipt disposition.
+2. **Resolve:** Validate schema 1, classify every parent submodule once, read exact gitlinks, canonicalize supported GitHub SSH/HTTPS repository identities, and reject any revision duplicated in release metadata.
+3. **Stage:** Fetch each deployed child revision to private bare storage and snapshot the caller's SIF. Validate desired trees, action paths, image digest, architecture, and contained component manifest without touching final destinations.
+4. **Preflight:** Start the containment supervisor; acquire supported legacy startup locks and the new deployment/start interlock exclusively; validate state roots, service inactivity, destination ancestors, ownership, repository identity, constrained Git configuration, worktree state, preserved paths, output paths, and conflicts across components. Unknown legacy revisions or unavailable containment block unattended mutation.
+5. **Journal:** Persist receipt schema, selected release, signer identity, artifact digest, intended revisions, final destinations, verified pre-state, and a digest-bound self-contained recovery bundle before the first final mutation. A post-mutation failed or in-progress record blocks and routes to `recover`.
+6. **Apply:** Install `msk_containers`, then `mkchad`; run `install_nvim.sh --check`, host-tool apply with a journal-owned recovery directory, and `install_nvim_container --source-revision <msk-sha> <staged-image>` as bounded argv subprocesses inside the deployment cgroup.
+7. **Verify:** Recheck exact HEADs, repository identities, installed host tools, active image digest and component manifest, and public lifecycle evidence. No deployment action starts a managed service.
+8. **Finalize:** Atomically finalize the receipt, print a compact summary and configuration guidance, retain prior revisions for deliberate recovery, and remove only private staging.
+
+An existing deployment must prove the managed service inactive through the public observational lifecycle interface after acquiring the exclusive interlock. Missing tooling and absent lifecycle state on a fresh host is distinct from an unavailable or ambiguous status on an existing installation; the latter blocks rather than guessing. The status result, selectively dead process state, PID reuse, and startup attempts are validated without trusting a bare PID.
+
+At startup, the deployer scans only its validated state directory for schema-1 post-mutation `failed` or `in_progress` records. A catchable failure finalizes to `failed`; controller death leaves the supervisor responsible for containment and final evidence, while supervisor or host loss may leave `in_progress`. Both states block later deployment until bootstrap recovery opens the canonical record by deployment ID, authenticates its local signed-tag or explicit-development-SHA bundle, proves the cgroup empty, and observes every Git tree/index, host-tool digest, image link/digest, and action result. `complete` advances only known pre/intended mixtures; `restore` returns only known deployment-owned mixtures to pre-state. Network failure, deleted refs, unknown bytes, later user edits, malformed files, copied records, future schemas, and missing bundle bytes never cause evidence deletion or unsafe fallback.
+
+### Git And Filesystem Safety
+
+- Canonical repository identity accepts the declared GitHub SSH and HTTPS forms for the same owner/repository, with optional `.git`, but rejects local paths, different hosts, and rewritten owners.
+- Git commands set `GIT_CONFIG_NOSYSTEM=1`, disable global configuration and templates, and use explicit remote URLs. Existing local config is enumerated with includes disabled; URL rewriting, external remote helpers, credential helpers, custom SSH commands, filters, hooks, fsmonitor, textconv, and ext-diff settings block or are overridden according to the fixed command profile.
+- Existing destinations must be real current-user-owned directories whose Git top level equals the destination. External Git directories, linked worktrees, submodule layouts, unsafe ancestors, and foreign-owned metadata block.
+- Worktree checks include ignored and untracked paths. Only release-declared preserved paths may remain, and the desired tree must not begin tracking or replacing them.
+- A checkout whose canonical origin, HEAD, tree, and allowed worktree state already comply is a no-op. It does not fetch, update `FETCH_HEAD`, rewrite the index, or run checkout hooks.
+- New clones use no shared object alternates or user templates, set the canonical declared remote after staging, disable hooks, verify object independence, and use `renameat2(RENAME_NOREPLACE)` for final installation. Unsupported no-replace semantics fail closed on the Linux HPC target.
+- Existing updates disable hooks, fetch only the staged exact commit, revalidate cleanliness and filesystem identity, and use detached checkout without reset, merge, stash, or branch movement. The journal records old and intended trees before checkout; recovery accepts a partial checkout only when every worktree and index entry is byte-identical to one of those trees.
+- Action paths must be normalized repository-relative regular executable files present in the pinned tree. Symlink escape, `..`, shell strings, inherited Git control variables, and unbounded subprocesses are rejected.
+
+### Materialization Contract
+
+The initial manifest shape is:
+
+```text
+# config-files-materialization-v1
+# target<TAB>kind<TAB>source<TAB>mode<TAB>expected_link_source
+.config/mkchad/opencode-server.json	age	.materialized/.config/mkchad/opencode-server.json.age	0600	.config/mkchad/opencode-server.json
+```
+
+The parser validates the complete manifest before linking, applying, verifying, or capturing. It rejects duplicate or canonically equivalent targets, absolute paths, empty fields, `.` or `..` segments, control characters, unsupported kinds, modes outside the fixed allowlist, non-`0600` age entries, overlapping targets, source escape, symlinked source parents, missing sources, and unexpected source types. A malformed manifest blocks normal link commands so exceptional files cannot fall back to symlinks.
+
+Every mutating command validates the canonical `config_files` remote, top level, host branch, scripts gitlink, and manifest identity before taking one exclusive per-user lock derived from the canonical target home. Same-directory private temporary files, pre-recorded random stage names, no-follow path checks, exact current-user ownership, exact modes, file/directory `fsync`, inode revalidation, and atomic rename protect regular targets. `apply` compares compliant content before replacement. `verify` never mutates and compares copy content directly or hashes a bounded age decryption stream without storing plaintext. `capture` first decrypts and compares an existing age source so unchanged plaintext does not produce randomized ciphertext churn.
+
+The initial `opencode-server.json` migration requires an externally provisioned age identity and recovery recipient plus explicit authorization to mutate the protected live target. The tool verifies newly written ciphertext through the host identity before removing the legacy source. The operator then rotates the credential in the regular live target, captures again, verifies that post-rotation ciphertext, and performs or attests a recovery-recipient decrypt before staging. Identities, recipients, plaintext, and private configuration values never enter the manifest, command output, receipt, Git commit message, textconv, ext-diff, or automatic backup.
+
+### Repository Ownership Matrix
+
+| Repository | Checkout and remote | Planning anchor | Intended transition |
+|---|---|---|---|
+| MkChad parent | `.`; `git@github.com:krafczyk/mkchad_dev.git` | Parent commit containing this implementation-ready plan | Add parent deployment files; later advance only `mkchad` and `msk_containers` gitlinks. Preserve the unrelated dirty `opencode` gitlink and historical documents. |
+| `msk_containers` | `msk_containers`; `git@github.com:krafczyk/msk_containers` | `945b1dcbf948e5655dc4369fbe6d0fdc2d790121` | One U1 child commit, then one parent gitlink advance. |
+| `mkchad` | `mkchad`; `git@github.com:krafczyk/mkchad` | `e91cbc39224d0637d9da59e1500cce6a355191c2` | One U2 child commit aligning to `opencode.nvim` revision `37033dc157ac4c05c1e1525fe2fc9e87ae83e2ac`, then one parent gitlink advance. |
+| `config_files_scripts` | `~/config_files/config_files_scripts`; `git@github.com:krafczyk/config_files_scripts` | `1897fc091a8eeea6144df9b5e22bfaa62775924d` | Fast-forward through `e4ceb12` and `822bdb5`, then create one U4 child commit. |
+| `config_files` | `~/config_files`; `git@github.com:krafczyk/config_files.git`; branch `schumann` | `10ced9a3bc5f282a594e28ad17b32231173d7f16` | Preserve the existing `.config/opencode/opencode.jsonc` modification; after authorization, add only U5 manifest/ciphertext/deletion and the scripts gitlink. |
+
+These anchors detect concurrent movement; they are not reset targets. Before every edit and commit, re-read root, HEAD, branch, status, staged and unstaged diffs, and relevant gitlinks. If a repository moved, reconcile compatible work or stop on direct conflict. Stage explicit intended paths only. Before a parent gitlink commit, verify the child commit independently and inspect a gitlink-only diff.
+
+### Sequencing And Commit Boundaries
+
+1. Update and verify `msk_containers`; commit its transactional installer seam independently.
+2. Align and verify the MkChad-owned `opencode.nvim` pin; commit `mkchad` independently.
+3. Implement and verify the parent deployer against fixture repositories and images without advancing unrelated gitlinks.
+4. Fast-forward `config_files_scripts` through `e4ceb12` and `822bdb5`, implement materialization, and commit that child independently.
+5. Advance only the intended MkChad parent gitlinks, bind a real SIF digest into `deploy/release.json`, run release validation, and commit the host-neutral release candidate.
+6. With explicit live-state authorization and age inputs, migrate the `config_files` host branch, rotate and recapture the credential, and record the new scripts gitlink in that independent repository before activation on that host.
+7. Push child commits before any repository that references them. Pushes and the signed parent tag occur only on explicit operator request after remote reachability and release checks pass.
+
+### Risks And Mitigations
+
+- **Moved or forged tag:** Verify a signed annotated tag against a separately provisioned signer before executing repository code; record tag object and peeled commit.
+- **Valid but unauthorized signer:** Accept only one exact `mkchad-release` allowed-signers entry, apply revocation policy, and record the approved key fingerprint rather than treating cryptographic validity as authorization.
+- **Partial host-tool overwrite:** Installer-owned full preflight, one lock, atomic file replacement, and content-based no-op behavior prevent a late conflict from creating a mixed installation.
+- **Failure after mutation:** Preserve versioned failed or in-progress evidence, block new deployment, and require explicit complete/restore reconciliation against known old/new bytes.
+- **Concurrent service start:** Share one lock between deployment and every managed startup transition, then prove inactive under the exclusive deployment hold.
+- **Git configuration execution:** Disable broad config sources, reject dangerous local keys, use explicit remotes, and disable hooks, filters, fsmonitor, textconv, and ext-diff where applicable.
+- **Concurrent destination creation:** Hold the user deployment lock and use no-replace final rename; never overwrite a path that appeared after preflight.
+- **Image replacement after hashing:** Install only the private staged snapshot with its full checksum sidecar.
+- **Partial deployment:** Update the journal before and after each mutation and retain prior component revisions plus previous-image evidence.
+- **Configuration-owned path collision:** Allow only exact declared paths, preserve them without reading content, and reject a desired Git tree that starts owning them.
+- **Secret exposure:** Keep age identity external, never log content, pre-record mode-`0600` temporary plaintext, recover honest SIGKILL residue before later work, rotate the historical credential, and recapture only the rotated value.
+- **Manifest bypass:** Parse the complete manifest before normal linking and refuse malformed or ambiguous entries.
+- **Unreachable child commit:** Release validation fetches every selected gitlink from its declared remote before publication; parent tags cannot precede child publication.
+
+---
+
+## Implementation Units
+
+### U1. Transactional `msk_containers` installers
+
+- **Goal:** Give the parent deployer a safe, idempotent installer-owned preflight and detached-image handoff.
+- **Requirements:** R7-R11, R19, R22-R23; AE3-AE4, AE8
+- **Files:** `msk_containers/bin/install_nvim.sh`; `msk_containers/bin/install_tools.sh`; `msk_containers/nvim/bin/install_nvim_container`; `msk_containers/tests/install_nvim_test.sh`; `msk_containers/tests/install_nvim_container_test.sh`; `msk_containers/tests/nvim_container_tooling_test.sh`; `msk_containers/docs/host-installation.md`.
+- **Approach:** Add `--check` to the high-level host installer and its delegated tool installer. Validate the complete source/output set before mutation, repeat checks under one safe lock, retain replaced bytes in a caller-supplied private recovery directory, atomically replace only current-user-owned regular outputs, and skip byte-identical mode-correct files. Add `--source-revision FULL_SHA` only for raw image naming outside a Git checkout. Keep `install_nvim.sh` authoritative over `install_tools.sh` and every copied launcher.
+- **Test scenarios:** A late incompatible output causes zero writes; compliant outputs remain unchanged; concurrent installs serialize; a kill between file replacements leaves each output at known old/new bytes and recovery assets sufficient for complete/restore; symlink, directory, foreign-owned, and unsafe-parent outputs fail; a detached raw image succeeds only with a valid full source revision; wrong revision forms and legacy detached behavior fail; managed image behavior remains unchanged.
+- **Verification:** Run the new host-installer test and the existing image-installer test from fresh task directories under `/tmp/mkchad-v1`; run the existing container tooling assertions.
+- **Dependencies:** None.
+
+### U2. MkChad configuration-owner alignment
+
+- **Goal:** Make the MkChad runtime pin agree with the parent-authoritative `opencode.nvim` gitlink and interlock managed startup with deployment.
+- **Requirements:** R2-R3, R13, R19; AE1, AE5
+- **Files:** `mkchad/lua/mkchad/opencode/contracts.lua`; `mkchad/lua/configs/opencode.lua`; `mkchad/tests/opencode_contracts_spec.lua`; `mkchad/tests/opencode_deployment_interlock_spec.lua`; `mkchad/tests/opencode_inventory_collectors_spec.lua`; `mkchad/tests/opencode_test_paths.lua`.
+- **Approach:** Update `opencode_nvim_revision` to `37033dc157ac4c05c1e1525fe2fc9e87ae83e2ac` and assert that the plugin spec consumes it. Extend the existing flock-based lifecycle boundary so every start takes the host-visible deployment lock non-exclusively through startup; deployment holds it exclusively. Keep process identity checks and the existing startup lock authoritative rather than adding PID-only cleanup. Move touched test scratch roots to `/tmp/mkchad-v1`.
+- **Test scenarios:** The owner declaration and Lazy specification use the exact full revision; an exclusive deployment lock blocks start without creating service state; a start transition blocks deployment lock acquisition; selective process death and PID reuse never authorize signaling; release of either side permits the next bounded operation.
+- **Verification:** Run the two new focused headless Neovim specs and the inventory collector spec that reports the declared plugin identity.
+- **Dependencies:** The intended `opencode.nvim` revision is already present as a parent gitlink.
+
+### U3. Parent release resolver and deployment engine
+
+- **Goal:** Implement deterministic release resolution, destination preflight, deployment, journaling, and receipt output without a persistent parent checkout.
+- **Requirements:** R1-R5, R7-R13, R19-R23; F1-F2, F4; AE1-AE5, AE8
+- **Files:** `deploy/mkchad_release_bootstrap.py`; `deploy/mkchad_deploy.py`; `deploy/release-v1.schema.json`; `deploy/receipt-v1.schema.json`; `tests/test_mkchad_release_bootstrap.py`; `tests/test_mkchad_deploy.py`; `tests/run_deployment_tests.sh`; `tests/fixtures/deployment/`; `docs/deployment/README.md`.
+- **Approach:** Use Python standard library plus explicit argv subprocesses. Keep the separately installed bootstrap minimal: validate its installed digest and protected trust root, snapshot signer inputs, verify the exact tag, and pass descriptor-bound evidence to candidate code. Implement the exact `validate-release`, `deploy`, and state-bound `recover` commands; strict release/receipt validation; gitlink extraction; canonical repository identity; constrained Git configuration; private child/image staging; digest-before-runtime image checks; all-destination preflight; current/legacy service interlocks; Linux no-replace clone installation; journal-aware existing-checkout updates; supervisor-owned containment; recovery reconciliation; and redacted human/JSON output.
+- **Test scenarios:** Signer-file ancestor and replacement races; authorized and unauthorized SSH signatures; moved/lightweight/expired-or-revoked tag policy; bootstrap self-digest and development labeling; malformed/future release and receipt schemas; outside/copied/moved recovery records; forged resource paths; forbidden revision fields; missing/duplicate dispositions; OpenCode tag/image mismatch; malicious Git config and helpers; wrong origin and dirty/ignored conflicts; preserved `opencode-server.json`; compliant no-op; clone and existing-path races; image digest mismatch without runtime invocation; staged inode replacement; controller and supervisor death with TERM-resistant, forking, and `setsid` descendants retained in the cgroup; missing cgroup delegation; current and actual previous-release startup races; unknown legacy revision; complete/restore recovery after remote outage, deleted tag, and unadvertised development commit; missing/tampered bundle bytes; later user edits; lock contention; unsafe state paths; receipt collision; and secret-sentinel absence.
+- **Verification:** Run Python compilation and the focused unittest suite. Tests use local fixture remotes, fake runtimes/installers, and deterministic crash points; they require no network, credentials, live paths, or real SIF.
+- **Dependencies:** U1 defines the final installer CLI; U2 defines the pin invariant validated at publication.
+
+### U4. Manifest-aware `config_files_scripts`
+
+- **Goal:** Preserve ordinary symlinks while adding safe apply, verify, capture, and initial age migration for exceptional regular files.
+- **Requirements:** R14-R18, R22-R23; F3; AE6-AE8
+- **Files:** `config_files_scripts:config_management_lib.sh`; `config_files_scripts:create_links.sh`; `config_files_scripts:move_and_link.sh`; `config_files_scripts:add_config_file_to_repo.sh`; `config_files_scripts:materialize_config_files.sh`; `config_files_scripts:materialize_config_files.py`; `config_files_scripts:tests/materialization_test.sh`; `config_files_scripts:tests/fake_age.sh`; `config_files_scripts:README.md`.
+- **Approach:** Fast-forward exactly through `e4ceb12` and `822bdb5`. Add strict schema-1 TSV parsing, canonical parent-repository and scripts-gitlink validation, host-branch validation, path/ownership helpers, a target-home-keyed cross-clone lock, pre-recorded plaintext staging, atomic regular-file writes, copy and age handlers, non-mutating verification, deliberate capture, and resumable initial age migration. The Python engine owns age subprocess containment and durable staging; the shell entrypoint preserves repository command style. Existing link commands exclude all manifest-owned paths and abort on malformed manifests; the legacy add command rejects manifest targets.
+- **Test scenarios:** Ordinary link plus copy/age exception; correct host and wrong-host branch; wrong remote/top-level/scripts gitlink; two independent clones targeting one home; malformed fields, traversal, duplicate and overlapping paths; forbidden modes and non-`0600` age; expected and unexpected links; broken links, directories, unsafe or replaced parents, wrong owner/mode; repeated no-op apply; verify without writes; unchanged capture without ciphertext churn; controller death with a forking fake age child; SIGKILL at each transition followed by journal-owned cleanup; no plaintext in arguments, environment captures, output, staged index entries, newly created Git objects, or post-recovery residue. Pre-existing historical objects are explicitly outside this assertion.
+- **Verification:** Run the new shell fixture suite from a fresh `/tmp/mkchad-v1` directory and ShellCheck on changed scripts when available. Tests provide a fake age binary for deterministic failure coverage and may run an opt-in real-age round trip when `age` and `age-keygen` are present.
+- **Dependencies:** None; implementation is independent of component deployment.
+
+### U5. Host-branch encrypted configuration migration
+
+- **Goal:** Adopt the materialization manifest for `opencode-server.json` without losing the live configuration or claiming that Git history was sanitized.
+- **Requirements:** R12-R18, R21-R23; F3-F4; AE5-AE8
+- **Files:** `config_files:.materialization.tsv`; `config_files:.materialized/.config/mkchad/opencode-server.json.age`; deletion of `config_files:.config/mkchad/opencode-server.json`; the `config_files_scripts` gitlink.
+- **Approach:** Update only canonical `github.com/krafczyk/config_files` branch `schumann` from the verified planning anchor or a reconciled descendant. After explicit authorization, run U4's initial capture with an externally provisioned identity and recovery recipient. Rotate the historical credential in the now-regular live file, capture again, verify the post-rotation ciphertext through the host identity, complete the recovery-recipient check, and only then stage ciphertext, manifest, legacy-source deletion, and the scripts gitlink. Inspect with external diff and text conversion disabled.
+- **Test scenarios:** Legacy expected symlink migrates; unexpected link or file blocks; interruption before target replacement, before ciphertext install, and before legacy-source deletion is resumable; pre-rotation ciphertext is replaced by verified post-rotation ciphertext before staging; resulting Git diff contains ciphertext rather than a readable configuration; ordinary files still link.
+- **Verification:** Run `verify` against the live target only after authorization, confirm exact owner/mode/type without printing content, confirm canonical repository/branch/scripts gitlink and intended staged paths, record the recovery-recipient check and credential rotation, and ensure the unrelated `.config/opencode/opencode.jsonc` modification remains unstaged. Do not rewrite repository history.
+- **Dependencies:** U4; operator-provided age inputs; explicit live-state authorization; operator-controlled credential rotation.
+
+### U6. Release contract, integration, and candidate publication
+
+- **Goal:** Bind the verified implementation and a real local SIF into one parent release candidate with complete configuration handoff.
+- **Requirements:** R1-R3, R6-R13, R19-R23; F1-F4; AE1-AE8
+- **Files:** `deploy/release.json`; `docs/deployment/configuration-contract-v1.md`; `docs/deployment/README.md`; parent `mkchad` and `msk_containers` gitlinks.
+- **Approach:** Classify every parent submodule, set the two named-root destinations and ordered installer actions, bind the real architecture-specific SIF digest and component-manifest digest, and document the pre-execution SSH-signature bootstrap and separate configuration phase. Advance only U1/U2 child gitlinks. Run the exact `validate-release` command to validate signer policy, the `opencode.nvim` pin, the unique MkChad OpenCode source tag and image identity, every non-disabled gitlink required by its disposition, artifact snapshot, destination ownership map, and stopped-service handoff before committing the release candidate.
+- **Test scenarios:** Full fresh-host fixture deployment; older clean checkout update; dirty checkout refusal; wrong image refusal before final writes; action failure with finalized recovery journal; repeated compliant deployment; configuration contract output with gitlink-derived pins; disabled historical component exclusion.
+- **Verification:** Run U1-U4 focused suites, the parent integration suite once, release validation against the real SIF, and a credential-free isolated-home deployment rehearsal. A real HPC deployment, pushes, and signed tag remain explicit operator actions.
+- **Dependencies:** U1-U4 for a host-neutral release candidate; a real release SIF; trusted SSH signing setup for later tag publication. U5 is required before activation on the migrated host, not before creating the release candidate.
+
+---
+
+## Verification Contract
+
+### Focused Commands
+
+Run only one resource-intensive suite at a time. Use fresh task-specific directories under `/tmp/mkchad-v1`.
+
+```bash
+# msk_containers
+bash tests/install_nvim_test.sh /tmp/mkchad-v1/install-nvim
+bash tests/install_nvim_container_test.sh /tmp/mkchad-v1/install-nvim-container nvim/bin/install_nvim_container
+bash tests/nvim_container_tooling_test.sh
+
+# mkchad
+nvim --headless -u NONE -l tests/opencode_contracts_spec.lua "$PWD"
+nvim --headless -u NONE -l tests/opencode_deployment_interlock_spec.lua "$PWD"
+nvim --headless -u NONE -l tests/opencode_inventory_collectors_spec.lua "$PWD"
+
+# parent workspace
+python3 -m py_compile deploy/mkchad_deploy.py
+bash tests/run_deployment_tests.sh /tmp/mkchad-v1/parent-deployment
+
+# config_files_scripts
+bash tests/materialization_test.sh /tmp/mkchad-v1/config-files-materialization
+
+# parent release candidate; operator supplies these paths
+python3 deploy/mkchad_deploy.py validate-release --image "$MKCHAD_RELEASE_IMAGE" --trust-root "$MKCHAD_TRUST_ROOT"
+```
+
+Commands run from the repository named by the preceding comment. Test scripts must create or require fresh per-test subdirectories, set `HOME`, all XDG roots, runtime state, Git config paths, installer destinations, and temporary paths beneath that directory, and reject resolution into protected live roots. They never delete the shared `/tmp/mkchad-v1` root.
+
+### Required Gates
+
+- **Release trust:** Prove exact annotated-tag fetch, one authorized SSH signer, unauthorized/unknown/revoked signer rejection, verification before code execution, stable tag object and peeled commit, development-SHA labeling, and rejection of branch or lightweight-tag substitution.
+- **Release consistency:** Prove every submodule has one disposition, deployed revisions come only from gitlinks, action files belong to pinned trees, configuration-owned pins agree, the unique MkChad OpenCode source tag equals image identity, frozen components are disabled, and selected commits are fetchable from declared remotes.
+- **Failure atomicity:** Inject failure and real process death before and after each journal write, checkout transition, host-tool file, image activation, and materialization rename. Catchable post-mutation failures finalize to recoverable `failed`; supervisor or host loss may leave valid `in_progress`. Recovery preserves prior revisions, cleans only journal-owned private plaintext, and chooses complete/restore only for known old/new state.
+- **Idempotence:** Capture inode/mtime or equivalent evidence before a repeated compliant run. Git checkouts, host tools, installed image, links, regular materialized files, and existing ciphertext must remain unchanged; only a new receipt may be written.
+- **Security:** Exercise unsafe owners, symlinked or replaced ancestors, special files, path traversal, hostile Git environment and system/global/local config, action symlink escape, malformed/future JSON/TSV, digest mismatch before runtime invocation, staged-image replacement, cgroup-wide subprocess timeout and escape attempts, and secret sentinel redaction.
+- **Concurrency:** Exercise deployment/start lock contention, startup at every mutation boundary, installer lock contention, materialization contention across two independent clones targeting one home, and final-destination creation races.
+- **Recovery:** Exercise truncated, malformed, and future journals; mixed Git index/worktree old/new state; later user edits; missing or tampered recovery-bundle bytes; remote outage and deleted refs; selectively dead and TERM-resistant subprocesses; and PID reuse. Unknown state must remain untouched with actionable diagnostics.
+- **Live-state boundary:** Default automated tests use isolated homes and fake runtimes. Real image validation, live configuration migration, service status, and credential rotation are opt-in operator gates.
+
+### Release Rehearsal
+
+Before a signed tag, create an isolated home and state root, use local fixture remotes for Git components, and run the real release manifest with a fake action layer. Then run release validation against the exact real SIF without installing it into the user's live container directory. A real HPC smoke deployment is the final evidence for host-specific runtime and filesystem behavior.
+
+---
+
+## Definition of Done
+
+### Global
+
+- An authorized SSH-signature-verified parent tag plus caller-supplied SIF can produce exact `msk_containers` and `mkchad` checkouts, verified host tools and image, a succeeded/failed/in-progress schema-1 machine record, and a configuration-pending stopped state without a persistent parent workspace.
+- Every parent submodule has one reviewed disposition; no release metadata duplicates a child revision; every deployed destination and action owner is explicit.
+- A failed preflight changes no final destination. A catchable failure after mutation finalizes an atomic journal; uncatchable interruption leaves a durable in-progress journal that blocks until explicit complete/restore reconciliation.
+- A compliant repeat does not rewrite checkouts, tools, images, symlinks, materialized files, or ciphertext.
+- `config_files` ordinary files retain existing symlink behavior while manifest entries support copy, age apply, non-mutating verify, deliberate capture, and resumable initial migration.
+- The migrated secret is current-user-owned, regular, mode `0600`, absent as plaintext from the new Git tree, rotated because historical commits remain, recaptured after rotation, and decryptable through both the host path and verified recovery procedure.
+- User-facing deployment, bootstrap, configuration handoff, recovery, and materialization documentation matches the implemented commands and failure behavior.
+- All focused and integration gates pass; unavailable real-host or real-image gates are reported rather than simulated as success.
+- Abandoned helpers, temporary fixtures, debug output, placeholder digests, plaintext, and dead-end implementation attempts are absent from every final diff.
+- Child commits are coherent and precede parent gitlink commits. No unrelated dirty file or gitlink is staged, reverted, or committed.
+- Successful deployment removes its authenticated recovery bundle only after final receipt durability; failed or interrupted deployment remains recoverable offline from retained digest-bound evidence.
+
+### Per Unit
+
+- U1 is done when host-tool preflight proves zero-write conflict handling, apply is atomic/idempotent under lock, detached raw SIFs accept only a valid explicit source revision, and existing image behavior still passes.
+- U2 is done when the MkChad owner pin and intended parent `opencode.nvim` gitlink agree and focused runtime/inventory tests prove one authority.
+- U3 is done when fixture tests cover authorized signer identity, schema, constrained Git, image trust ordering, current/legacy service interlocks, cgroup containment, bootstrap recovery, receipt reconciliation, redaction, concurrency, interruption, and no-op behavior without touching live paths.
+- U4 is done when malformed manifests block linking, repository/branch/scripts/target-lock identity is enforced, exceptional targets round-trip through apply/verify/capture, ordinary links remain compatible, catchable failures leave no plaintext, and uncatchable residue is journal-owned and removed by recovery.
+- U5 is done only after authorized live migration, credential rotation, post-rotation recapture, host-identity verification, and recovery-recipient evidence; code completion alone does not satisfy this operational unit.
+- U6 is done when a real digest-backed release manifest validates, intended gitlinks are advanced, the isolated rehearsal passes, and the candidate is ready for an explicitly authorized push and signed tag.
