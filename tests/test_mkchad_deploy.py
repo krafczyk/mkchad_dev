@@ -1,0 +1,551 @@
+"""Focused behavioral tests for the parent deployment engine."""
+
+import hashlib
+import importlib.util
+import json
+import os
+import pathlib
+import shutil
+import tempfile
+import unittest
+from unittest import mock
+import subprocess
+import sys
+import time
+
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+
+
+def load_module(name: str, relative: str):
+    """Load a deployment module directly from the parent checkout."""
+    spec = importlib.util.spec_from_file_location(name, ROOT / relative)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+class DeploymentValidationTests(unittest.TestCase):
+    """Exercise fail-closed release and filesystem primitives."""
+
+    def setUp(self):
+        self.deploy = load_module("mkchad_deploy", "deploy/mkchad_deploy.py")
+        self.root = pathlib.Path(tempfile.mkdtemp(prefix="mkchad-deploy-test-"))
+
+    def release(self):
+        return {
+            "schema": 1,
+            "components": [
+                {
+                    "name": "msk_containers",
+                    "disposition": "deployed",
+                    "destination": {"root": "xdg_data_home", "path": "mkchad/components/msk_containers"},
+                    "actions": [
+                        {"id": "host-tools-check", "path": "bin/install_nvim.sh", "args": ["--check"]},
+                        {"id": "host-tools-install", "path": "bin/install_nvim.sh", "args": ["--recovery-dir", {"token": "recovery_dir"}]},
+                        {"id": "image-install", "path": "nvim/bin/install_nvim_container", "args": ["--source-revision", {"token": "component_revision"}, {"token": "staged_image"}]},
+                    ],
+                },
+                {"name": "mkchad", "disposition": "deployed", "destination": {"root": "xdg_config_home", "path": "mkchad"}, "actions": []},
+                {"name": "opencode", "disposition": "embedded"},
+                {"name": "opencode.nvim", "disposition": "configuration-owned"},
+                {"name": "opencode-project-reload", "disposition": "configuration-owned"},
+                {"name": "compound-engineering", "disposition": "configuration-owned"},
+                {"name": "opencode_sprint_loop", "disposition": "disabled"},
+            ],
+            "artifacts": {"nvim-image": [{"architecture": "x86_64", "sha256": "a" * 64, "component_manifest_sha256": "b" * 64, "source_filename_class": "raw-nvim-container"}]},
+            "configuration": {"contract_version": 1, "guidance": "docs/deployment/README.md"},
+        }
+
+    def make_checkout(self, path, repository, files=None, executable=()):
+        path.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", str(path)], check=True)
+        for name, content in (files or {"tracked": "content\n"}).items():
+            target = path / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+            if name in executable:
+                target.chmod(0o755)
+        subprocess.run(["git", "-C", str(path), "add", "."], check=True)
+        subprocess.run(
+            ["git", "-C", str(path), "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-q", "-m", "initial"],
+            check=True,
+        )
+        subprocess.run(["git", "-C", str(path), "remote", "add", "origin", f"git@github.com:krafczyk/{repository}"], check=True)
+        return subprocess.check_output(["git", "-C", str(path), "rev-parse", "HEAD"], text=True).strip()
+
+    def test_release_rejects_duplicate_disposition_and_revision(self):
+        release = self.release()
+        release["components"].append({"name": "mkchad", "disposition": "disabled"})
+        with self.assertRaisesRegex(self.deploy.DeploymentError, "exactly one"):
+            self.deploy.validate_release_document(release, list(self.deploy.COMPONENT_DISPOSITIONS))
+        release = self.release()
+        release["components"][0]["revision"] = "0" * 40
+        with self.assertRaisesRegex(self.deploy.DeploymentError, "revision"):
+            self.deploy.validate_release_document(release, list(self.deploy.COMPONENT_DISPOSITIONS))
+
+    def test_release_enforces_fixed_dispositions_destinations_and_typed_actions(self):
+        release = self.release()
+        release["components"][2]["disposition"] = "deployed"
+        with self.assertRaisesRegex(self.deploy.DeploymentError, "disposition"):
+            self.deploy.validate_release_document(release, list(self.deploy.COMPONENT_DISPOSITIONS))
+
+        release = self.release()
+        release["components"][0]["destination"]["path"] = "elsewhere"
+        with self.assertRaisesRegex(self.deploy.DeploymentError, "destination"):
+            self.deploy.validate_release_document(release, list(self.deploy.COMPONENT_DISPOSITIONS))
+
+        release = self.release()
+        self.deploy.validate_release_document(release, list(self.deploy.COMPONENT_DISPOSITIONS))
+        release["components"][0]["actions"][2]["args"][1] = {"token": "shell_command"}
+        with self.assertRaisesRegex(self.deploy.DeploymentError, "token"):
+            self.deploy.validate_release_document(release, list(self.deploy.COMPONENT_DISPOSITIONS))
+
+    def test_public_signed_tree_metadata_does_not_require_private_receipt_mode(self):
+        release_path = self.root / "release.json"
+        release_path.write_text(json.dumps(self.release()), encoding="utf-8")
+        os.chmod(release_path, 0o644)
+        parsed = self.deploy.load_release_json(release_path)
+        self.assertEqual(parsed["schema"], 1)
+
+    def test_repository_identity_and_destination_are_constrained(self):
+        self.assertEqual(self.deploy.canonical_github_repository("git@github.com:krafczyk/mkchad.git"), "github.com/krafczyk/mkchad")
+        self.assertEqual(self.deploy.canonical_github_repository("https://github.com/krafczyk/mkchad"), "github.com/krafczyk/mkchad")
+        with self.assertRaises(self.deploy.DeploymentError):
+            self.deploy.canonical_github_repository("/tmp/mkchad")
+        with self.assertRaises(self.deploy.DeploymentError):
+            self.deploy.resolve_named_destination({"xdg_config_home": self.root}, "xdg_config_home", "../escape")
+
+    def test_image_snapshot_rejects_replacement_and_digest_mismatch_before_runtime(self):
+        source = self.root / "input.sif"
+        source.write_bytes(b"known image")
+        staged = self.deploy.snapshot_image(source, self.root / "stage", hashlib.sha256(b"known image").hexdigest())
+        self.assertEqual(staged.read_bytes(), b"known image")
+        self.assertEqual(staged.name, "nvim_container_x86.sif")
+        self.assertIn(hashlib.sha256(b"known image").hexdigest(), pathlib.Path(str(staged) + ".sha256").read_text(encoding="ascii"))
+        with self.assertRaisesRegex(self.deploy.DeploymentError, "digest"):
+            self.deploy.snapshot_image(source, self.root / "other", "0" * 64)
+        source.unlink()
+        source.symlink_to(staged)
+        with self.assertRaisesRegex(self.deploy.DeploymentError, "regular"):
+            self.deploy.snapshot_image(source, self.root / "symlink", hashlib.sha256(b"known image").hexdigest())
+
+    def test_journal_rejects_future_and_moved_receipts(self):
+        state = self.root / "state"
+        state.mkdir(mode=0o700)
+        record = {"schema": 1, "id": "123e4567-e89b-12d3-a456-426614174000", "state": "failed", "deployer": "mkchad-deploy-v1", "resources": []}
+        path = state / (record["id"] + ".json")
+        self.deploy.atomic_json(path, record)
+        self.assertEqual(self.deploy.load_recovery_record(state, record["id"])["state"], "failed")
+        record["schema"] = 2
+        self.deploy.atomic_json(path, record)
+        with self.assertRaisesRegex(self.deploy.DeploymentError, "schema"):
+            self.deploy.load_recovery_record(state, record["id"])
+
+    def test_receipt_collision_and_moved_record_leave_evidence_untouched(self):
+        state = self.root / "state"
+        state.mkdir(mode=0o700)
+        path = state / "receipt.json"
+        self.deploy.atomic_json(path, {"schema": 1})
+        with self.assertRaisesRegex(self.deploy.DeploymentError, "collision"):
+            self.deploy.atomic_json(path, {"schema": 1}, no_replace=True)
+        record = {"schema": 1, "id": "123e4567-e89b-12d3-a456-426614174000", "state": "failed", "deployer": "mkchad-deploy-v1", "state_root": "/elsewhere", "resources": []}
+        self.deploy.atomic_json(state / (record["id"] + ".json"), record)
+        with self.assertRaisesRegex(self.deploy.DeploymentError, "moved or copied"):
+            self.deploy.load_recovery_record(state, record["id"])
+        self.assertTrue((state / (record["id"] + ".json")).exists())
+
+    def test_hostile_git_config_blocks_before_checkout_and_clean_checkout_is_noop(self):
+        checkout = self.root / "checkout"
+        subprocess.run(["git", "init", str(checkout)], check=True, stdout=subprocess.DEVNULL)
+        subprocess.run(["git", "-C", str(checkout), "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-m", "initial"], check=True, stdout=subprocess.DEVNULL)
+        commit = subprocess.check_output(["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True).strip()
+        subprocess.run(["git", "-C", str(checkout), "remote", "add", "origin", "git@github.com:krafczyk/mkchad"], check=True)
+        result = self.deploy.preflight_existing_checkout(checkout, "github.com/krafczyk/mkchad", commit)
+        self.assertTrue(result["compliant"])
+        subprocess.run(["git", "-C", str(checkout), "config", "filter.attack.clean", "/bin/false"], check=True)
+        with self.assertRaisesRegex(self.deploy.DeploymentError, "dangerous"):
+            self.deploy.preflight_existing_checkout(checkout, "github.com/krafczyk/mkchad", commit)
+        subprocess.run(["git", "-C", str(checkout), "config", "--unset", "filter.attack.clean"], check=True)
+        external_git = self.root / "external-git"
+        (checkout / ".git").rename(external_git)
+        (checkout / ".git").symlink_to(external_git, target_is_directory=True)
+        with self.assertRaisesRegex(self.deploy.DeploymentError, "external Git"):
+            self.deploy.preflight_existing_checkout(checkout, "github.com/krafczyk/mkchad", commit)
+
+    def test_all_destinations_preflight_before_any_component_update(self):
+        data = self.root / "data"
+        config = self.root / "config"
+        msk = data / "mkchad" / "components" / "msk_containers"
+        mkchad = config / "mkchad"
+        msk_commit = self.make_checkout(msk, "msk_containers")
+        mkchad_commit = self.make_checkout(mkchad, "mkchad", {".gitignore": "opencode-server.json\n"})
+        (mkchad / "unexpected").write_text("dirty\n", encoding="ascii")
+        release = self.release()
+        roots = {"xdg_data_home": data, "xdg_config_home": config}
+        gitlinks = {
+            "msk_containers": {"commit": msk_commit, "repository": "github.com/krafczyk/msk_containers"},
+            "mkchad": {"commit": mkchad_commit, "repository": "github.com/krafczyk/mkchad"},
+        }
+        before = os.stat(msk)
+        with self.assertRaisesRegex(self.deploy.DeploymentError, "local work"):
+            self.deploy.preflight_all_destinations(roots, release, gitlinks, {"msk_containers": msk, "mkchad": mkchad})
+        after = os.stat(msk)
+        self.assertEqual((before.st_dev, before.st_ino), (after.st_dev, after.st_ino))
+        self.assertEqual(subprocess.check_output(["git", "-C", str(msk), "rev-parse", "HEAD"], text=True).strip(), msk_commit)
+
+    def test_preserved_mkchad_path_accepts_only_expected_link_or_private_file(self):
+        checkout = self.root / "preserved"
+        commit = self.make_checkout(checkout, "mkchad", {".gitignore": "opencode-server.json\n"})
+        preserved = checkout / "opencode-server.json"
+        preserved.symlink_to("../../config_files/.config/mkchad/opencode-server.json")
+        self.deploy.preflight_existing_checkout(checkout, "github.com/krafczyk/mkchad", commit, {"opencode-server.json"})
+        preserved.unlink()
+        preserved.symlink_to("/tmp/unexpected")
+        with self.assertRaisesRegex(self.deploy.DeploymentError, "unexpected legacy link"):
+            self.deploy.preflight_existing_checkout(checkout, "github.com/krafczyk/mkchad", commit, {"opencode-server.json"})
+
+    def test_pinned_tree_owns_executable_actions_and_configuration_pin(self):
+        msk = self.root / "action-tree"
+        action_path = "bin/install_nvim.sh"
+        commit = self.make_checkout(msk, "msk_containers", {action_path: "#!/bin/sh\nexit 0\n"}, executable={action_path})
+        component = {"actions": [{"id": "host-tools-check", "path": action_path, "args": ["--check"]}]}
+        self.deploy.validate_action_files(msk, commit, component)
+        (msk / action_path).chmod(0o644)
+        subprocess.run(["git", "-C", str(msk), "add", action_path], check=True)
+        subprocess.run(["git", "-C", str(msk), "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-q", "-m", "non-executable"], check=True)
+        non_executable = subprocess.check_output(["git", "-C", str(msk), "rev-parse", "HEAD"], text=True).strip()
+        with self.assertRaisesRegex(self.deploy.DeploymentError, "executable"):
+            self.deploy.validate_action_files(msk, non_executable, component)
+
+        mkchad = self.root / "pin-tree"
+        expected = "1" * 40
+        mkchad_commit = self.make_checkout(
+            mkchad,
+            "mkchad",
+            {"lua/mkchad/opencode/contracts.lua": f'local M = {{ opencode_nvim_revision = "{expected}" }}\nreturn M\n'},
+        )
+        self.deploy.validate_configuration_pin(mkchad, mkchad_commit, expected)
+        with self.assertRaisesRegex(self.deploy.DeploymentError, "does not match"):
+            self.deploy.validate_configuration_pin(mkchad, mkchad_commit, "2" * 40)
+
+    def test_missing_cgroup_delegation_blocks_before_subprocesses(self):
+        with self.assertRaisesRegex(self.deploy.DeploymentError, "cgroup"):
+            with self.deploy.CgroupScope(self.root / "absent", "scope"):
+                pass
+
+    def test_cgroup_scope_enrolls_before_exec_and_kills_on_timeout(self):
+        root = self.root / "cgroup"
+        scope = self.deploy.CgroupScope(root, "fixture")
+        scope.path.mkdir(parents=True)
+        for name, content in (("cgroup.procs", ""), ("cgroup.events", "populated 0\n"), ("cgroup.kill", "")):
+            (scope.path / name).write_text(content, encoding="ascii")
+
+        def timeout_run(*args, **kwargs):
+            kwargs["preexec_fn"]()
+            raise subprocess.TimeoutExpired(args[0], kwargs["timeout"])
+
+        with mock.patch.object(subprocess, "run", side_effect=timeout_run):
+            with self.assertRaisesRegex(self.deploy.DeploymentError, "timed out"):
+                scope.run(["/bin/true"], timeout=1)
+        self.assertEqual((scope.path / "cgroup.procs").read_text(encoding="ascii"), str(os.getpid()))
+        self.assertEqual((scope.path / "cgroup.kill").read_text(encoding="ascii"), "1")
+
+    def test_recovery_quiesces_only_identity_proven_cgroup(self):
+        deployment_id = "123e4567-e89b-12d3-a456-426614174000"
+        root = self.root / "recovery-cgroup"
+        scope = root / ("mkchad-deploy-" + deployment_id)
+        scope.mkdir(parents=True)
+        events = scope / "cgroup.events"
+        events.write_text("populated 1\n", encoding="ascii")
+        (scope / "cgroup.kill").write_text("", encoding="ascii")
+        record = {"cgroup_name": scope.name, "cgroup_identity": self.deploy._identity(scope)}
+
+        def become_empty(_):
+            events.write_text("populated 0\n", encoding="ascii")
+
+        with mock.patch.object(time, "sleep", side_effect=become_empty):
+            self.deploy.quiesce_recorded_cgroup(record, deployment_id, root)
+        self.assertEqual((scope / "cgroup.kill").read_text(encoding="ascii"), "1")
+
+    def test_subprocess_diagnostics_and_redaction_do_not_expose_secret_sentinels(self):
+        sentinel = "DO-NOT-STORE-THIS"
+        failed = subprocess.CompletedProcess([], 17, "", f'Authorization: Bearer {sentinel} password: {sentinel}')
+        with mock.patch.object(subprocess, "run", return_value=failed):
+            with self.assertRaises(self.deploy.DeploymentError) as raised:
+                self.deploy.run_git(["status"])
+        self.assertNotIn(sentinel, str(raised.exception))
+        self.assertNotIn(sentinel, self.deploy.redact(f'{{"password":"{sentinel}"}} token={sentinel}'))
+
+    def test_image_recovery_classification_rejects_later_bytes(self):
+        home = self.root / "image-home"
+        container_dir = home / "containers"
+        container_dir.mkdir(parents=True, mode=0o700)
+        target = container_dir / "neovim_expected.sif"
+        target.write_bytes(b"expected")
+        target.chmod(0o600)
+        (container_dir / "neovim.sif").symlink_to(target.name)
+        resource = {
+            "active_before": None,
+            "previous_before": None,
+            "intended_target": target.name,
+            "intended_digest": hashlib.sha256(b"expected").hexdigest(),
+        }
+        self.deploy.classify_image_resource(resource, {"home": home})
+        target.write_bytes(b"later user bytes")
+        with self.assertRaisesRegex(self.deploy.DeploymentError, "later edits"):
+            self.deploy.classify_image_resource(resource, {"home": home})
+
+    def test_detached_supervisor_survives_controller_death(self):
+        started = self.root / "supervisor-started"
+        completed = self.root / "supervisor-completed"
+        controller = self.root / "controller.py"
+        controller.write_text(
+            "import importlib.util, pathlib, sys\n"
+            f"spec=importlib.util.spec_from_file_location('deploy', {str(ROOT / 'deploy/mkchad_deploy.py')!r})\n"
+            "module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module)\n"
+            f"raise SystemExit(module.spawn_supervisor([sys.executable, '-c', {('import pathlib,time; pathlib.Path(' + repr(str(started)) + ').write_text(\"started\"); time.sleep(0.5); pathlib.Path(' + repr(str(completed)) + ').write_text(\"completed\")')!r}]))\n",
+            encoding="utf-8",
+        )
+        process = subprocess.Popen([sys.executable, str(controller)])
+        for _ in range(100):
+            if started.exists():
+                break
+            time.sleep(0.02)
+        self.assertTrue(started.exists(), "supervisor did not start")
+        process.kill()
+        process.wait()
+        for _ in range(100):
+            if completed.exists():
+                break
+            time.sleep(0.02)
+        self.assertTrue(completed.exists(), "supervisor died with its controller")
+
+    def test_interlock_classifies_legacy_current_and_unknown_revisions(self):
+        checkout = self.root / "interlock-checkout"
+        contracts = checkout / "lua" / "mkchad" / "opencode" / "contracts.lua"
+        contracts.parent.mkdir(parents=True)
+        contracts.write_text("local M = { deployment_interlock_schema = 1 }\n", encoding="ascii")
+        with mock.patch.object(self.deploy, "run_git", return_value=subprocess.CompletedProcess([], 0, self.deploy.LEGACY_MKCHAD_REVISION + "\n", "")):
+            self.assertEqual(self.deploy.classify_existing_interlock(checkout), "legacy-v1")
+        with mock.patch.object(self.deploy, "run_git", return_value=subprocess.CompletedProcess([], 0, "1" * 40 + "\n", "")):
+            self.assertEqual(self.deploy.classify_existing_interlock(checkout), "host-lock-v1")
+            contracts.write_text("local M = {}\n", encoding="ascii")
+            with self.assertRaisesRegex(self.deploy.DeploymentError, "maintenance quiescence"):
+                self.deploy.classify_existing_interlock(checkout)
+            self.assertEqual(self.deploy.classify_existing_interlock(checkout, True), "operator-quiesced")
+
+    def test_fresh_host_interlock_uses_shared_state_lock_and_rejects_links(self):
+        roots = {
+            "home": self.root / "home",
+            "xdg_config_home": self.root / "config",
+            "xdg_data_home": self.root / "data",
+            "xdg_state_home": self.root / "state",
+        }
+        for path in roots.values():
+            path.mkdir(mode=0o700)
+        lock_path = roots["xdg_state_home"] / "mkchad" / "deployment.lock"
+        with self.deploy.HostInterlock(roots):
+            with self.assertRaisesRegex(self.deploy.DeploymentError, "another deployment"):
+                with self.deploy.UserLock(lock_path):
+                    pass
+        lock_path.unlink()
+        target = self.root / "unrelated"
+        target.write_text("keep\n", encoding="ascii")
+        lock_path.symlink_to(target)
+        with self.assertRaisesRegex(self.deploy.DeploymentError, "unsafe"):
+            with self.deploy.HostInterlock(roots):
+                pass
+        self.assertEqual(target.read_text(encoding="ascii"), "keep\n")
+
+    def test_checkout_recovery_completes_and_restores_from_offline_bundle(self):
+        data = self.root / "data"
+        destination = data / "mkchad" / "components" / "msk_containers"
+        previous = self.make_checkout(destination, "msk_containers", {"tracked": "old\n", "other": "old other\n"})
+        (destination / "tracked").write_text("new\n", encoding="ascii")
+        (destination / "other").write_text("new other\n", encoding="ascii")
+        subprocess.run(["git", "-C", str(destination), "add", "tracked", "other"], check=True)
+        subprocess.run(["git", "-C", str(destination), "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-q", "-m", "new"], check=True)
+        intended = subprocess.check_output(["git", "-C", str(destination), "rev-parse", "HEAD"], text=True).strip()
+        bundle_root = self.root / "bundle"
+        bundle_root.mkdir(mode=0o700)
+        git_bundle = bundle_root / "msk_containers.bundle"
+        subprocess.run(["git", "-C", str(destination), "bundle", "create", str(git_bundle), "--all"], check=True)
+        git_bundle.chmod(0o600)
+        subprocess.run(["git", "-C", str(destination), "checkout", "-q", "--detach", previous], check=True)
+
+        class DirectScope:
+            def run(self, argv, timeout=300, extra_env=None):
+                environment = os.environ.copy()
+                environment.update(extra_env or {})
+                return subprocess.run(argv, check=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, env=environment)
+
+        component = self.release()["components"][0]
+        authority = {"commit": intended, "repository": "github.com/krafczyk/msk_containers", "url": "git@github.com:krafczyk/msk_containers"}
+        resource = {"kind": "checkout", "name": "msk_containers", "previous": previous, "intended": intended}
+        roots = {"xdg_data_home": data}
+        completed = self.deploy.recover_checkout_resource(resource, "complete", component, authority, bundle_root, roots, DirectScope())
+        self.assertEqual(completed["revision"], intended)
+        subprocess.run(["git", "-C", str(destination), "checkout", previous, "--", "tracked"], check=True)
+        restored = self.deploy.recover_checkout_resource(resource, "restore", component, authority, bundle_root, roots, DirectScope())
+        self.assertEqual(restored["revision"], previous)
+        self.assertEqual((destination / "tracked").read_text(encoding="ascii"), "old\n")
+        self.assertEqual((destination / "other").read_text(encoding="ascii"), "old other\n")
+
+    def test_isolated_home_deployment_rehearsal_is_repeatable(self):
+        fixture = self.root / "rehearsal"
+        home = fixture / "home"
+        config = fixture / "config"
+        data = fixture / "data"
+        state = fixture / "state"
+        runtime = fixture / "runtime"
+        for path in (home, config, data, state, runtime):
+            path.mkdir(parents=True, mode=0o700)
+        image = fixture / "nvim_container_x86.sif"
+        image.write_bytes(b"fixture image")
+        image_digest = hashlib.sha256(image.read_bytes()).hexdigest()
+        opencode_nvim_commit = "3" * 40
+
+        children = {}
+        child_commits = {}
+        for name in self.deploy.COMPONENT_DISPOSITIONS:
+            child = fixture / (name.replace(".", "-") + "-source")
+            files = {"tracked": name + "\n"}
+            executable = set()
+            if name == "msk_containers":
+                files = {
+                    "bin/install_nvim.sh": """#!/usr/bin/env bash
+set -euo pipefail
+[[ ${1:-} == --check ]] && exit 0
+mkdir -p "$HOME/.local/bin"
+repo=$(realpath "$(dirname "$(realpath "$0")")/..")
+for source in "$repo"/container_tools/*.sh "$repo"/nvim/bin/*; do
+  [[ -f $source ]] || continue
+  target="$HOME/.local/bin/${source##*/}"
+  cmp -s "$source" "$target" 2>/dev/null || { cp "$source" "$target"; chmod 755 "$target"; }
+done
+""",
+                    "nvim/bin/mkchad-opencode-server": "#!/usr/bin/env bash\nprintf '%s\\n' '{\"status\":\"inactive\"}'\n",
+                    "nvim/bin/install_nvim_container": """#!/usr/bin/env bash
+set -euo pipefail
+image=${@: -1}
+mkdir -p "$HOME/containers"
+target="$HOME/containers/neovim_fixture.sif"
+[[ -e $target ]] || cp "$image" "$target"
+ln -sfn "${target##*/}" "$HOME/containers/neovim.sif"
+""",
+                    "nvim/component-manifest.json": "{}\n",
+                }
+                executable = {"bin/install_nvim.sh", "nvim/bin/install_nvim_container", "nvim/bin/mkchad-opencode-server"}
+            elif name == "mkchad":
+                files = {
+                    ".gitignore": "opencode-server.json\n",
+                    "lua/mkchad/opencode/contracts.lua": f'local M = {{ deployment_interlock_schema = 1, opencode_nvim_revision = "{opencode_nvim_commit}" }}\nreturn M\n',
+                }
+            child_commits[name] = self.make_checkout(child, name, files, executable)
+            children[name] = child
+        opencode_nvim_commit = child_commits["opencode.nvim"]
+        contracts = children["mkchad"] / "lua" / "mkchad" / "opencode" / "contracts.lua"
+        contracts.write_text(
+            f'local M = {{ deployment_interlock_schema = 1, opencode_nvim_revision = "{opencode_nvim_commit}" }}\nreturn M\n',
+            encoding="ascii",
+        )
+        subprocess.run(["git", "-C", str(children["mkchad"]), "add", str(contracts.relative_to(children["mkchad"]))], check=True)
+        subprocess.run(
+            ["git", "-C", str(children["mkchad"]), "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-q", "-m", "pin"],
+            check=True,
+        )
+        child_commits["mkchad"] = subprocess.check_output(["git", "-C", str(children["mkchad"]), "rev-parse", "HEAD"], text=True).strip()
+        container_tools = fixture / "container-tools-source"
+        container_tools_commit = self.make_checkout(
+            container_tools,
+            "container_tools",
+            {"ct_exec.sh": "#!/usr/bin/env bash\nexit 0\n"},
+            executable={"ct_exec.sh"},
+        )
+        msk_source = children["msk_containers"]
+        (msk_source / ".gitmodules").write_text(
+            '[submodule "container_tools"]\n\tpath = container_tools\n\turl = git@github.com:krafczyk/container_tools\n',
+            encoding="ascii",
+        )
+        subprocess.run(["git", "-C", str(msk_source), "add", ".gitmodules"], check=True)
+        subprocess.run(
+            ["git", "-C", str(msk_source), "update-index", "--add", "--cacheinfo", f"160000,{container_tools_commit},container_tools"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(msk_source), "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-q", "-m", "pin tools"],
+            check=True,
+        )
+        child_commits["msk_containers"] = subprocess.check_output(["git", "-C", str(msk_source), "rev-parse", "HEAD"], text=True).strip()
+
+        parent = fixture / "parent"
+        (parent / "deploy").mkdir(parents=True)
+        (parent / "docs" / "deployment").mkdir(parents=True)
+        release = self.release()
+        release["artifacts"]["nvim-image"][0]["sha256"] = image_digest
+        release["artifacts"]["nvim-image"][0]["component_manifest_sha256"] = hashlib.sha256(b"{}\n").hexdigest()
+        (parent / "deploy" / "release.json").write_text(json.dumps(release), encoding="utf-8")
+        shutil.copy(ROOT / "deploy" / "release-v1.schema.json", parent / "deploy" / "release-v1.schema.json")
+        shutil.copy(ROOT / "deploy" / "receipt-v1.schema.json", parent / "deploy" / "receipt-v1.schema.json")
+        (parent / "docs" / "deployment" / "README.md").write_text("fixture guidance\n", encoding="ascii")
+        modules = []
+        for name in self.deploy.COMPONENT_DISPOSITIONS:
+            modules.extend([f'[submodule "{name}"]', f"\tpath = {name}", f"\turl = git@github.com:krafczyk/{name}"])
+        (parent / ".gitmodules").write_text("\n".join(modules) + "\n", encoding="utf-8")
+        subprocess.run(["git", "init", "-q", str(parent)], check=True)
+        subprocess.run(["git", "-C", str(parent), "add", "."], check=True)
+        for name, commit in child_commits.items():
+            subprocess.run(["git", "-C", str(parent), "update-index", "--add", "--cacheinfo", f"160000,{commit},{name}"], check=True)
+        subprocess.run(["git", "-C", str(parent), "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-q", "-m", "release"], check=True)
+        parent_commit = subprocess.check_output(["git", "-C", str(parent), "rev-parse", "HEAD"], text=True).strip()
+        evidence = fixture / "verified-release.json"
+        evidence.write_text(json.dumps({"schema": 1, "deployer": self.deploy.DEPLOYER_ID, "trust": "development-sha", "parent_commit": parent_commit}), encoding="utf-8")
+        evidence.chmod(0o600)
+
+        class DirectScope:
+            def __init__(self, root, deployment_id):
+                self.path = pathlib.Path(root) / ("mkchad-deploy-" + deployment_id)
+
+            def __enter__(self):
+                self.path.mkdir(parents=True)
+                return self
+
+            def __exit__(self, *_):
+                return None
+
+            def run(self, argv, timeout=300, extra_env=None):
+                environment = os.environ.copy()
+                environment.update(extra_env or {})
+                return subprocess.run(argv, check=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, env=environment)
+
+        environment = {
+            "HOME": str(home),
+            "XDG_CONFIG_HOME": str(config),
+            "XDG_DATA_HOME": str(data),
+            "XDG_STATE_HOME": str(state),
+            "XDG_RUNTIME_DIR": str(runtime),
+            "MKCHAD_DEPLOY_CGROUP_ROOT": str(fixture / "fake-cgroup"),
+        }
+        stage_map = {name: children[name] for name in children}
+        stage_map["msk_containers-container_tools"] = container_tools
+        with mock.patch.dict(os.environ, environment, clear=False), mock.patch.object(self.deploy, "CgroupScope", DirectScope), mock.patch.object(
+            self.deploy, "_verified_evidence", return_value={"trust": "development-sha", "parent_commit": parent_commit}
+        ), mock.patch.object(self.deploy, "stage_child", side_effect=lambda url, commit, staging, name, scope: stage_map[name]), mock.patch.object(
+            self.deploy, "validate_image_runtime", return_value={"schema": 1}
+        ), mock.patch.object(
+            self.deploy, "expected_managed_image_name", return_value="neovim_fixture.sif"
+        ):
+            first = self.deploy.deploy(parent, evidence, image)
+            launcher_before = os.stat(home / ".local" / "bin" / "mkchad-opencode-server")
+            second = self.deploy.deploy(parent, evidence, image)
+            launcher_after = os.stat(home / ".local" / "bin" / "mkchad-opencode-server")
+        self.assertEqual(first["state"], "succeeded")
+        self.assertEqual(second["state"], "succeeded")
+        self.assertEqual((launcher_before.st_ino, launcher_before.st_mtime_ns), (launcher_after.st_ino, launcher_after.st_mtime_ns))
+        self.assertEqual(subprocess.check_output(["git", "-C", str(config / "mkchad"), "rev-parse", "HEAD"], text=True).strip(), child_commits["mkchad"])
+
+
+if __name__ == "__main__":
+    unittest.main()

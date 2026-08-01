@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MkChad deployment receipt schema 1",
+  "type": "object",
+  "required": ["schema", "id", "deployer", "state", "phase", "trust", "components", "artifact", "actions", "configuration_handoff", "recovery", "diagnostic"],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {"const": 1},
+    "id": {"type": "string"},
+    "deployer": {"const": "mkchad-deploy-v1"},
+    "state": {"enum": ["in_progress", "failed", "succeeded", "recovered_complete", "recovered_restore"]},
+    "phase": {"type": "string"},
+    "trust": {"type": "object"},
+    "components": {"type": "array"},
+    "artifact": {"type": "object"},
+    "actions": {"type": "array"},
+    "configuration_handoff": {"type": "object"},
+    "recovery": {"type": "object"},
+    "diagnostic": {"type": "string"}
+  }
+}
