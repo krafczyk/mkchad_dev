@@ -38,7 +38,7 @@ RESULT_FIELDS = {
     "diagnostic",
     "log_path",
 }
-REDACT_ASSIGNMENT = re.compile(r"(?i)\b(password|token|secret|api[_-]?key)=[^\s]+")
+REDACT_ASSIGNMENT = re.compile(r"(?i)\b(?P<key>[A-Za-z0-9_-]*(?:password|token|secret|api[_-]?key)[A-Za-z0-9_-]*)=[^\s]+")
 COMMAND_TIMEOUT = 300
 
 
@@ -87,7 +87,7 @@ def _invocation_lock(state_root: pathlib.Path):
 
 def _redact(text: str) -> str:
     """Remove recognizable credential assignments before terminal or log output."""
-    return REDACT_ASSIGNMENT.sub(lambda match: match.group(1) + "=<redacted>", text)
+    return REDACT_ASSIGNMENT.sub(lambda match: match.group("key") + "=<redacted>", text)
 
 
 def _write_stream(stream, log, data: bytes):

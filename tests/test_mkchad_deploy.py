@@ -3,6 +3,7 @@
 import copy
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import pathlib
@@ -1322,10 +1323,10 @@ class DeploymentPreflightTests(unittest.TestCase):
         image = self.root / "runtime.sif"
         image.write_bytes(b"x")
         completed = subprocess.CompletedProcess([], 0, "x86_64\n", "")
-        with mock.patch.object(self.deploy.shutil, "which", side_effect=["/bin/apptainer", "/bin/singularity"]), mock.patch.object(self.deploy.subprocess, "run", return_value=completed) as run:
+        with mock.patch.object(self.deploy.shutil, "which", side_effect=["/bin/apptainer", "/bin/singularity"]), mock.patch.object(self.deploy, "_v2_capture", return_value=completed) as run:
             self.deploy._v2_validate_image_runtime(image, "x86_64")
         self.assertEqual(run.call_args.args[0][0], "/bin/apptainer")
-        with mock.patch.object(self.deploy.shutil, "which", side_effect=[None, "/bin/singularity"]), mock.patch.object(self.deploy.subprocess, "run", return_value=completed) as run:
+        with mock.patch.object(self.deploy.shutil, "which", side_effect=[None, "/bin/singularity"]), mock.patch.object(self.deploy, "_v2_capture", return_value=completed) as run:
             self.deploy._v2_validate_image_runtime(image, "x86_64")
         self.assertEqual(run.call_args.args[0][0], "/bin/singularity")
         with mock.patch.object(self.deploy.shutil, "which", return_value=None):
@@ -1393,7 +1394,7 @@ class DeploymentPreflightTests(unittest.TestCase):
                 self._preflight()
         self._lifecycle({"schema": 1, "ok": True, "command": "status", "status": "inactive"})
         plans = {name: (self.root / name, {"kind": "absent", "compliant": False}) for name in self.commits}
-        with mock.patch.object(self.deploy.subprocess, "run", side_effect=subprocess.TimeoutExpired(["status"], 40)):
+        with mock.patch.object(self.deploy, "_v2_capture", side_effect=self.deploy.DeploymentError("command timed out")):
             with self.assertRaisesRegex(self.deploy.DeploymentError, "status"):
                 self.deploy._v2_lifecycle(self.roots, plans, self.root / "sources" / "msk_containers", {"sha256": "0" * 64}, 40)
 
@@ -1755,6 +1756,161 @@ class DeploymentContractTests(unittest.TestCase):
             mutate(result)
             with self.subTest(message=message), self.assertRaisesRegex(self.deploy.DeploymentError, message):
                 self.deploy.validate_result_v1_document(result)
+
+
+class DeploymentExecutionTests(DeploymentCheckoutTests):
+    """Exercise schema-2 actions, image installation, and terminal results."""
+
+    def _sources(self):
+        commits = super()._sources()
+        msk = self.root / "sources" / "msk_containers"
+        (msk / "bin" / "install_nvim.sh").write_text(
+            "#!/bin/sh\n"
+            "set -eu\n"
+            "printf 'host-tools %s\\n' \"$*\"\n"
+            "[ \"${1:-}\" != --check ] || exit \"${HOST_PREFLIGHT_STATUS:-0}\"\n"
+            "[ \"${HOST_TOOLS_SLEEP:-0}\" = 0 ] || sleep \"$HOST_TOOLS_SLEEP\"\n"
+            "mkdir -p \"$HOME/.local/bin\"\n"
+            "cp container_tools/*.sh \"$HOME/.local/bin/\"\n"
+            "cp nvim/bin/nvim \"$HOME/.local/bin/nvim\"\n"
+            "cp nvim/bin/install_nvim_container \"$HOME/.local/bin/install_nvim_container\"\n"
+            "chmod 755 \"$HOME/.local/bin\"/*\n",
+            encoding="ascii",
+        )
+        (msk / "nvim" / "bin" / "nvim").write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+        (msk / "nvim" / "bin" / "nvim").chmod(0o755)
+        (msk / "nvim" / "bin" / "install_nvim_container").write_text(
+            "#!/bin/sh\n"
+            "set -eu\n"
+            "printf 'image-install %s\\n' \"$*\"\n"
+            "[ \"${1:-}\" = --dry-run ] && exit 0\n"
+            "[ \"${IMAGE_INSTALL_STATUS:-0}\" = 0 ] || exit \"$IMAGE_INSTALL_STATUS\"\n"
+            "mkdir -p \"$HOME/containers\"\n"
+            "for source; do :; done\n"
+            "if [ \"${IMAGE_INSTALL_WRONG_DIGEST:-0}\" = 1 ]; then printf bad > \"$HOME/containers/neovim_fixture.sif\"; else cp \"$source\" \"$HOME/containers/neovim_fixture.sif\"; fi\n"
+            "ln -sfn neovim_fixture.sif \"$HOME/containers/neovim.sif\"\n",
+            encoding="ascii",
+        )
+        commits["msk_containers"] = self._commit(msk, "install fixture outputs")
+        return commits
+
+    def _execute(self, *, manifest=None, image=None, run_id="123e4567-e89b-12d3-a456-426614174000"):
+        manifest, image = (manifest, image) if manifest else self._manifest()
+        self.result_path = self.root / "result.json"
+        return self.deploy.execute_v2_deployment(
+            self.root,
+            image,
+            release="v2-fixture",
+            log_path=self.root / "run.log",
+            result_path=self.result_path,
+            run_id=run_id,
+            manifest_path=manifest,
+            roots=self.roots,
+            staging_root=self.root,
+        )
+
+    def _result(self):
+        return json.loads(self.result_path.read_text(encoding="utf-8"))
+
+    def test_actions_install_and_verify_the_pinned_outputs_and_publish_requested_state(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(self._execute(), 0)
+        result = self._result()
+        self.assertEqual(result["outcome"], "succeeded")
+        self.assertEqual(result["phase"], "verify")
+        self.assertEqual(result["artifact"]["observed_sha256"], result["artifact"]["expected_sha256"])
+        self.assertEqual([action["status"] for action in result["actions"]], ["succeeded"] * 5)
+        self.assertEqual({component["name"] for component in result["configuration_handoff"]["components"]}, self.deploy.V2_CONFIGURATION_COMPONENTS)
+        self.assertIn("host-tools --check", output.getvalue())
+        self.assertFalse(list(self.state.rglob("*journal*")))
+        self.assertFalse(list(self.state.rglob("*recovery*")))
+
+    def test_first_apply_failure_stops_later_actions_and_reports_a_redacted_terminal_result(self):
+        os.environ["IMAGE_INSTALL_STATUS"] = "7"
+        os.environ["API_TOKEN"] = "DO-NOT-PUBLISH"
+        self.assertEqual(self._execute(), 2)
+        result = self._result()
+        self.assertEqual(result["outcome"], "failed")
+        self.assertEqual(result["failed_step"], "msk_containers:image-install")
+        self.assertEqual([action["status"] for action in result["actions"]], ["succeeded", "succeeded", "succeeded", "failed", "pending"])
+        encoded = json.dumps(result)
+        self.assertNotIn("DO-NOT-PUBLISH", encoded)
+        self.assertNotIn("args", encoded)
+        self.assertNotIn("environment", encoded)
+
+    def test_preflight_action_failure_names_the_step_before_checkout_mutation(self):
+        os.environ["HOST_PREFLIGHT_STATUS"] = "7"
+
+        self.assertEqual(self._execute(), 2)
+
+        result = self._result()
+        self.assertEqual(result["phase"], "preflight")
+        self.assertEqual(result["failed_step"], "msk_containers:host-tools-preflight")
+        self.assertEqual([action["status"] for action in result["actions"]], ["failed", "pending", "pending", "pending", "pending"])
+        self.assertFalse(self._destination("msk_containers").exists())
+
+    def test_action_timeout_terminates_the_live_group_and_records_the_failed_step(self):
+        os.environ["HOST_TOOLS_SLEEP"] = "10"
+        original = self.deploy._v2_run_action
+
+        def short_timeout(argv, cwd):
+            return original(argv, cwd, timeout=0.05)
+
+        with mock.patch.object(self.deploy, "_v2_run_action", side_effect=short_timeout):
+            self.assertEqual(self._execute(), 2)
+        result = self._result()
+        self.assertEqual(result["failed_step"], "msk_containers:host-tools-install")
+        self.assertEqual([action["status"] for action in result["actions"]], ["succeeded", "succeeded", "failed", "pending", "pending"])
+        self.assertIn("timed out", result["diagnostic"])
+
+    def test_wrong_installed_image_digest_fails_terminal_verification(self):
+        os.environ["IMAGE_INSTALL_WRONG_DIGEST"] = "1"
+        self.assertEqual(self._execute(), 2)
+        result = self._result()
+        self.assertEqual(result["outcome"], "failed")
+        self.assertEqual(result["phase"], "verify")
+        self.assertEqual(result["failed_step"], "installed-image-verification")
+        self.assertNotEqual(result["artifact"]["observed_sha256"], result["artifact"]["expected_sha256"])
+
+    def test_internal_cli_accepts_only_the_launcher_handoff_arguments(self):
+        log_path = self.root / "run.log"
+        result_path = self.root / "result.json"
+        with mock.patch.object(self.deploy, "execute_v2_deployment", return_value=0) as execute:
+            self.assertEqual(
+                self.deploy.main(
+                    [
+                        "deploy", "--release", "v2-fixture", "--image", str(self.root / "image.sif"),
+                        "--log-path", str(log_path), "--result-path", str(result_path),
+                        "--run-id", "123e4567-e89b-12d3-a456-426614174000",
+                    ]
+                ),
+                0,
+            )
+        self.assertEqual(execute.call_args.kwargs["release"], "v2-fixture")
+        self.assertEqual(execute.call_args.kwargs["log_path"], log_path)
+        self.assertEqual(execute.call_args.kwargs["result_path"], result_path)
+
+    def test_uncaught_termination_leaves_the_previous_terminal_result(self):
+        self.assertEqual(self._execute(), 0)
+        prior = self.result_path.read_text(encoding="utf-8")
+        with mock.patch.object(self.deploy, "_v2_run_action", side_effect=SystemExit):
+            with self.assertRaises(SystemExit):
+                self._execute(run_id="423e4567-e89b-12d3-a456-426614174000")
+        self.assertEqual(self.result_path.read_text(encoding="utf-8"), prior)
+
+    def test_active_compliant_run_verifies_without_apply_and_caught_interruption_publishes_result(self):
+        self.assertEqual(self._execute(), 0)
+        self._lifecycle()
+        launcher = self.home / ".local" / "bin" / "mkchad-opencode-server"
+        launcher.write_text("#!/bin/sh\nprintf '%s\\n' '{\"schema\": 1, \"ok\": true, \"command\": \"status\", \"status\": \"healthy\"}'\n", encoding="ascii")
+        launcher.chmod(0o755)
+        self.assertEqual(self._execute(run_id="223e4567-e89b-12d3-a456-426614174000"), 0)
+        result = self._result()
+        self.assertEqual([action["status"] for action in result["actions"]], ["succeeded", "succeeded", "skipped-compliant", "skipped-compliant", "succeeded"])
+        with mock.patch.object(self.deploy, "_v2_run_action", side_effect=KeyboardInterrupt):
+            self.assertEqual(self._execute(run_id="323e4567-e89b-12d3-a456-426614174000"), 2)
+        self.assertEqual(self._result()["outcome"], "interrupted")
 
 
 if __name__ == "__main__":

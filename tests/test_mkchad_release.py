@@ -288,5 +288,17 @@ raise SystemExit(int(os.environ.get('MKCHAD_RELEASE_CHILD_EXIT', '0')))
         self.assertFalse(list(self.temp.glob("mkchad-release-*")))
 
 
+class ReleaseLoggingTests(unittest.TestCase):
+    """Exercise launcher logging behavior shared with release-owned deployment output."""
+
+    def test_streamed_output_is_redacted_before_terminal_and_log_writes(self):
+        launcher = load_launcher()
+        terminal = io.StringIO()
+        log = io.StringIO()
+        launcher._write_stream(terminal, log, b"API_TOKEN=DO-NOT-PUBLISH child output\n")
+        self.assertEqual(terminal.getvalue(), "API_TOKEN=<redacted> child output\n")
+        self.assertEqual(log.getvalue(), terminal.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

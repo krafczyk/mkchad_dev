@@ -17,6 +17,7 @@ import configparser
 import contextlib
 import contextvars
 import ctypes
+import datetime
 import errno
 import fcntl
 import hashlib
@@ -2508,6 +2509,44 @@ def _roots() -> dict[str, pathlib.Path]:
 V2_LIFECYCLE_STATUSES = frozenset({"inactive", "healthy", "degraded", "blocked", "starting", "stopping", "failed"})
 V2_LIFECYCLE_TIMEOUT = 40
 V2_COMMAND_TIMEOUT = 300
+V2_TERM_GRACE = 5
+
+
+class _V2ActionError(DeploymentError):
+    """Identify one failed manifest action while preserving its diagnostic."""
+
+    def __init__(self, component: str, action_id: str, phase: str, diagnostic: str):
+        super().__init__(diagnostic)
+        self.component = component
+        self.action_id = action_id
+        self.phase = phase
+
+
+def _v2_capture(command: list[str], *, cwd: pathlib.Path | None = None, env: dict[str, str] | None = None, timeout: float = V2_COMMAND_TIMEOUT) -> subprocess.CompletedProcess:
+    """Run one bounded noninteractive command in a disposable process group."""
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=cwd,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+            close_fds=True,
+        )
+    except OSError as exc:
+        raise DeploymentError(f"command could not start: {command[0]}") from exc
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except KeyboardInterrupt:
+        _v2_terminate_group(process)
+        raise
+    except subprocess.TimeoutExpired as exc:
+        _v2_terminate_group(process)
+        raise DeploymentError(f"command timed out after {timeout:g} seconds: {command[0]}") from exc
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
 
 def _v2_git(argv: list[str], cwd: pathlib.Path | None = None, check: bool = True) -> subprocess.CompletedProcess:
@@ -2518,16 +2557,12 @@ def _v2_git(argv: list[str], cwd: pathlib.Path | None = None, check: bool = True
     hooks or templates.
     """
     try:
-        result = subprocess.run(
+        result = _v2_capture(
             ["git", "-c", "core.hooksPath=/dev/null", "-c", "init.templateDir=", *argv],
             cwd=cwd,
             env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=V2_COMMAND_TIMEOUT,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except DeploymentError as exc:
         raise DeploymentError(f"git staging command failed: {argv[0]}") from exc
     if check and result.returncode:
         raise DeploymentError(f"git staging command failed: {argv[0]}")
@@ -2607,8 +2642,8 @@ def _v2_validate_image_runtime(image: pathlib.Path, architecture: str):
     if runtime is None:
         raise DeploymentError("no Apptainer or Singularity runtime is available")
     try:
-        result = subprocess.run([runtime, "exec", str(image), "uname", "-m"], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=V2_LIFECYCLE_TIMEOUT)
-    except (OSError, subprocess.TimeoutExpired) as exc:
+        result = _v2_capture([runtime, "exec", str(image), "uname", "-m"], timeout=V2_LIFECYCLE_TIMEOUT)
+    except DeploymentError as exc:
         raise DeploymentError("image architecture inspection failed") from exc
     observed = result.stdout.strip().lower()
     normalized = {"amd64": "x86_64", "x86": "x86_64", "arm64": "aarch64", "ppc64el": "ppc64le"}.get(observed, observed)
@@ -2660,27 +2695,109 @@ def _v2_destination_preflight(roots: dict[str, pathlib.Path], component: dict, s
     return destination, {"kind": "absent", "compliant": False}
 
 
-def _v2_expand_action(action: dict, staged_image: pathlib.Path, component: dict, recovery: pathlib.Path) -> list[str]:
-    """Expand a typed preflight action into its fixed executable argument array."""
+def _v2_expand_action(action: dict, staged_image: pathlib.Path, component: dict, recovery: pathlib.Path, checkout: pathlib.Path | None = None) -> list[str]:
+    """Expand one typed action from either staging or its final pinned checkout."""
     tokens = {"recovery_dir": str(recovery), "staged_image": str(staged_image), "component_revision": component["commit"]}
-    return [str(component["_staged"] / action["path"]), *(argument if isinstance(argument, str) else tokens[argument["token"]] for argument in action["args"])]
+    return [str((checkout or component["_staged"]) / action["path"]), *(argument if isinstance(argument, str) else tokens[argument["token"]] for argument in action["args"])]
 
 
-def _v2_run_preflight_actions(components: dict[str, dict], staged_image: pathlib.Path, staging: pathlib.Path):
+def _v2_terminate_group(process: subprocess.Popen):
+    """Stop one live command group and wait for its leader without retaining a PID."""
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(process.pid, signal.SIGTERM)
+    try:
+        process.wait(timeout=V2_TERM_GRACE)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(process.pid, signal.SIGKILL)
+    process.wait(timeout=V2_TERM_GRACE)
+
+
+def _v2_run_action(argv: list[str], cwd: pathlib.Path, timeout: float = V2_COMMAND_TIMEOUT) -> subprocess.CompletedProcess:
+    """Run one action in a bounded process group and stream redacted child output.
+
+    Args:
+        argv: Fixed executable argument array expanded from a validated action.
+        cwd: Pinned component checkout owning the executable.
+        timeout: Finite maximum action duration in seconds.
+
+    Returns:
+        Completed child output after a zero exit status.
+
+    Raises:
+        DeploymentError: If the action cannot start, times out, or exits nonzero.
+        KeyboardInterrupt: After terminating only this action's live process group.
+    """
+    try:
+        process = subprocess.Popen(
+            argv,
+            cwd=cwd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+            close_fds=True,
+        )
+    except OSError as exc:
+        raise DeploymentError("action could not start") from exc
+    assert process.stdout is not None and process.stderr is not None
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ, sys.stdout)
+    selector.register(process.stderr, selectors.EVENT_READ, sys.stderr)
+    stdout_fd, stderr_fd = process.stdout.fileno(), process.stderr.fileno()
+    output = {stdout_fd: bytearray(), stderr_fd: bytearray()}
+    deadline = time.monotonic() + timeout
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _v2_terminate_group(process)
+                raise DeploymentError(f"action timed out after {timeout:g} seconds")
+            for key, _ in selector.select(min(0.1, remaining)):
+                data = os.read(key.fileobj.fileno(), 65536)
+                if not data:
+                    selector.unregister(key.fileobj)
+                    continue
+                output[key.fileobj.fileno()].extend(data)
+                key.data.write(redact(data.decode("utf-8", errors="replace")))
+                key.data.flush()
+        status = process.wait(timeout=max(0.1, deadline - time.monotonic()))
+    except KeyboardInterrupt:
+        _v2_terminate_group(process)
+        raise
+    except subprocess.TimeoutExpired as exc:
+        _v2_terminate_group(process)
+        raise DeploymentError(f"action timed out after {timeout:g} seconds") from exc
+    finally:
+        selector.close()
+        process.stdout.close()
+        process.stderr.close()
+    if status:
+        raise DeploymentError(f"action failed with exit {status}")
+    return subprocess.CompletedProcess(argv, status, output[stdout_fd].decode("utf-8", "replace"), output[stderr_fd].decode("utf-8", "replace"))
+
+
+def _v2_run_preflight_actions(components: dict[str, dict], staged_image: pathlib.Path, recovery: pathlib.Path):
     """Run all manifest preflight actions from disposable staged checkouts."""
-    recovery = pathlib.Path(tempfile.mkdtemp(prefix="recovery-", dir=staging))
-    os.chmod(recovery, 0o700)
+    results = []
     for component in components.values():
         for action in component["actions"]:
             if action["phase"] != "preflight":
                 continue
             argv = _v2_expand_action(action, staged_image, component, recovery)
             try:
-                result = subprocess.run(argv, cwd=component["_staged"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=V2_COMMAND_TIMEOUT)
-            except (OSError, subprocess.TimeoutExpired) as exc:
-                raise DeploymentError(f"preflight action failed: {component['name']}:{action['id']}") from exc
-            if result.returncode:
-                raise DeploymentError(f"preflight action failed: {component['name']}:{action['id']}")
+                _v2_run_action(argv, component["_staged"])
+            except DeploymentError as exc:
+                raise _V2ActionError(
+                    component["name"],
+                    action["id"],
+                    "preflight",
+                    f"preflight action failed: {component['name']}:{action['id']}",
+                ) from exc
+            results.append((component["name"], action["id"]))
+    return results
 
 
 def _v2_managed_paths(roots: dict[str, pathlib.Path], staged_msk: pathlib.Path) -> list[pathlib.Path]:
@@ -2723,9 +2840,9 @@ def _v2_lifecycle(roots: dict[str, pathlib.Path], plans: dict[str, tuple[pathlib
     if not launcher.is_file() or not os.access(launcher, os.X_OK):
         raise DeploymentError("lifecycle command is unavailable")
     try:
-        result = subprocess.run([str(launcher), "status", "--json"], env={**os.environ, "HOME": str(roots["home"]), "XDG_CONFIG_HOME": str(roots["xdg_config_home"]), "XDG_DATA_HOME": str(roots["xdg_data_home"]), "XDG_STATE_HOME": str(roots["xdg_state_home"])}, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+        result = _v2_capture([str(launcher), "status", "--json"], env={**os.environ, "HOME": str(roots["home"]), "XDG_CONFIG_HOME": str(roots["xdg_config_home"]), "XDG_DATA_HOME": str(roots["xdg_data_home"]), "XDG_STATE_HOME": str(roots["xdg_state_home"])}, timeout=timeout)
         payload = json.loads(result.stdout)
-    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
+    except (DeploymentError, json.JSONDecodeError) as exc:
         raise DeploymentError("managed service status is unavailable or malformed") from exc
     if result.returncode or not isinstance(payload, dict) or payload.get("schema") != 1 or payload.get("ok") is not True or payload.get("command") != "status" or payload.get("status") not in V2_LIFECYCLE_STATUSES:
         raise DeploymentError("managed service status is unavailable or malformed")
@@ -2788,16 +2905,22 @@ def preflight_release_inputs(repo: pathlib.Path, image: pathlib.Path, *, manifes
         plans = {name: _v2_destination_preflight(roots, component, component["_staged"]) for name, component in deployed.items()}
         with UserLock(roots["xdg_state_home"] / "mkchad" / "deployment.lock"):
             lifecycle, verify_only = _v2_lifecycle(roots, plans, deployed["msk_containers"]["_staged"], artifact, lifecycle_timeout)
-            _v2_run_preflight_actions(deployed, staged_image, staging)
+            recovery = pathlib.Path(tempfile.mkdtemp(prefix="recovery-", dir=staging))
+            os.chmod(recovery, 0o700)
+            preflight_actions = _v2_run_preflight_actions(deployed, staged_image, recovery)
             yield {
                 "state": "preflighted",
                 "lifecycle": lifecycle,
                 "verify_only": verify_only,
+                "release": release,
                 "components": deployed,
                 "bare": staged_bare,
                 "plans": plans,
                 "roots": roots,
                 "artifact": artifact,
+                "staged_image": staged_image,
+                "recovery": recovery,
+                "preflight_actions": preflight_actions,
             }
     finally:
         shutil.rmtree(staging, ignore_errors=True)
@@ -2944,6 +3067,215 @@ def apply_preflighted_checkouts(prepared: dict) -> list[dict]:
         results.append(_v2_apply_checkout(prepared, name))
     verify_preflighted_checkouts(prepared)
     return results
+
+
+def _v2_timestamp() -> str:
+    """Return one schema-1 terminal-result UTC timestamp."""
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _v2_configuration_handoff(release: dict) -> dict:
+    """Build the configuration-owned pin handoff directly from a schema-2 manifest."""
+    return {
+        "state": "configuration-pending",
+        "contract_version": release["configuration"]["contract_version"],
+        "guidance": release["configuration"]["guidance"],
+        "components": [
+            {"name": component["name"], "repository": component["repository"], "commit": component["commit"]}
+            for component in release["components"]
+            if component["disposition"] == "configuration-owned"
+        ],
+    }
+
+
+def _v2_observed_commit(component: dict, roots: dict[str, pathlib.Path]) -> str | None:
+    """Return an observed deployed HEAD when it remains readable after a terminal run."""
+    if component["disposition"] != "deployed":
+        return None
+    try:
+        destination = resolve_named_destination(roots, component["destination"]["root"], component["destination"]["path"])
+        result = _v2_git(["-C", str(destination), "rev-parse", "HEAD"], check=False)
+        head = result.stdout.strip()
+        return head if result.returncode == 0 and SHA1.fullmatch(head) else None
+    except DeploymentError:
+        return None
+
+
+def _v2_observed_image_digest(home: pathlib.Path) -> str | None:
+    """Return the active image digest when its ordinary managed link is readable."""
+    container_dir = pathlib.Path(os.environ.get("NVIM_CONTAINER_DIR", home / "containers"))
+    try:
+        target = container_dir / os.readlink(container_dir / "neovim.sif")
+        return _digest(target)
+    except (DeploymentError, OSError):
+        return None
+
+
+def _v2_terminal_result(release: dict, prepared: dict, run_id: str, release_tag: str, started_at: str, *, outcome: str, phase: str, actions: list[dict], failed_step: str | None, diagnostic: str) -> dict:
+    """Build a complete terminal result without serializing command or environment data."""
+    return {
+        "schema": 1,
+        "run_id": run_id,
+        "release": release_tag,
+        "started_at": started_at,
+        "completed_at": _v2_timestamp(),
+        "outcome": outcome,
+        "phase": phase,
+        "components": [
+            {
+                "name": component["name"],
+                "disposition": component["disposition"],
+                "requested_commit": component["commit"],
+                "observed_commit": _v2_observed_commit(component, prepared["roots"]),
+            }
+            for component in release["components"]
+        ],
+        "artifact": {
+            "architecture": prepared["artifact"]["architecture"],
+            "expected_sha256": prepared["artifact"]["sha256"],
+            "observed_sha256": _v2_observed_image_digest(prepared["roots"]["home"]),
+        },
+        "actions": actions,
+        "configuration_handoff": _v2_configuration_handoff(release),
+        "failed_step": failed_step,
+        "diagnostic": redact(diagnostic) or "deployment failed; repair the reported step and rerun",
+        "log_path": prepared["log_path"],
+    }
+
+
+def _v2_publish_result(path: pathlib.Path, document: dict):
+    """Validate and atomically replace the caller-provided terminal result path."""
+    validate_result_v1_document(document)
+    atomic_json(path, document)
+
+
+def _v2_verify_host_tools(msk_destination: pathlib.Path, home: pathlib.Path):
+    """Verify all installer-owned host tools have the final pinned bytes and modes."""
+    target_dir = home / ".local" / "bin"
+    for source in installer_owned_sources(msk_destination):
+        target = target_dir / source.name
+        if not target.is_file() or stat.S_IMODE(target.stat().st_mode) != 0o755 or _digest(target) != _digest(source):
+            raise DeploymentError(f"host-tool verification failed: {source.name}")
+
+
+def execute_v2_deployment(
+    repo: pathlib.Path,
+    image: pathlib.Path,
+    *,
+    release: str,
+    log_path: pathlib.Path,
+    result_path: pathlib.Path,
+    run_id: str,
+    manifest_path: pathlib.Path | None = None,
+    roots: dict[str, pathlib.Path] | None = None,
+    staging_root: pathlib.Path | None = None,
+) -> int:
+    """Execute one schema-2 deployment and publish exactly one terminal result.
+
+    ``manifest_path``, ``roots``, and ``staging_root`` are internal test seams.
+    The public internal CLI always loads ``repo/deploy/release.json`` and derives
+    roots from its process environment.
+
+    Args:
+        repo: Checked-out release that owns the schema-2 manifest.
+        image: Caller-supplied raw SIF.
+        release: Selected release tag for the terminal record.
+        log_path: Launcher-owned run log path bound into the record.
+        result_path: Launcher-owned temporary result path to atomically replace.
+        run_id: Launcher-generated UUID for this admitted invocation.
+        manifest_path: Optional test-only manifest override.
+        roots: Optional test-only named target roots.
+        staging_root: Optional test-only disposable staging parent.
+
+    Returns:
+        Zero on verified success and two for a published failure or interruption.
+    """
+    if not UUID.fullmatch(run_id):
+        raise DeploymentError("invalid deployment run ID")
+    started_at = _v2_timestamp()
+    prepared = None
+    current = None
+    failure_step = "preflight"
+    phase = "preflight"
+    actions = []
+    try:
+        result_roots = roots or _roots()
+        result_manifest = validate_release_v2_document(load_release_json(manifest_path or repo / "deploy" / "release.json"))
+        prepared = {
+            "release": result_manifest,
+            "roots": result_roots,
+            "artifact": _artifact_for(result_manifest),
+            "log_path": str(log_path),
+        }
+        actions = [
+            {"component": component["name"], "id": action["id"], "phase": action["phase"], "status": "pending"}
+            for component in result_manifest["components"]
+            if component["disposition"] == "deployed"
+            for action in component["actions"]
+        ]
+        with preflight_release_inputs(repo, image, manifest_path=manifest_path, roots=roots, staging_root=staging_root) as prepared:
+            prepared["log_path"] = str(log_path)
+            release_document = prepared["release"]
+
+            def run_phase(action_phase: str, *, final: bool = False):
+                nonlocal current
+                for component in prepared["components"].values():
+                    for action in component["actions"]:
+                        if action["phase"] != action_phase:
+                            continue
+                        current = next(item for item in actions if item["component"] == component["name"] and item["id"] == action["id"])
+                        argv = _v2_expand_action(action, prepared["staged_image"], component, prepared["recovery"], prepared["plans"][component["name"]][0] if final else None)
+                        _v2_run_action(argv, prepared["plans"][component["name"]][0] if final else component["_staged"])
+                        current["status"] = "succeeded"
+                        current = None
+
+            # Preflight actions ran after all destinations and lifecycle state were proven.
+            for component_name, action_id in prepared["preflight_actions"]:
+                next(item for item in actions if item["component"] == component_name and item["id"] == action_id)["status"] = "succeeded"
+            phase = "apply"
+            if prepared["verify_only"]:
+                for action in actions:
+                    if action["phase"] == "apply":
+                        action["status"] = "skipped-compliant"
+            else:
+                failure_step = "checkout-apply"
+                apply_preflighted_checkouts(prepared)
+                if _v2_complete_compliance(prepared["plans"], prepared["roots"], prepared["components"]["msk_containers"]["_staged"], prepared["artifact"]):
+                    for action in actions:
+                        if action["phase"] == "apply":
+                            action["status"] = "skipped-compliant"
+                else:
+                    run_phase("apply", final=True)
+            phase = "verify"
+            run_phase("verify", final=True)
+            failure_step = "checkout-verification"
+            verify_preflighted_checkouts(prepared)
+            failure_step = "host-tool-verification"
+            _v2_verify_host_tools(prepared["plans"]["msk_containers"][0], prepared["roots"]["home"])
+            failure_step = "installed-image-verification"
+            verify_installed_image(prepared["roots"]["home"], prepared["artifact"]["sha256"])
+            _v2_publish_result(result_path, _v2_terminal_result(release_document, prepared, run_id, release, started_at, outcome="succeeded", phase=phase, actions=actions, failed_step=None, diagnostic="deployment verified; configuration is pending"))
+            return 0
+    except KeyboardInterrupt:
+        if prepared is not None:
+            if current is not None:
+                current["status"] = "failed"
+            _v2_publish_result(result_path, _v2_terminal_result(prepared["release"], prepared, run_id, release, started_at, outcome="interrupted", phase=phase, actions=actions, failed_step=f"{current['component']}:{current['id']}" if current else failure_step, diagnostic="deployment interrupted; inspect the completed steps and rerun"))
+        return 2
+    except DeploymentError as exc:
+        if prepared is not None:
+            if isinstance(exc, _V2ActionError):
+                current = next(
+                    item
+                    for item in actions
+                    if item["component"] == exc.component and item["id"] == exc.action_id
+                )
+                phase = exc.phase
+            if current is not None:
+                current["status"] = "failed"
+            _v2_publish_result(result_path, _v2_terminal_result(prepared["release"], prepared, run_id, release, started_at, outcome="failed", phase=phase, actions=actions, failed_step=f"{current['component']}:{current['id']}" if current else failure_step, diagnostic=str(exc)))
+        print("mkchad-deploy: " + redact(str(exc)), file=sys.stderr)
+        return 2
 
 
 def _installer_trust_environment() -> dict[str, str] | None:
@@ -3558,12 +3890,17 @@ def main(argv: list[str] | None = None) -> int:
     validate.add_argument("--expected-parent-commit", required=True)
     validate.add_argument("--image", type=pathlib.Path, required=True)
     deploy_parser = commands.add_parser("deploy", allow_abbrev=False)
-    deploy_parser.add_argument("--repo", type=pathlib.Path, default=pathlib.Path.cwd())
-    deploy_parser.add_argument("--verified-release", type=pathlib.Path, required=True)
-    deploy_parser.add_argument("--verified-parent-bundle", type=pathlib.Path, required=True)
+    deploy_parser.add_argument("--release")
     deploy_parser.add_argument("--image", type=pathlib.Path, required=True)
-    deploy_parser.add_argument("--state-root", type=pathlib.Path)
-    deploy_parser.add_argument("--maintenance-quiesced", action="store_true")
+    deploy_parser.add_argument("--log-path", type=pathlib.Path)
+    deploy_parser.add_argument("--result-path", type=pathlib.Path)
+    deploy_parser.add_argument("--run-id")
+    # Retained only until the U6 cutover removes the inactive schema-1 path.
+    deploy_parser.add_argument("--repo", type=pathlib.Path, default=pathlib.Path.cwd(), help=argparse.SUPPRESS)
+    deploy_parser.add_argument("--verified-release", type=pathlib.Path, help=argparse.SUPPRESS)
+    deploy_parser.add_argument("--verified-parent-bundle", type=pathlib.Path, help=argparse.SUPPRESS)
+    deploy_parser.add_argument("--state-root", type=pathlib.Path, help=argparse.SUPPRESS)
+    deploy_parser.add_argument("--maintenance-quiesced", action="store_true", help=argparse.SUPPRESS)
     deploy_parser.add_argument("--trust-group-writable-roots", action="store_true", help=argparse.SUPPRESS)
     deploy_parser.add_argument("--bootstrap-root", type=pathlib.Path, help=argparse.SUPPRESS)
     supervisor = commands.add_parser("supervise", help=argparse.SUPPRESS, allow_abbrev=False)
@@ -3592,6 +3929,19 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "validate-release":
             print(json.dumps(validate_release_inputs(args.repo, args.release, args.expected_parent_commit, args.image), sort_keys=True))
         elif args.command == "deploy":
+            if args.release is not None:
+                if args.log_path is None or args.result_path is None or args.run_id is None:
+                    parser.error("deploy --release requires --log-path, --result-path, and --run-id")
+                return execute_v2_deployment(
+                    pathlib.Path.cwd(),
+                    args.image,
+                    release=args.release,
+                    log_path=args.log_path,
+                    result_path=args.result_path,
+                    run_id=args.run_id,
+                )
+            if args.verified_release is None or args.verified_parent_bundle is None:
+                parser.error("deploy requires the schema-2 release arguments")
             command = [sys.executable, str(pathlib.Path(__file__).resolve()), "supervise", "--repo", str(args.repo), "--verified-release", str(args.verified_release), "--verified-parent-bundle", str(args.verified_parent_bundle), "--image", str(args.image)]
             if args.state_root:
                 command.extend(["--state-root", str(args.state_root)])
