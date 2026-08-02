@@ -873,9 +873,7 @@ def install_or_update_nested_checkout(parent_destination: pathlib.Path, staged: 
         raise DeploymentError("nested checkout recovery state was not journaled before parent mutation")
     temporary = pathlib.Path(tempfile.mkdtemp(prefix=".container-tools-", dir=parent_destination))
     try:
-        _contained_git(scope, ["clone", "--no-checkout", "--no-local", str(staged), str(temporary)])
-        _contained_git(scope, ["-C", str(temporary), "remote", "set-url", "origin", authority["url"]])
-        _contained_git(scope, ["-C", str(temporary), "checkout", "--detach", "--no-recurse-submodules", authority["commit"]])
+        _prepare_exact_checkout(staged, temporary, authority["commit"], authority["url"], scope)
         _no_replace_rename(temporary, destination)
         resource["state"] = "installed"
         resource["identity"] = _identity(destination)
@@ -1558,6 +1556,16 @@ def _contained_git(scope: SessionScope, argv: list[str], extra_env: dict[str, st
     return scope.run(["git", "-c", "core.hooksPath=/dev/null", "-c", "init.templateDir=", *argv], extra_env=extra_env)
 
 
+def _prepare_exact_checkout(
+    source: pathlib.Path, destination: pathlib.Path, commit: str, origin: str, scope: SessionScope
+) -> None:
+    """Initialize an empty checkout by fetching one exact authorized commit."""
+    _contained_git(scope, ["init", str(destination)])
+    _contained_git(scope, ["-C", str(destination), "fetch", "--no-tags", str(source), commit])
+    _contained_git(scope, ["-C", str(destination), "remote", "add", "origin", origin])
+    _contained_git(scope, ["-C", str(destination), "checkout", "--detach", "--no-recurse-submodules", commit])
+
+
 def stage_child(url: str, commit: str, staging_root: pathlib.Path, name: str, scope: SessionScope) -> pathlib.Path:
     """Fetch one exact child object into an independent private bare repository."""
     bare = staging_root / (name.replace("/", "_") + ".git")
@@ -1644,9 +1652,7 @@ def install_or_update_component(destination: pathlib.Path, staged: pathlib.Path,
     parent_identity = _identity(destination.parent)
     temporary = pathlib.Path(tempfile.mkdtemp(prefix=".mkchad-clone-", dir=destination.parent))
     try:
-        _contained_git(scope, ["clone", "--no-checkout", "--no-local", str(staged), str(temporary)])
-        _contained_git(scope, ["-C", str(temporary), "remote", "set-url", "origin", authority["url"]])
-        _contained_git(scope, ["-C", str(temporary), "checkout", "--detach", "--no-recurse-submodules", commit])
+        _prepare_exact_checkout(staged, temporary, commit, authority["url"], scope)
         if _identity(destination.parent) != parent_identity:
             raise DeploymentError("destination parent changed after preflight")
         resource = {"kind": "checkout", "name": component["name"], "previous": None, "intended": commit, "state": "pending"}
@@ -2623,9 +2629,7 @@ def recover_checkout_resource(resource: dict, mode: str, component: dict, author
     _safe_owned_directory(destination.parent)
     temporary = pathlib.Path(tempfile.mkdtemp(prefix=".mkchad-recover-", dir=destination.parent))
     try:
-        _contained_git(scope, ["clone", "--no-checkout", "--no-local", str(git_bundle), str(temporary)])
-        _contained_git(scope, ["-C", str(temporary), "remote", "set-url", "origin", authority["url"]])
-        _contained_git(scope, ["-C", str(temporary), "checkout", "--detach", "--no-recurse-submodules", target])
+        _prepare_exact_checkout(git_bundle, temporary, target, authority["url"], scope)
         _no_replace_rename(temporary, destination)
     finally:
         if temporary.exists():

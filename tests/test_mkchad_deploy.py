@@ -353,6 +353,30 @@ class DeploymentValidationTests(unittest.TestCase):
         self.assertEqual((before.st_dev, before.st_ino), (after.st_dev, after.st_ino))
         self.assertEqual(subprocess.check_output(["git", "-C", str(msk), "rev-parse", "HEAD"], text=True).strip(), msk_commit)
 
+    def test_absent_checkout_fetches_unreferenced_staged_commit(self):
+        source = self.root / "source"
+        commit = self.make_checkout(source, "msk_containers")
+        staged = self.root / "staged.git"
+        subprocess.run(["git", "init", "-q", "--bare", str(staged)], check=True)
+        subprocess.run(["git", "-C", str(staged), "fetch", "--no-tags", str(source), commit], check=True, stdout=subprocess.DEVNULL)
+        self.assertNotEqual(subprocess.run(["git", "-C", str(staged), "show-ref", "--quiet"]).returncode, 0)
+
+        parent = self.root / "components"
+        parent.mkdir(mode=0o700)
+        destination = parent / "msk_containers"
+        component = {"name": "msk_containers"}
+        authority = {"repository": "github.com/krafczyk/msk_containers", "url": "git@github.com:krafczyk/msk_containers", "commit": commit}
+        preflight = self.deploy.preflight_component_destination(destination, component, authority, staged)
+        state = self.root / "state"
+        state.mkdir(mode=0o700)
+        journal = self.deploy.DeploymentJournal(state, {"kind": "development-sha", "parent_commit": "a" * 40}, [])
+        with self.deploy.SessionScope() as scope:
+            result = self.deploy.install_or_update_component(destination, staged, component, authority, journal, scope, preflight)
+
+        self.assertEqual(result["result"], "installed")
+        self.assertEqual(subprocess.check_output(["git", "-C", str(destination), "rev-parse", "HEAD"], text=True).strip(), commit)
+        self.assertEqual(subprocess.check_output(["git", "-C", str(destination), "remote", "get-url", "origin"], text=True).strip(), authority["url"])
+
     def test_preserved_mkchad_path_accepts_only_expected_link_or_private_file(self):
         checkout = self.root / "preserved"
         commit = self.make_checkout(checkout, "mkchad", {"tracked": "content\n"})
