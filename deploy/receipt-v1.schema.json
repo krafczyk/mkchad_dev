@@ -37,7 +37,36 @@
     "components": {"type": "array"},
     "artifact": {"type": "object"},
     "actions": {"type": "array"},
-    "configuration_handoff": {"type": "object"},
+    "configuration_handoff": {
+      "type": "object",
+      "required": ["contract_version", "guidance", "components"],
+      "additionalProperties": false,
+      "properties": {
+        "contract_version": {"const": 1},
+        "guidance": {"type": "string", "minLength": 1},
+        "components": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "uniqueItems": true,
+          "allOf": [
+            {"contains": {"type": "object", "properties": {"name": {"const": "opencode.nvim"}}, "required": ["name"]}, "minContains": 1, "maxContains": 1},
+            {"contains": {"type": "object", "properties": {"name": {"const": "opencode-project-reload"}}, "required": ["name"]}, "minContains": 1, "maxContains": 1},
+            {"contains": {"type": "object", "properties": {"name": {"const": "compound-engineering"}}, "required": ["name"]}, "minContains": 1, "maxContains": 1}
+          ],
+          "items": {
+            "type": "object",
+            "required": ["name", "repository", "revision"],
+            "additionalProperties": false,
+            "properties": {
+              "name": {"enum": ["opencode.nvim", "opencode-project-reload", "compound-engineering"]},
+              "repository": {"type": "string", "pattern": "^github\\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"},
+              "revision": {"type": "string", "pattern": "^[0-9a-f]{40}$"}
+            }
+          }
+        }
+      }
+    },
     "recovery": {"type": "object"},
     "process_cleanup": {
       "type": "object",

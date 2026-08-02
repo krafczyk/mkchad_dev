@@ -359,6 +359,33 @@ def validate_release_document(document: dict, submodules: list[str]) -> dict:
     return document
 
 
+def configuration_handoff(release: dict, gitlinks: dict[str, dict[str, str]]) -> dict:
+    """Build the machine-readable host-configuration handoff from gitlinks.
+
+    Args:
+        release: Validated schema-1 release metadata.
+        gitlinks: Child authorities derived from the selected parent commit.
+
+    Returns:
+        Contract version, guidance path, and sorted configuration-owned
+        repository revisions. Revisions are never read from release metadata.
+
+    Raises:
+        DeploymentError: If a configuration-owned component lacks a complete
+        gitlink-derived authority. The function has no side effects.
+    """
+    components = []
+    for component in release["components"]:
+        if component["disposition"] != "configuration-owned":
+            continue
+        authority = gitlinks.get(component["name"])
+        if not isinstance(authority, dict) or not SHA1.fullmatch(authority.get("commit", "")) or not isinstance(authority.get("repository"), str):
+            raise DeploymentError("configuration-owned component lacks gitlink authority")
+        components.append({"name": component["name"], "repository": authority["repository"], "revision": authority["commit"]})
+    components.sort(key=lambda item: item["name"])
+    return {"contract_version": release["configuration"]["contract_version"], "guidance": release["configuration"]["guidance"], "components": components}
+
+
 def _validate_action(action: object, component: str):
     """Validate one ordered component-owned action without interpolation."""
     if not isinstance(action, dict) or set(action) != {"id", "path", "args"}:
@@ -2176,7 +2203,7 @@ def deploy(repo: pathlib.Path, verified_release: pathlib.Path, verified_parent_b
                     if not final_checkout["compliant"]:
                         raise DeploymentError(f"component verification failed: {component['name']}")
                 phase = "finalize"
-                receipt = {"schema": SCHEMA, "id": journal.id, "deployer": DEPLOYER_ID, "state": "succeeded", "phase": "finalized", "authority": authority, "components": results, "artifact": {"sha256": artifact["sha256"], "architecture": artifact["architecture"]}, "actions": actions, "configuration_handoff": release["configuration"], "recovery": {"available": False}, "process_cleanup": {"machine_observed": True, "operator_asserted": False}, "diagnostic": "deployment completed without reading configuration-owned content"}
+                receipt = {"schema": SCHEMA, "id": journal.id, "deployer": DEPLOYER_ID, "state": "succeeded", "phase": "finalized", "authority": authority, "components": results, "artifact": {"sha256": artifact["sha256"], "architecture": artifact["architecture"]}, "actions": actions, "configuration_handoff": configuration_handoff(release, gitlinks), "recovery": {"available": False}, "process_cleanup": {"machine_observed": True, "operator_asserted": False}, "diagnostic": "deployment completed without reading configuration-owned content"}
                 receipt_path = state_root / (journal.id + ".receipt.json")
                 atomic_json(receipt_path, receipt, no_replace=True)
                 journal.succeeded(receipt)
@@ -2454,7 +2481,7 @@ def validate_release_inputs(repo: pathlib.Path, release_tag: str, expected_paren
                     validate_action_files(staged[component["name"]], gitlinks[component["name"]]["commit"], component)
             validate_configuration_pin(staged["mkchad"], gitlinks["mkchad"]["commit"], gitlinks["opencode.nvim"]["commit"])
             manifest = validate_image_runtime(scope, staged_image, artifact, staged["msk_containers"], gitlinks["msk_containers"]["commit"], staged["opencode"], gitlinks["opencode"])
-            return {"state": "validated", "parent_commit": expected_parent_commit, "components": sorted(gitlinks), "artifact": {"sha256": artifact["sha256"], "architecture": artifact["architecture"]}, "component_manifest": manifest}
+            return {"state": "validated", "parent_commit": expected_parent_commit, "components": sorted(gitlinks), "artifact": {"sha256": artifact["sha256"], "architecture": artifact["architecture"]}, "component_manifest": manifest, "configuration_handoff": configuration_handoff(release, gitlinks)}
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

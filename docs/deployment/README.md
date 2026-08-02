@@ -75,6 +75,11 @@ later-edited bytes remain untouched and the recovery bundle is retained.
 Receipts include closed authority, component, action, artifact, recovery, and
 configuration-handoff identities. Raw subprocess diagnostics, configuration
 contents, credentials, and secret-bearing values are never stored.
+Follow [configuration contract v1](configuration-contract-v1.md) after a
+successful component receipt. The independent configuration phase reviews the
+gitlink-derived configuration-owned revisions, applies and verifies the correct
+`config_files` host branch, and starts the managed service only after status
+agrees with the selected release.
 Machine-observed process-group cleanup and an operator's explicit quiescence
 assertion are recorded separately. Recovery never signals journal PIDs. It
 requires `--confirm-processes-quiesced` only for an `in_progress` record and

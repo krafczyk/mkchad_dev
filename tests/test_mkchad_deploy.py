@@ -111,6 +111,20 @@ class DeploymentValidationTests(unittest.TestCase):
         parsed = self.deploy.load_release_json(release_path)
         self.assertEqual(parsed["schema"], 1)
 
+    def test_configuration_handoff_uses_only_gitlink_derived_pins(self):
+        gitlinks = {
+            name: {"repository": f"github.com/krafczyk/{name}", "commit": format(index, "040x")}
+            for index, name in enumerate(self.deploy.COMPONENT_DISPOSITIONS, 1)
+        }
+        handoff = self.deploy.configuration_handoff(self.release(), gitlinks)
+        self.assertEqual(handoff["contract_version"], 1)
+        self.assertEqual(handoff["guidance"], "docs/deployment/README.md")
+        self.assertEqual([component["name"] for component in handoff["components"]], ["compound-engineering", "opencode-project-reload", "opencode.nvim"])
+        self.assertEqual(handoff["components"][0]["revision"], gitlinks["compound-engineering"]["commit"])
+        del gitlinks["opencode.nvim"]
+        with self.assertRaisesRegex(self.deploy.DeploymentError, "gitlink authority"):
+            self.deploy.configuration_handoff(self.release(), gitlinks)
+
     def test_keyless_authority_evidence_and_parent_bundle_are_closed_and_bound(self):
         repo = self.root / "parent"
         subprocess.run(["git", "init", "-q", str(repo)], check=True)
