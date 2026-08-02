@@ -1273,7 +1273,8 @@ class SessionScope:
 
             stdout, stderr = bytes(streams[stdout_fd]), bytes(streams[stderr_fd])
             if terminal is not None and terminal.si_code == os.CLD_EXITED and terminal.si_status != 0:
-                failure = failure or f"supervised subprocess failed with exit {terminal.si_status}; stderr-sha256={hashlib.sha256(stderr).hexdigest()}"
+                if failure == "supervised subprocess failed":
+                    failure = f"supervised subprocess failed with exit {terminal.si_status}; stderr-sha256={hashlib.sha256(stderr).hexdigest()}"
             live = self._live_group_members(identity[2], identity[3])
             if live and (live != [process.pid] or terminal is not None):
                 failure = failure or "supervised process group has an unexpected live member"

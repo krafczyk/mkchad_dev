@@ -407,6 +407,12 @@ class DeploymentValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(self.deploy.DeploymentError, "diagnostic output exceeded"):
             scope.run([sys.executable, "-c", "import sys; sys.stderr.write('x' * (1024 * 1024 + 1))"])
 
+    def test_session_scope_reports_exit_and_stderr_digest(self):
+        stderr = b"expected failure\n"
+        with self.assertRaises(self.deploy.DeploymentError) as raised:
+            self.deploy.SessionScope().run([sys.executable, "-c", "import sys; sys.stderr.write('expected failure\\n'); sys.exit(7)"])
+        self.assertEqual(str(raised.exception), f"supervised subprocess failed with exit 7; stderr-sha256={hashlib.sha256(stderr).hexdigest()}")
+
     def test_session_scope_reaps_only_after_group_cleanup_and_detects_reuse_fence(self):
         scope = self.deploy.SessionScope()
         process = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
