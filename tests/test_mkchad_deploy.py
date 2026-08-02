@@ -1,5 +1,6 @@
 """Focused behavioral tests for the parent deployment engine."""
 
+import copy
 import hashlib
 import importlib.util
 import json
@@ -1178,6 +1179,171 @@ ln -sfn "${target##*/}" "$HOME/containers/neovim.sif"
         self.assertEqual(second["state"], "succeeded")
         self.assertEqual((launcher_before.st_ino, launcher_before.st_mtime_ns), (launcher_after.st_ino, launcher_after.st_mtime_ns))
         self.assertEqual(subprocess.check_output(["git", "-C", str(config / "mkchad"), "rev-parse", "HEAD"], text=True).strip(), child_commits["mkchad"])
+
+
+class DeploymentContractTests(unittest.TestCase):
+    """Exercise the future release manifest and terminal result contracts."""
+
+    def setUp(self):
+        self.deploy = load_module("mkchad_deploy_contracts", "deploy/mkchad_deploy.py")
+
+    def release(self):
+        return {
+            "schema": 2,
+            "components": [
+                {
+                    "name": "msk_containers",
+                    "disposition": "deployed",
+                    "repository": "git@github.com:krafczyk/msk_containers",
+                    "commit": "a084416bf54b113677f5227380916e9003591111",
+                    "destination": {"root": "xdg_data_home", "path": "mkchad/components/msk_containers"},
+                    "actions": [
+                        {"id": "host-tools-preflight", "phase": "preflight", "path": "bin/install_nvim.sh", "args": ["--check", "--recovery-dir", {"token": "recovery_dir"}]},
+                        {"id": "image-install-preflight", "phase": "preflight", "path": "nvim/bin/install_nvim_container", "args": ["--dry-run", "--source-revision", {"token": "component_revision"}, {"token": "staged_image"}]},
+                        {"id": "host-tools-install", "phase": "apply", "path": "bin/install_nvim.sh", "args": ["--recovery-dir", {"token": "recovery_dir"}]},
+                        {"id": "image-install", "phase": "apply", "path": "nvim/bin/install_nvim_container", "args": ["--source-revision", {"token": "component_revision"}, {"token": "staged_image"}]},
+                        {"id": "host-tools-verify", "phase": "verify", "path": "bin/install_nvim.sh", "args": ["--check"]},
+                    ],
+                },
+                {
+                    "name": "container_tools",
+                    "disposition": "deployed",
+                    "repository": "git@github.com:krafczyk/container_tools",
+                    "commit": "22ffd7f3e8a52ec5a40dd95cb7428a7128830bc7",
+                    "destination": {"root": "xdg_data_home", "path": "mkchad/components/msk_containers/container_tools"},
+                    "actions": [],
+                },
+                {
+                    "name": "mkchad",
+                    "disposition": "deployed",
+                    "repository": "git@github.com:krafczyk/mkchad",
+                    "commit": "fb089cf345b33c7fd87dcc1d56677766c5719708",
+                    "destination": {"root": "xdg_config_home", "path": "mkchad"},
+                    "actions": [],
+                    "preserved_paths": ["opencode-server.json", "lazy-lock.json"],
+                },
+                {"name": "opencode", "disposition": "embedded", "repository": "git@github.com:krafczyk/opencode.git", "commit": "a8a797ab717289fe30308b1e3bcc8dfa865beb4a"},
+                {"name": "opencode.nvim", "disposition": "configuration-owned", "repository": "git@github.com:krafczyk/opencode.nvim", "commit": "37033dc157ac4c05c1e1525fe2fc9e87ae83e2ac"},
+                {"name": "opencode-project-reload", "disposition": "configuration-owned", "repository": "git@github.com:krafczyk/opencode-project-reload.git", "commit": "4548302d5b79ab079b2a9d503a4556c6119cbab2"},
+                {"name": "compound-engineering", "disposition": "configuration-owned", "repository": "git@github.com:krafczyk/compound-engineering-plugin.git", "commit": "f07e820a4146963de4e3ae1197c82f6686507e6c"},
+                {"name": "opencode_sprint_loop", "disposition": "disabled", "repository": "git@github.com:krafczyk/opencode_sprint_loop", "commit": "5e71e56e6fc471c7021a7e34a58485cb38c2ab49"},
+            ],
+            "artifacts": {"nvim-image": [{"architecture": "x86_64", "sha256": "a" * 64, "source_filename_class": "raw-nvim-container"}]},
+            "configuration": {"contract_version": 1, "guidance": "docs/deployment/README.md"},
+        }
+
+    def result(self, outcome="succeeded"):
+        release = self.release()
+        result = {
+            "schema": 1,
+            "release": "v2.0.0",
+            "started_at": "2026-08-02T12:00:00Z",
+            "completed_at": "2026-08-02T12:01:00Z",
+            "outcome": outcome,
+            "phase": "verify" if outcome == "succeeded" else "apply",
+            "components": [
+                {"name": component["name"], "disposition": component["disposition"], "requested_commit": component["commit"], "observed_commit": component["commit"] if component["disposition"] == "deployed" else None}
+                for component in release["components"]
+            ],
+            "artifact": {"architecture": "x86_64", "expected_sha256": "a" * 64, "observed_sha256": "a" * 64},
+            "actions": [
+                {"component": "msk_containers", "id": action["id"], "phase": action["phase"], "status": "succeeded"}
+                for action in release["components"][0]["actions"]
+            ],
+            "configuration_handoff": {
+                "state": "configuration-pending",
+                "contract_version": 1,
+                "guidance": "docs/deployment/README.md",
+                "components": [
+                    {"name": component["name"], "repository": component["repository"], "commit": component["commit"]}
+                    for component in release["components"] if component["disposition"] == "configuration-owned"
+                ],
+            },
+            "failed_step": None,
+            "diagnostic": "deployment completed",
+            "log_path": "/tmp/mkchad-v1/deploy/logs/run.log",
+        }
+        if outcome == "failed":
+            result["actions"][3]["status"] = "failed"
+            result["failed_step"] = "msk_containers:image-install"
+            result["diagnostic"] = "image installer failed"
+        elif outcome == "interrupted":
+            result["actions"][3]["status"] = "pending"
+            result["failed_step"] = "deployment interrupted"
+            result["diagnostic"] = "deployment interrupted"
+        return result
+
+    def test_schema_2_fixture_is_exact_and_gitlink_independent(self):
+        fixture = json.loads((ROOT / "tests" / "fixtures" / "deployment" / "release-v2.json").read_text(encoding="utf-8"))
+        self.assertEqual(self.deploy.validate_release_v2_document(fixture), fixture)
+        disagreement = copy.deepcopy(fixture)
+        disagreement["components"][0]["commit"] = "f" * 40
+        self.assertEqual(self.deploy.validate_release_v2_document(disagreement), disagreement)
+
+    def test_schema_2_rejects_component_fields_and_identity_errors(self):
+        for mutate, message in [
+            (lambda value: value.pop("configuration"), "unknown or missing"),
+            (lambda value: value.__setitem__("unexpected", True), "unknown or missing"),
+            (lambda value: value["components"].append(copy.deepcopy(value["components"][0])), "component"),
+            (lambda value: value["components"].pop(1), "component"),
+            (lambda value: value["components"][0].__setitem__("repository", "ssh://example.invalid/repo"), "repository"),
+            (lambda value: value["components"][0].__setitem__("commit", "A" * 40), "commit"),
+            (lambda value: value["components"][0].__setitem__("disposition", "installed"), "disposition"),
+            (lambda value: value["components"][0].__setitem__("unexpected", True), "component fields"),
+            (lambda value: value["components"][0].pop("repository"), "repository"),
+            (lambda value: value["components"].append({"name": "config_files", "disposition": "disabled", "repository": "git@github.com:krafczyk/config_files", "commit": "0" * 40}), "component"),
+        ]:
+            release = self.release()
+            mutate(release)
+            with self.subTest(message=message), self.assertRaisesRegex(self.deploy.DeploymentError, message):
+                self.deploy.validate_release_v2_document(release)
+
+    def test_schema_2_rejects_deployment_fields_actions_artifacts_and_configuration_errors(self):
+        cases = [
+            (lambda value: value["components"][0]["destination"].__setitem__("path", "../outside"), "destination"),
+            (lambda value: value["components"][0]["destination"].__setitem__("root", "temporary"), "destination"),
+            (lambda value: value["components"][2]["preserved_paths"].__setitem__(0, "nested/../path"), "preserved"),
+            (lambda value: value["components"][2].__setitem__("preserved_paths", ["other.json"]), "preserved"),
+            (lambda value: value["components"][3].__setitem__("actions", []), "non-deployed"),
+            (lambda value: value["components"][0]["actions"].append(copy.deepcopy(value["components"][0]["actions"][0])), "action id"),
+            (lambda value: value["components"][0]["actions"][0].__setitem__("phase", "install"), "action phase"),
+            (lambda value: value["components"][0]["actions"][0].__setitem__("path", "bin/../install_nvim.sh"), "action path"),
+            (lambda value: value["components"][0]["actions"][0]["args"].__setitem__(2, {"token": "shell_command"}), "action token"),
+            (lambda value: value["artifacts"]["nvim-image"][0].__setitem__("architecture", "sparc"), "architecture"),
+            (lambda value: value["artifacts"]["nvim-image"][0].__setitem__("sha256", "A" * 64), "digest"),
+            (lambda value: value["artifacts"]["nvim-image"][0].__setitem__("source_filename_class", "derived-container"), "source filename"),
+            (lambda value: value["artifacts"]["nvim-image"][0].pop("sha256"), "artifact"),
+            (lambda value: value["artifacts"]["nvim-image"].append(copy.deepcopy(value["artifacts"]["nvim-image"][0])), "architecture"),
+            (lambda value: value["components"][2]["destination"].__setitem__("root", "xdg_data_home") or value["components"][2]["destination"].__setitem__("path", "mkchad/components/msk_containers"), "destinations"),
+            (lambda value: value["configuration"].__setitem__("guidance", "../README.md"), "guidance"),
+        ]
+        for mutate, message in cases:
+            release = self.release()
+            mutate(release)
+            with self.subTest(message=message), self.assertRaisesRegex(self.deploy.DeploymentError, message):
+                self.deploy.validate_release_v2_document(release)
+
+    def test_schema_1_terminal_results_accept_each_outcome_and_reject_malformed_data(self):
+        for outcome in ("succeeded", "failed", "interrupted"):
+            result = self.result(outcome)
+            self.assertEqual(self.deploy.validate_result_v1_document(result), result)
+
+        for mutate, message in [
+            (lambda value: value.__setitem__("schema", 2), "schema"),
+            (lambda value: value.__setitem__("environment", {}), "unknown or missing"),
+            (lambda value: value["components"].pop(), "components"),
+            (lambda value: value["components"][0].__setitem__("requested_commit", "bad"), "commit"),
+            (lambda value: value["artifact"].__setitem__("expected_sha256", "bad"), "digest"),
+            (lambda value: value["actions"][0].__setitem__("status", "running"), "status"),
+            (lambda value: value["actions"][0].__setitem__("args", []), "action"),
+            (lambda value: value["configuration_handoff"].__setitem__("state", "installed"), "configuration"),
+            (lambda value: value["configuration_handoff"]["components"].pop(), "configuration components"),
+            (lambda value: value.__setitem__("log_path", "relative.log"), "log path"),
+        ]:
+            result = self.result()
+            mutate(result)
+            with self.subTest(message=message), self.assertRaisesRegex(self.deploy.DeploymentError, message):
+                self.deploy.validate_result_v1_document(result)
 
 
 if __name__ == "__main__":

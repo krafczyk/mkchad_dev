@@ -1,0 +1,47 @@
+{
+  "schema": 2,
+  "components": [
+    {
+      "name": "msk_containers",
+      "disposition": "deployed",
+      "repository": "git@github.com:krafczyk/msk_containers",
+      "commit": "a084416bf54b113677f5227380916e9003591111",
+      "destination": {"root": "xdg_data_home", "path": "mkchad/components/msk_containers"},
+      "actions": [
+        {"id": "host-tools-preflight", "phase": "preflight", "path": "bin/install_nvim.sh", "args": ["--check", "--recovery-dir", {"token": "recovery_dir"}]},
+        {"id": "image-install-preflight", "phase": "preflight", "path": "nvim/bin/install_nvim_container", "args": ["--dry-run", "--source-revision", {"token": "component_revision"}, {"token": "staged_image"}]},
+        {"id": "host-tools-install", "phase": "apply", "path": "bin/install_nvim.sh", "args": ["--recovery-dir", {"token": "recovery_dir"}]},
+        {"id": "image-install", "phase": "apply", "path": "nvim/bin/install_nvim_container", "args": ["--source-revision", {"token": "component_revision"}, {"token": "staged_image"}]},
+        {"id": "host-tools-verify", "phase": "verify", "path": "bin/install_nvim.sh", "args": ["--check"]}
+      ]
+    },
+    {
+      "name": "container_tools",
+      "disposition": "deployed",
+      "repository": "git@github.com:krafczyk/container_tools",
+      "commit": "22ffd7f3e8a52ec5a40dd95cb7428a7128830bc7",
+      "destination": {"root": "xdg_data_home", "path": "mkchad/components/msk_containers/container_tools"},
+      "actions": []
+    },
+    {
+      "name": "mkchad",
+      "disposition": "deployed",
+      "repository": "git@github.com:krafczyk/mkchad",
+      "commit": "fb089cf345b33c7fd87dcc1d56677766c5719708",
+      "destination": {"root": "xdg_config_home", "path": "mkchad"},
+      "actions": [],
+      "preserved_paths": ["opencode-server.json", "lazy-lock.json"]
+    },
+    {"name": "opencode", "disposition": "embedded", "repository": "git@github.com:krafczyk/opencode.git", "commit": "a8a797ab717289fe30308b1e3bcc8dfa865beb4a"},
+    {"name": "opencode.nvim", "disposition": "configuration-owned", "repository": "git@github.com:krafczyk/opencode.nvim", "commit": "37033dc157ac4c05c1e1525fe2fc9e87ae83e2ac"},
+    {"name": "opencode-project-reload", "disposition": "configuration-owned", "repository": "git@github.com:krafczyk/opencode-project-reload.git", "commit": "4548302d5b79ab079b2a9d503a4556c6119cbab2"},
+    {"name": "compound-engineering", "disposition": "configuration-owned", "repository": "git@github.com:krafczyk/compound-engineering-plugin.git", "commit": "f07e820a4146963de4e3ae1197c82f6686507e6c"},
+    {"name": "opencode_sprint_loop", "disposition": "disabled", "repository": "git@github.com:krafczyk/opencode_sprint_loop", "commit": "5e71e56e6fc471c7021a7e34a58485cb38c2ab49"}
+  ],
+  "artifacts": {
+    "nvim-image": [
+      {"architecture": "x86_64", "sha256": "96128373e8042d1544d577d17ceb99b2a0edd716958a4d9254ff70e4bc43f4f3", "source_filename_class": "raw-nvim-container"}
+    ]
+  },
+  "configuration": {"contract_version": 1, "guidance": "docs/deployment/README.md"}
+}

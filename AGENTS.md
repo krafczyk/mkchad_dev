@@ -120,3 +120,11 @@ password before first use on a multi-user host and reevaluate before any
 non-loopback exposure or authentication change. Audits of lifecycle behavior
 must cover selective process death, PID reuse, malformed and future state,
 concurrent startup, credential transport, bounded subprocesses, and recovery.
+
+## Release Deployment Exception
+
+`mkchad-release` supports one trusted operator on a trusted host. For this
+release-deployment command only, malicious same-user writers, hostile local
+repository substitution, remote compromise, and adversarial filesystem races
+are outside the supported threat model. This exception does not change runtime
+server, credential, or cross-user network boundaries.

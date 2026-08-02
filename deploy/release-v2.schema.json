@@ -1,0 +1,131 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MkChad explicit release manifest schema 2",
+  "type": "object",
+  "required": ["schema", "components", "artifacts", "configuration"],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {"const": 2},
+    "components": {
+      "type": "array",
+      "minItems": 8,
+      "maxItems": 8,
+      "items": {"oneOf": [{"$ref": "#/$defs/msk_containers"}, {"$ref": "#/$defs/container_tools"}, {"$ref": "#/$defs/mkchad"}, {"$ref": "#/$defs/opencode"}, {"$ref": "#/$defs/opencode_nvim"}, {"$ref": "#/$defs/opencode_project_reload"}, {"$ref": "#/$defs/compound_engineering"}, {"$ref": "#/$defs/opencode_sprint_loop"}]}
+    },
+    "artifacts": {
+      "type": "object",
+      "required": ["nvim-image"],
+      "additionalProperties": false,
+      "properties": {
+        "nvim-image": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/image"}
+        }
+      }
+    },
+    "configuration": {
+      "type": "object",
+      "required": ["contract_version", "guidance"],
+      "additionalProperties": false,
+      "properties": {
+        "contract_version": {"const": 1},
+        "guidance": {"$ref": "#/$defs/relative_path"}
+      }
+    }
+  },
+  "$defs": {
+    "repository": {"type": "string", "pattern": "^(git@github\\.com:|https://github\\.com/)[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(\\.git)?$"},
+    "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "relative_path": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]*$"},
+    "destination": {
+      "type": "object",
+      "required": ["root", "path"],
+      "additionalProperties": false,
+      "properties": {
+        "root": {"enum": ["home", "xdg_config_home", "xdg_data_home", "xdg_state_home"]},
+        "path": {"$ref": "#/$defs/relative_path"}
+      }
+    },
+    "action": {
+      "type": "object",
+      "required": ["id", "phase", "path", "args"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {"type": "string", "pattern": "^[a-z][a-z0-9-]*$"},
+        "phase": {"enum": ["preflight", "apply", "verify"]},
+        "path": {"$ref": "#/$defs/relative_path"},
+        "args": {
+          "type": "array",
+          "items": {
+            "oneOf": [
+              {"type": "string", "minLength": 1, "not": {"pattern": "[{}]"}},
+              {"type": "object", "required": ["token"], "additionalProperties": false, "properties": {"token": {"enum": ["recovery_dir", "staged_image", "component_revision"]}}}
+            ]
+          }
+        }
+      }
+    },
+    "image": {
+      "type": "object",
+      "required": ["architecture", "sha256", "source_filename_class"],
+      "additionalProperties": false,
+      "properties": {
+        "architecture": {"enum": ["x86_64", "aarch64", "ppc64le"]},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "source_filename_class": {"const": "raw-nvim-container"}
+      }
+    },
+    "deployed": {
+      "type": "object",
+      "required": ["name", "disposition", "repository", "commit", "destination", "actions"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {"enum": ["msk_containers", "container_tools"]},
+        "disposition": {"const": "deployed"},
+        "repository": {"$ref": "#/$defs/repository"},
+        "commit": {"$ref": "#/$defs/commit"},
+        "destination": {"$ref": "#/$defs/destination"},
+        "actions": {"type": "array", "items": {"$ref": "#/$defs/action"}}
+      }
+    },
+    "msk_containers": {"allOf": [{"$ref": "#/$defs/deployed"}, {"properties": {"name": {"const": "msk_containers"}}}]},
+    "container_tools": {"allOf": [{"$ref": "#/$defs/deployed"}, {"properties": {"name": {"const": "container_tools"}}}]},
+    "mkchad": {
+      "type": "object",
+      "required": ["name", "disposition", "repository", "commit", "destination", "actions"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {"const": "mkchad"},
+        "disposition": {"const": "deployed"},
+        "repository": {"$ref": "#/$defs/repository"},
+        "commit": {"$ref": "#/$defs/commit"},
+        "destination": {"$ref": "#/$defs/destination"},
+        "actions": {"type": "array", "items": {"$ref": "#/$defs/action"}},
+        "preserved_paths": {"type": "array", "uniqueItems": true, "items": {"enum": ["opencode-server.json", "lazy-lock.json"]}}
+      }
+    },
+    "opencode": {"$ref": "#/$defs/embedded"},
+    "embedded": {
+      "type": "object",
+      "required": ["name", "disposition", "repository", "commit"],
+      "additionalProperties": false,
+      "properties": {"name": {"const": "opencode"}, "disposition": {"const": "embedded"}, "repository": {"$ref": "#/$defs/repository"}, "commit": {"$ref": "#/$defs/commit"}}
+    },
+    "configuration_owned": {
+      "type": "object",
+      "required": ["name", "disposition", "repository", "commit"],
+      "additionalProperties": false,
+      "properties": {"name": {"enum": ["opencode.nvim", "opencode-project-reload", "compound-engineering"]}, "disposition": {"const": "configuration-owned"}, "repository": {"$ref": "#/$defs/repository"}, "commit": {"$ref": "#/$defs/commit"}}
+    },
+    "opencode_nvim": {"allOf": [{"$ref": "#/$defs/configuration_owned"}, {"properties": {"name": {"const": "opencode.nvim"}}}]},
+    "opencode_project_reload": {"allOf": [{"$ref": "#/$defs/configuration_owned"}, {"properties": {"name": {"const": "opencode-project-reload"}}}]},
+    "compound_engineering": {"allOf": [{"$ref": "#/$defs/configuration_owned"}, {"properties": {"name": {"const": "compound-engineering"}}}]},
+    "opencode_sprint_loop": {
+      "type": "object",
+      "required": ["name", "disposition", "repository", "commit"],
+      "additionalProperties": false,
+      "properties": {"name": {"const": "opencode_sprint_loop"}, "disposition": {"const": "disabled"}, "repository": {"$ref": "#/$defs/repository"}, "commit": {"$ref": "#/$defs/commit"}}
+    }
+  }
+}

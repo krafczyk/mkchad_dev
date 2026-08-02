@@ -52,6 +52,21 @@ COMPONENT_DISPOSITIONS = {
     "compound-engineering": "configuration-owned",
     "opencode_sprint_loop": "disabled",
 }
+RELEASE_V2_COMPONENT_DISPOSITIONS = {
+    "msk_containers": "deployed",
+    "container_tools": "deployed",
+    "mkchad": "deployed",
+    "opencode": "embedded",
+    "opencode.nvim": "configuration-owned",
+    "opencode-project-reload": "configuration-owned",
+    "compound-engineering": "configuration-owned",
+    "opencode_sprint_loop": "disabled",
+}
+V2_DESTINATION_ROOTS = frozenset({"home", "xdg_config_home", "xdg_data_home", "xdg_state_home"})
+V2_ACTION_PHASES = ("preflight", "apply", "verify")
+V2_ARCHITECTURES = frozenset({"x86_64", "aarch64", "ppc64le"})
+V2_PRESERVED_PATHS = frozenset({"opencode-server.json", "lazy-lock.json"})
+V2_CONFIGURATION_COMPONENTS = frozenset({"opencode.nvim", "opencode-project-reload", "compound-engineering"})
 WORKSPACE_ONLY_SUBMODULES = frozenset({"config_files"})
 DEPLOYED_DESTINATIONS = {
     "msk_containers": ("xdg_data_home", "mkchad/components/msk_containers"),
@@ -440,6 +455,279 @@ def _validate_action(action: object, component: str):
                 raise DeploymentError(f"unsafe literal action argument for {component}")
         elif not isinstance(argument, dict) or set(argument) != {"token"} or argument["token"] not in ACTION_TOKENS:
             raise DeploymentError(f"unknown action token for {component}")
+
+
+def _normalized_relative_path(value: object, label: str) -> str:
+    """Return a normalized repository-relative path or raise ``DeploymentError``.
+
+    Args:
+        value: Candidate JSON string containing a relative path.
+        label: Human-readable field name used in a validation diagnostic.
+
+    Returns:
+        The validated path unchanged.
+
+    Raises:
+        DeploymentError: If the path is empty, absolute, contains traversal, or
+            contains characters outside the release metadata path alphabet.
+    """
+    if not isinstance(value, str) or not SAFE_RELATIVE.fullmatch(value):
+        raise DeploymentError(f"invalid {label}")
+    if any(part in {".", ".."} for part in pathlib.PurePosixPath(value).parts):
+        raise DeploymentError(f"invalid {label}")
+    return value
+
+
+def _validate_v2_action(action: object, component: str, action_ids: set[str], last_phase: int) -> int:
+    """Validate one schema-2 action and return its ordered phase index.
+
+    Args:
+        action: Candidate action object from a deployed component.
+        component: Component name used in validation diagnostics.
+        action_ids: Mutable manifest-wide set of previously declared action IDs.
+        last_phase: Index of the preceding action phase for this component.
+
+    Returns:
+        The validated action phase index.
+
+    Raises:
+        DeploymentError: If the action has an unknown shape, duplicate ID,
+            unnormalized executable path, out-of-order phase, unsafe literal, or
+            unknown typed token. This function has no side effects beyond adding
+            a successfully validated ID to ``action_ids``.
+    """
+    if not isinstance(action, dict) or set(action) != {"id", "phase", "path", "args"}:
+        raise DeploymentError(f"malformed action for {component}")
+    action_id = action.get("id")
+    if not isinstance(action_id, str) or not re.fullmatch(r"[a-z][a-z0-9-]*", action_id):
+        raise DeploymentError(f"invalid action id for {component}")
+    if action_id in action_ids:
+        raise DeploymentError("duplicate action id")
+    phase = action.get("phase")
+    if phase not in V2_ACTION_PHASES:
+        raise DeploymentError(f"invalid action phase for {component}")
+    phase_index = V2_ACTION_PHASES.index(phase)
+    if phase_index < last_phase:
+        raise DeploymentError(f"action phases are out of order for {component}")
+    _normalized_relative_path(action.get("path"), "action path")
+    arguments = action.get("args")
+    if not isinstance(arguments, list):
+        raise DeploymentError(f"invalid action arguments for {component}")
+    for argument in arguments:
+        if isinstance(argument, str):
+            if not argument or "\x00" in argument or argument.startswith("/") or "{" in argument or "}" in argument:
+                raise DeploymentError(f"unsafe action literal for {component}")
+        elif not isinstance(argument, dict) or set(argument) != {"token"} or argument.get("token") not in ACTION_TOKENS:
+            raise DeploymentError(f"unknown action token for {component}")
+    action_ids.add(action_id)
+    return phase_index
+
+
+def validate_release_v2_document(document: dict) -> dict:
+    """Validate a standalone schema-2 release manifest without Gitlink authority.
+
+    Args:
+        document: Parsed JSON release manifest that declares every release
+            component, image artifact, and configuration handoff.
+
+    Returns:
+        The unchanged validated document.
+
+    Raises:
+        DeploymentError: If the document is not the exact closed schema-2
+            shape, omits or repeats a known component, contains unsafe metadata,
+            or has conflicting deployment destinations. Validation is pure and
+            never reads Git state, destinations, or ``config_files``.
+    """
+    required = {"schema", "components", "artifacts", "configuration"}
+    if not isinstance(document, dict) or set(document) != required or document.get("schema") != 2:
+        raise DeploymentError("release has unknown or missing fields or an unsupported schema")
+    components = document.get("components")
+    if not isinstance(components, list):
+        raise DeploymentError("release components are malformed")
+    seen_components, destinations, action_ids = set(), [], set()
+    for component in components:
+        if not isinstance(component, dict):
+            raise DeploymentError("malformed component")
+        name = component.get("name")
+        disposition = component.get("disposition")
+        if name not in RELEASE_V2_COMPONENT_DISPOSITIONS or name in seen_components:
+            raise DeploymentError("release must declare every known component exactly once")
+        if disposition != RELEASE_V2_COMPONENT_DISPOSITIONS[name]:
+            raise DeploymentError(f"invalid disposition for {name}")
+        if not isinstance(component.get("repository"), str):
+            raise DeploymentError(f"invalid repository for {name}")
+        canonical_github_repository(component["repository"])
+        if not isinstance(component.get("commit"), str) or not SHA1.fullmatch(component["commit"]):
+            raise DeploymentError(f"invalid commit for {name}")
+        allowed = {"name", "disposition", "repository", "commit"}
+        if disposition == "deployed":
+            allowed |= {"destination", "actions"}
+            destination = component.get("destination")
+            if not isinstance(destination, dict) or set(destination) != {"root", "path"} or destination.get("root") not in V2_DESTINATION_ROOTS:
+                raise DeploymentError(f"invalid destination for {name}")
+            destination_path = _normalized_relative_path(destination.get("path"), "destination")
+            destinations.append((name, destination["root"], destination_path))
+            actions = component.get("actions")
+            if not isinstance(actions, list):
+                raise DeploymentError(f"invalid actions for {name}")
+            last_phase = 0
+            for action in actions:
+                last_phase = _validate_v2_action(action, name, action_ids, last_phase)
+            if "preserved_paths" in component:
+                allowed.add("preserved_paths")
+                preserved_paths = component["preserved_paths"]
+                if name != "mkchad" or not isinstance(preserved_paths, list) or not all(isinstance(path, str) for path in preserved_paths) or len(set(preserved_paths)) != len(preserved_paths):
+                    raise DeploymentError(f"invalid preserved paths for {name}")
+                for preserved_path in preserved_paths:
+                    if preserved_path not in V2_PRESERVED_PATHS:
+                        raise DeploymentError(f"invalid preserved path for {name}")
+        elif {"destination", "actions", "preserved_paths"} & set(component):
+            raise DeploymentError(f"non-deployed component has deployment-only fields: {name}")
+        if set(component) != allowed:
+            raise DeploymentError(f"unknown component fields for {name}")
+        seen_components.add(name)
+    if seen_components != set(RELEASE_V2_COMPONENT_DISPOSITIONS):
+        raise DeploymentError("release must declare every known component exactly once")
+    for index, (name, root, path) in enumerate(destinations):
+        for other_name, other_root, other_path in destinations[index + 1:]:
+            if root != other_root:
+                continue
+            nested_tools = {name, other_name} == {"msk_containers", "container_tools"}
+            msk_path = path if name == "msk_containers" else other_path
+            tools_path = path if name == "container_tools" else other_path
+            if (
+                nested_tools
+                and root == "xdg_data_home"
+                and msk_path == "mkchad/components/msk_containers"
+                and tools_path == "mkchad/components/msk_containers/container_tools"
+            ):
+                continue
+            if path == other_path or path.startswith(other_path + "/") or other_path.startswith(path + "/"):
+                raise DeploymentError("components have overlapping destinations")
+    artifacts = document.get("artifacts")
+    if not isinstance(artifacts, dict) or set(artifacts) != {"nvim-image"} or not isinstance(artifacts["nvim-image"], list) or not artifacts["nvim-image"]:
+        raise DeploymentError("release artifacts are malformed")
+    architectures = set()
+    for artifact in artifacts["nvim-image"]:
+        if not isinstance(artifact, dict) or set(artifact) != {"architecture", "sha256", "source_filename_class"}:
+            raise DeploymentError("malformed nvim-image artifact")
+        architecture = artifact.get("architecture")
+        if architecture not in V2_ARCHITECTURES or architecture in architectures:
+            raise DeploymentError("invalid or duplicate image architecture")
+        if not isinstance(artifact.get("sha256"), str) or not SHA256.fullmatch(artifact["sha256"]):
+            raise DeploymentError("invalid image digest")
+        if artifact.get("source_filename_class") != "raw-nvim-container":
+            raise DeploymentError("invalid nvim-image source filename class")
+        architectures.add(architecture)
+    configuration = document.get("configuration")
+    if not isinstance(configuration, dict) or set(configuration) != {"contract_version", "guidance"} or configuration.get("contract_version") != 1:
+        raise DeploymentError("malformed configuration handoff")
+    _normalized_relative_path(configuration.get("guidance"), "configuration guidance")
+    return document
+
+
+def _validate_result_commit(value: object, label: str, nullable: bool = False):
+    """Validate one result commit or digest field without transforming it.
+
+    Args:
+        value: Candidate string, or ``None`` for a nullable observed value.
+        label: Field category used in errors, either ``commit`` or ``digest``.
+        nullable: Whether an unavailable observation may be represented as null.
+
+    Raises:
+        DeploymentError: If the value is not a lowercase full SHA-1 or SHA-256.
+    """
+    if nullable and value is None:
+        return
+    pattern = SHA1 if label == "commit" else SHA256
+    if not isinstance(value, str) or not pattern.fullmatch(value):
+        raise DeploymentError(f"invalid result {label}")
+
+
+def validate_result_v1_document(document: dict) -> dict:
+    """Validate one completed schema-1 deployment result without publishing it.
+
+    Args:
+        document: Parsed terminal result JSON produced by a deployment run.
+
+    Returns:
+        The unchanged validated document.
+
+    Raises:
+        DeploymentError: If a result is future, incomplete, contains unknown
+            secret-bearing fields, or has malformed component, artifact, action,
+            configuration-handoff, timestamp, or log metadata. This pure
+            validator does not read files or alter persistent state.
+    """
+    required = {"schema", "release", "started_at", "completed_at", "outcome", "phase", "components", "artifact", "actions", "configuration_handoff", "failed_step", "diagnostic", "log_path"}
+    if not isinstance(document, dict) or set(document) != required or document.get("schema") != 1:
+        raise DeploymentError("result has unknown or missing fields or an unsupported schema")
+    if not isinstance(document.get("release"), str) or not re.fullmatch(r"(?!-)(?!.*\.\.)[A-Za-z0-9][A-Za-z0-9._/-]*", document["release"]):
+        raise DeploymentError("invalid result release")
+    timestamp = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
+    if not all(isinstance(document[key], str) and timestamp.fullmatch(document[key]) for key in ("started_at", "completed_at")):
+        raise DeploymentError("invalid result timestamp")
+    if document.get("outcome") not in {"succeeded", "failed", "interrupted"} or document.get("phase") not in V2_ACTION_PHASES:
+        raise DeploymentError("invalid result outcome or phase")
+    components = document.get("components")
+    if not isinstance(components, list):
+        raise DeploymentError("malformed result components")
+    seen = set()
+    for component in components:
+        if not isinstance(component, dict) or set(component) != {"name", "disposition", "requested_commit", "observed_commit"}:
+            raise DeploymentError("malformed result component")
+        name = component.get("name")
+        if name not in RELEASE_V2_COMPONENT_DISPOSITIONS or name in seen or component.get("disposition") != RELEASE_V2_COMPONENT_DISPOSITIONS[name]:
+            raise DeploymentError("invalid result component")
+        _validate_result_commit(component.get("requested_commit"), "commit")
+        _validate_result_commit(component.get("observed_commit"), "commit", nullable=True)
+        seen.add(name)
+    if seen != set(RELEASE_V2_COMPONENT_DISPOSITIONS):
+        raise DeploymentError("result components are incomplete")
+    artifact = document.get("artifact")
+    if not isinstance(artifact, dict) or set(artifact) != {"architecture", "expected_sha256", "observed_sha256"} or artifact.get("architecture") not in V2_ARCHITECTURES:
+        raise DeploymentError("malformed result artifact")
+    _validate_result_commit(artifact.get("expected_sha256"), "digest")
+    _validate_result_commit(artifact.get("observed_sha256"), "digest", nullable=True)
+    actions = document.get("actions")
+    if not isinstance(actions, list):
+        raise DeploymentError("malformed result actions")
+    action_keys = set()
+    for action in actions:
+        if not isinstance(action, dict) or set(action) != {"component", "id", "phase", "status"}:
+            raise DeploymentError("malformed result action")
+        if action.get("component") not in RELEASE_V2_COMPONENT_DISPOSITIONS or not isinstance(action.get("id"), str) or not re.fullmatch(r"[a-z][a-z0-9-]*", action["id"]):
+            raise DeploymentError("invalid result action")
+        if action.get("phase") not in V2_ACTION_PHASES or action.get("status") not in {"pending", "succeeded", "skipped-compliant", "failed"}:
+            raise DeploymentError("invalid result action status")
+        key = (action["component"], action["id"])
+        if key in action_keys:
+            raise DeploymentError("duplicate result action")
+        action_keys.add(key)
+    handoff = document.get("configuration_handoff")
+    if not isinstance(handoff, dict) or set(handoff) != {"state", "contract_version", "guidance", "components"} or handoff.get("state") != "configuration-pending" or handoff.get("contract_version") != 1:
+        raise DeploymentError("malformed result configuration handoff")
+    _normalized_relative_path(handoff.get("guidance"), "configuration guidance")
+    if not isinstance(handoff.get("components"), list):
+        raise DeploymentError("malformed result configuration components")
+    handoff_names = set()
+    for component in handoff["components"]:
+        if not isinstance(component, dict) or set(component) != {"name", "repository", "commit"} or component.get("name") not in V2_CONFIGURATION_COMPONENTS or component["name"] in handoff_names or not isinstance(component.get("repository"), str):
+            raise DeploymentError("malformed result configuration component")
+        canonical_github_repository(component["repository"])
+        _validate_result_commit(component.get("commit"), "commit")
+        handoff_names.add(component["name"])
+    if handoff_names != V2_CONFIGURATION_COMPONENTS:
+        raise DeploymentError("result configuration components are incomplete")
+    if document["failed_step"] is not None and (not isinstance(document["failed_step"], str) or not document["failed_step"] or len(document["failed_step"]) > 256):
+        raise DeploymentError("invalid result failed step")
+    if not isinstance(document["diagnostic"], str) or not document["diagnostic"] or len(document["diagnostic"]) > 4096:
+        raise DeploymentError("invalid result diagnostic")
+    log_path = document.get("log_path")
+    if not isinstance(log_path, str) or not log_path.startswith("/") or any(part in {"", ".", ".."} for part in pathlib.PurePosixPath(log_path).parts[1:]):
+        raise DeploymentError("invalid result log path")
+    return document
 
 
 def git_env() -> dict[str, str]:
