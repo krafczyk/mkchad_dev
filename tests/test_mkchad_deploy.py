@@ -239,6 +239,50 @@ class DeploymentValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(self.deploy.DeploymentError, "regular"):
             self.deploy.snapshot_image(source, self.root / "symlink", hashlib.sha256(b"known image").hexdigest())
 
+    def test_image_runtime_uses_contained_writable_home(self):
+        runtime = self.root / "singularity"
+        runtime.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+        runtime.chmod(0o755)
+        manifest_text = json.dumps(
+            {
+                "schema": 1,
+                "relationships": [
+                    {"id": "ships-opencode", "contract": {"version": "1.18.9-mkchad.2"}},
+                ],
+            }
+        ) + "\n"
+        artifact = {
+            "architecture": "x86_64",
+            "component_manifest_sha256": hashlib.sha256(manifest_text.encode()).hexdigest(),
+        }
+
+        class RecordingScope:
+            def __init__(self):
+                self.commands = []
+
+            def run(self, argv, **_kwargs):
+                self.commands.append(argv)
+                if argv[-2:] == ["uname", "-m"]:
+                    return subprocess.CompletedProcess(argv, 0, "x86_64\n", "")
+                if argv[-2:] == ["cat", "/usr/share/mkchad/component-manifest.json"]:
+                    return subprocess.CompletedProcess(argv, 0, manifest_text, "")
+                if argv[-2:] == ["opencode", "--version"]:
+                    return subprocess.CompletedProcess(argv, 0, "1.18.9-mkchad.2\n", "")
+                raise AssertionError(f"unexpected command: {argv}")
+
+        scope = RecordingScope()
+        git_results = [
+            subprocess.CompletedProcess([], 0, manifest_text, ""),
+            subprocess.CompletedProcess([], 0, "v1.18.9-mkchad.2\n", ""),
+        ]
+        with mock.patch.dict(os.environ, {"MKCHAD_CONTAINER_RUNTIME": str(runtime)}), mock.patch.object(
+            self.deploy, "_contained_git"
+        ), mock.patch.object(self.deploy, "run_git", side_effect=git_results):
+            self.deploy.validate_image_runtime(scope, self.root / "image.sif", artifact, self.root / "msk", "a" * 40, self.root / "opencode", {"url": "remote", "commit": "b" * 40})
+
+        self.assertTrue(all("--contain" in command for command in scope.commands))
+        self.assertEqual(scope.commands[-1][-4:], ["env", "HOME=/tmp", "opencode", "--version"])
+
     def test_journal_rejects_future_and_moved_receipts(self):
         state = self.root / "state"
         state.mkdir(mode=0o700)

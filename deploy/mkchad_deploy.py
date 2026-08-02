@@ -1303,13 +1303,15 @@ def validate_image_runtime(scope: SessionScope, staged_image: pathlib.Path, arti
     """Validate architecture, embedded manifest, and unique OpenCode release tag.
 
     Runtime execution receives only the staged image under a clean environment,
-    no home directory, and no host bind.  The component manifest is compared to
-    the pinned ``msk_containers`` tree before any final destination mutation.
+    a contained temporary filesystem, and no host home or hostfs bind. OpenCode
+    receives that contained ``/tmp`` as HOME so version inspection cannot write
+    into the read-only image. The component manifest is compared to the pinned
+    ``msk_containers`` tree before any final destination mutation.
     """
     runtime = os.environ.get("MKCHAD_CONTAINER_RUNTIME")
     if not runtime or not os.path.isabs(runtime) or not os.access(runtime, os.X_OK):
         raise DeploymentError("a trusted explicit container runtime is required")
-    common = [runtime, "exec", "--cleanenv", "--no-home", "--no-mount", "hostfs", str(staged_image)]
+    common = [runtime, "exec", "--cleanenv", "--contain", "--no-home", "--no-mount", "hostfs", str(staged_image)]
     architecture = scope.run([*common, "uname", "-m"]).stdout.strip().lower()
     normalized = {"amd64": "x86_64", "x86": "x86_64", "arm64": "aarch64", "ppc64el": "ppc64le"}.get(architecture, architecture)
     if normalized != artifact["architecture"]:
@@ -1328,7 +1330,7 @@ def validate_image_runtime(scope: SessionScope, staged_image: pathlib.Path, arti
     tags = run_git(["-C", str(staged_opencode), "for-each-ref", "--format=%(refname:short)", "--points-at", opencode_authority["commit"], "refs/tags/v*-mkchad.*"]).stdout.splitlines()
     if len(tags) != 1:
         raise DeploymentError("OpenCode gitlink has no unique mkchad release tag")
-    image_version = scope.run([*common, "opencode", "--version"]).stdout.strip()
+    image_version = scope.run([*common, "env", "HOME=/tmp", "opencode", "--version"]).stdout.strip()
     relationships = manifest.get("relationships") if isinstance(manifest, dict) else None
     versions = [item.get("contract", {}).get("version") for item in relationships or [] if isinstance(item, dict) and item.get("id") == "ships-opencode"]
     expected_version = versions[0] if len(versions) == 1 else None
