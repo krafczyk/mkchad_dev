@@ -64,7 +64,7 @@
     "nvim-image": [
       {
         "architecture": "x86_64",
-        "sha256": "953f01bf032b03b73e9642b109fcad01f48795d7469d020a9e6447ec5160adea",
+        "sha256": "96128373e8042d1544d577d17ceb99b2a0edd716958a4d9254ff70e4bc43f4f3",
         "component_manifest_sha256": "39236c20ad7f8cb15867950a2d740f8cfd3a02827d4209b37208e3b5c2131613",
         "source_filename_class": "raw-nvim-container"
       }
