@@ -129,7 +129,8 @@ class BootstrapAuthorityTests(unittest.TestCase):
         self.assertTrue(self.bootstrap._unsafe_writable_ancestor(foreign))
         self.assertTrue(self.bootstrap._unsafe_writable_ancestor(foreign, trust_group_writable_ancestors=True))
         root_group_writable = mock.Mock(st_uid=0, st_mode=stat.S_IFDIR | 0o770)
-        self.assertTrue(self.bootstrap._unsafe_writable_ancestor(root_group_writable, trust_group_writable_ancestors=True))
+        self.assertTrue(self.bootstrap._unsafe_writable_ancestor(root_group_writable))
+        self.assertFalse(self.bootstrap._unsafe_writable_ancestor(root_group_writable, trust_group_writable_ancestors=True))
         protected_shared_root = mock.Mock(st_uid=0, st_mode=stat.S_IFDIR | stat.S_ISVTX | 0o777)
         self.assertFalse(self.bootstrap._unsafe_writable_ancestor(protected_shared_root))
         self.assertFalse(self.bootstrap._unsafe_writable_ancestor(protected_shared_root, trust_group_writable_ancestors=True))
@@ -140,7 +141,7 @@ class BootstrapAuthorityTests(unittest.TestCase):
         self.assertEqual(result, 2)
         validate.assert_called_once_with(pathlib.Path(self.bootstrap.__file__).absolute(), trust_group_writable_ancestors=True)
         output.assert_any_call(
-            "mkchad-release-bootstrap: warning: trusting every group-class or ACL writer on current-user-owned bootstrap ancestors",
+            "mkchad-release-bootstrap: warning: trusting every group-class or ACL writer on root- or current-user-owned bootstrap ancestors",
             file=self.bootstrap.sys.stderr,
         )
         with mock.patch.object(self.bootstrap, "validate_installed_bootstrap") as abbreviated_validate, mock.patch.object(

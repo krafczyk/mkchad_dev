@@ -64,15 +64,16 @@ def _unsafe_writable_ancestor(entry: os.stat_result, *, trust_group_writable_anc
     Args:
         entry: Metadata for one path ancestor.
         trust_group_writable_ancestors: Treat group-write access to a
-            current-user-owned ancestor as trusted. World-write and foreign
-            ownership remain unsafe except for root-owned sticky shared roots.
+            root- or current-user-owned ancestor as trusted. World-write and
+            foreign ownership remain unsafe except for root-owned sticky shared
+            roots.
     """
     if entry.st_uid not in {0, os.getuid()}:
         return True
     if entry.st_mode & 0o002:
         return not (entry.st_uid == 0 and bool(entry.st_mode & stat.S_ISVTX))
     if entry.st_mode & 0o020:
-        return not (trust_group_writable_ancestors and entry.st_uid == os.getuid())
+        return not trust_group_writable_ancestors
     return False
 
 
@@ -92,8 +93,8 @@ def validate_installed_bootstrap(script: pathlib.Path, *, trust_group_writable_a
         script: Installed bootstrap path that must be absolute, current-user-owned,
             regular, and non-writable by group or other users.
         trust_group_writable_ancestors: Permit group-write access to
-            current-user-owned ancestors when the operator trusts every
-            principal granted that access.
+            root- or current-user-owned ancestors when the operator trusts
+            every principal granted that access.
 
     Raises:
         BootstrapError: If an ancestor is linked or unsafe under the selected
@@ -642,7 +643,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--trust-bootstrap-group-writable-ancestors",
         action="store_true",
-        help="trust group-write access on current-user-owned bootstrap ancestors",
+        help="trust group-write access on root- or current-user-owned bootstrap ancestors",
     )
     args = parser.parse_args(argv)
     try:
@@ -652,7 +653,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         if args.trust_bootstrap_group_writable_ancestors:
             print(
-                "mkchad-release-bootstrap: warning: trusting every group-class or ACL writer on current-user-owned bootstrap ancestors",
+                "mkchad-release-bootstrap: warning: trusting every group-class or ACL writer on root- or current-user-owned bootstrap ancestors",
                 file=sys.stderr,
             )
         if args.command == "recover":
