@@ -21,6 +21,9 @@ python3 deploy/mkchad_deploy.py deploy --verified-release EVIDENCE --verified-pa
 python3 ~/.local/libexec/mkchad-release-bootstrap recover --deployment-id UUID --mode complete|restore --state-root DIR [--confirm-processes-quiesced]
 ```
 
+`--state-root` names the canonical mode-`0700` deployment-record directory,
+normally `~/.local/state/mkchad/deployments`.
+
 No delegated cgroup or service-manager scope is required. Every Git, runtime,
 and installer child starts in a new POSIX session with closed standard input,
 minimal environment, separate 1 MiB stdout/stderr bounds, and a fixed timeout.

@@ -198,12 +198,21 @@ class BootstrapAuthorityTests(unittest.TestCase):
             if not path.exists():
                 path.write_bytes(content)
             path.chmod(0o600)
+        large_bundle = bundle / "large.bundle"
+        with large_bundle.open("wb") as handle:
+            handle.truncate(16 * 1024 * 1024 + 1)
+        large_bundle.chmod(0o600)
+        large_digest = hashlib.sha256()
+        for _ in range(16):
+            large_digest.update(b"\0" * (1024 * 1024))
+        large_digest.update(b"\0")
         record = {
             "schema": 1, "id": deployment_id, "deployer": "mkchad-deploy-v1", "state": "failed",
             "state_root": str(state), "recovery_bundle": bundle.name,
             "authority": authority,
             "bundle_digests": {name: hashlib.sha256(content).hexdigest() for name, content in retained.items()},
         }
+        record["bundle_digests"][large_bundle.name] = large_digest.hexdigest()
         (state / f"{deployment_id}.json").write_text(json.dumps(record), encoding="utf-8")
         (state / f"{deployment_id}.json").chmod(0o600)
         self.assertEqual(self.bootstrap.authenticated_recovery_deployer(state, deployment_id), bundle / "deployer.py")

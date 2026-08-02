@@ -126,6 +126,75 @@ def _read_private(path: pathlib.Path) -> bytes:
         os.close(fd)
 
 
+def _digest_private(path: pathlib.Path) -> str:
+    """Hash one owner-only regular file without loading it into memory."""
+    entry = os.lstat(path)
+    if (
+        not stat.S_ISREG(entry.st_mode)
+        or stat.S_ISLNK(entry.st_mode)
+        or entry.st_uid != os.getuid()
+        or stat.S_IMODE(entry.st_mode) != 0o600
+    ):
+        raise BootstrapError(f"unsafe private input: {path}")
+    identity = (
+        entry.st_dev,
+        entry.st_ino,
+        entry.st_size,
+        entry.st_mode,
+        entry.st_uid,
+        entry.st_mtime_ns,
+        entry.st_ctime_ns,
+    )
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        before = os.fstat(fd)
+        if identity != (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mode,
+            before.st_uid,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        ):
+            raise BootstrapError("private input changed before open")
+        digest = hashlib.sha256()
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(fd, min(1024 * 1024, remaining))
+            if not chunk:
+                raise BootstrapError("private input changed while reading")
+            digest.update(chunk)
+            remaining -= len(chunk)
+        if os.read(fd, 1):
+            raise BootstrapError("private input changed while reading")
+        after = os.fstat(fd)
+        if identity != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mode,
+            after.st_uid,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ):
+            raise BootstrapError("private input changed while reading")
+        final = os.lstat(path)
+        if identity != (
+            final.st_dev,
+            final.st_ino,
+            final.st_size,
+            final.st_mode,
+            final.st_uid,
+            final.st_mtime_ns,
+            final.st_ctime_ns,
+        ):
+            raise BootstrapError("private input changed after open")
+        return digest.hexdigest()
+    finally:
+        os.close(fd)
+
+
 def _write_all(fd: int, data: bytes):
     """Write all bytes or fail rather than accepting a short write."""
     view = memoryview(data)
@@ -422,7 +491,7 @@ def write_evidence(directory: pathlib.Path, authority: dict, parent_bundle: path
     if not directory.exists() and not directory.is_symlink():
         directory.mkdir(mode=0o700)
     _safe_directory(directory)
-    digest = hashlib.sha256(_read_private(parent_bundle)).hexdigest()
+    digest = _digest_private(parent_bundle)
     value = {"schema": SCHEMA, "deployer": DEPLOYER_ID, "authority": _validate_authority(authority), "parent_bundle_sha256": digest}
     path = directory / "verified-release.json"
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
@@ -443,7 +512,7 @@ def _retained_evidence(path: pathlib.Path, bundle: pathlib.Path) -> dict:
         raise BootstrapError("malformed retained release evidence") from exc
     if not isinstance(evidence, dict) or set(evidence) != {"schema", "deployer", "authority", "parent_bundle_sha256"} or evidence["schema"] != SCHEMA or evidence["deployer"] != DEPLOYER_ID or not SHA256.fullmatch(evidence["parent_bundle_sha256"]):
         raise BootstrapError("retained release evidence is malformed")
-    if hashlib.sha256(_read_private(bundle)).hexdigest() != evidence["parent_bundle_sha256"]:
+    if _digest_private(bundle) != evidence["parent_bundle_sha256"]:
         raise BootstrapError("retained parent bundle integrity verification failed")
     authority = _validate_authority(evidence["authority"])
     temporary = pathlib.Path(tempfile.mkdtemp(prefix="mkchad-recovery-verify-"))
@@ -511,7 +580,7 @@ def authenticated_recovery_deployer(state_root: pathlib.Path, deployment_id: str
     for name, expected in digests.items():
         if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+", name) or not isinstance(expected, str) or not SHA256.fullmatch(expected):
             raise BootstrapError("deployment recovery bundle digest table is malformed")
-        if hashlib.sha256(_read_private(bundle / name)).hexdigest() != expected:
+        if _digest_private(bundle / name) != expected:
             raise BootstrapError("deployment recovery bundle integrity verification failed")
     mandatory = {"deployer.py", "verified-release.json", "release.json", "release-v1.schema.json", "receipt-v1.schema.json", "parent.bundle"}
     if not mandatory <= set(digests):
