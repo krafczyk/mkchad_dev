@@ -588,8 +588,16 @@ def execute_deployment(repo: pathlib.Path, image: pathlib.Path, *, release_tag: 
                 if not isinstance(payload, dict) or payload.get("schema") != 1 or payload.get("ok") is not True or payload.get("command") != "status" or payload.get("status") not in {"inactive", "healthy", "degraded", "blocked", "starting", "stopping", "failed"}:
                     raise DeploymentError("managed service status is unavailable or malformed")
                 active = payload["status"] != "inactive"
-            elif any(path.exists() or path.is_symlink() for path in _managed_paths(roots, staged["msk_containers"][1], image)):
-                raise DeploymentError("partial target has no lifecycle command")
+            else:
+                partial_paths = sorted(
+                    (path for path in _managed_paths(roots, staged["msk_containers"][1], image) if path.exists() or path.is_symlink()),
+                    key=str,
+                )
+                if partial_paths:
+                    raise DeploymentError(
+                        f"partial target has no lifecycle command at {lifecycle}; detected pre-existing managed paths: "
+                        + ", ".join(map(str, partial_paths))
+                    )
             recovery = staging / "recovery"
             recovery.mkdir(mode=0o700)
             for component in deployed.values():

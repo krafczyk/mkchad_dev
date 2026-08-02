@@ -67,6 +67,8 @@ The launcher streams Git and deployer output to the terminal and writes the
 same redacted output to `${XDG_STATE_HOME:-$HOME/.local/state}/mkchad/deploy/`.
 It keeps the current log and two previous logs. `latest-result.json` is
 atomically replaced only by the admitted run's matching run ID and log path.
+Partial-target diagnostics report the expected lifecycle command and every
+pre-existing managed path that requires lifecycle validation.
 
 The result distinguishes deployed, embedded, configuration-owned, and disabled
 components. A successful result is `configuration-pending`: deployment does

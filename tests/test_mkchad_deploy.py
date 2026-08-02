@@ -289,6 +289,10 @@ class DeploymentExecutionTests(unittest.TestCase):
         partial.parent.mkdir(parents=True)
         partial.write_text("partial\n", encoding="ascii")
         self.assertEqual(self._execute("223e4567-e89b-12d3-a456-426614174000"), 2)
+        self.assertEqual(
+            self._result()["diagnostic"],
+            f"partial target has no lifecycle command at {self.home / '.local' / 'bin' / 'mkchad-opencode-server'}; detected pre-existing managed paths: {partial}",
+        )
         self.assertFalse(self._destination("msk_containers").exists())
         partial.unlink()
 
