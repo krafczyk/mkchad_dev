@@ -212,6 +212,15 @@ raise SystemExit(child_exit)
         self.assertIn("--result-path", received["argv"])
         self.assertIn(received["run_id"], pathlib.Path(received["result_path"]).name)
 
+    def test_replace_partial_is_forwarded_to_the_release_deployer(self):
+        _, remote, _ = self.remote_with_release()
+        capture = self.root / "replace-partial.json"
+
+        status, _, _ = self.invoke(remote, extra=("--replace-partial",), capture=capture)
+
+        self.assertEqual(status, 0)
+        self.assertIn("--replace-partial", json.loads(capture.read_text(encoding="utf-8"))["argv"])
+
     def test_only_public_options_are_accepted(self):
         _, remote, _ = self.remote_with_release()
         for extra in (("--remote", "elsewhere"), ("--expected-parent-commit", "a" * 40), ("recover",)):

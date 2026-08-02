@@ -525,7 +525,7 @@ def _publish(path: pathlib.Path, document: dict):
     os.replace(temporary, path)
 
 
-def execute_deployment(repo: pathlib.Path, image: pathlib.Path, *, release_tag: str, log_path: pathlib.Path, result_path: pathlib.Path, run_id: str) -> int:
+def execute_deployment(repo: pathlib.Path, image: pathlib.Path, *, release_tag: str, log_path: pathlib.Path, result_path: pathlib.Path, run_id: str, replace_partial: bool = False) -> int:
     """Preflight, apply, verify, and report one schema-2 release deployment.
 
     Args:
@@ -535,6 +535,8 @@ def execute_deployment(repo: pathlib.Path, image: pathlib.Path, *, release_tag: 
         log_path: Launcher-owned absolute run-log path.
         result_path: Launcher-owned path for atomic terminal-result publication.
         run_id: Launcher-generated UUID binding the result to this invocation.
+        replace_partial: Whether the operator asserts that a legacy partial
+            target has no active managed service and may be replaced.
 
     Returns:
         Zero after verified success, or two after a published failure or
@@ -594,10 +596,13 @@ def execute_deployment(repo: pathlib.Path, image: pathlib.Path, *, release_tag: 
                     key=str,
                 )
                 if partial_paths:
-                    raise DeploymentError(
-                        f"partial target has no lifecycle command at {lifecycle}; detected pre-existing managed paths: "
-                        + ", ".join(map(str, partial_paths))
-                    )
+                    detail = ", ".join(map(str, partial_paths))
+                    if not replace_partial:
+                        raise DeploymentError(
+                            f"partial target has no lifecycle command at {lifecycle}; detected pre-existing managed paths: {detail}; "
+                            "rerun with --replace-partial only after confirming the managed service is inactive"
+                        )
+                    print(f"mkchad-deploy: --replace-partial asserted the managed service is inactive; replacing: {detail}", file=sys.stderr)
             recovery = staging / "recovery"
             recovery.mkdir(mode=0o700)
             for component in deployed.values():
@@ -707,6 +712,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("deploy")
     parser.add_argument("--release", required=True)
     parser.add_argument("--image", type=pathlib.Path, required=True)
+    parser.add_argument("--replace-partial", action="store_true")
     parser.add_argument("--log-path", type=pathlib.Path, required=True)
     parser.add_argument("--result-path", type=pathlib.Path, required=True)
     parser.add_argument("--run-id", required=True)
@@ -714,7 +720,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.deploy != "deploy":
         parser.error("only the deploy handoff is supported")
     try:
-        return execute_deployment(pathlib.Path.cwd(), args.image, release_tag=args.release, log_path=args.log_path, result_path=args.result_path, run_id=args.run_id)
+        return execute_deployment(pathlib.Path.cwd(), args.image, release_tag=args.release, log_path=args.log_path, result_path=args.result_path, run_id=args.run_id, replace_partial=args.replace_partial)
     except DeploymentError as exc:
         print("mkchad-deploy: " + str(exc), file=sys.stderr)
         return 2

@@ -115,7 +115,10 @@ git config --global url."file://$canonical/release.git".insteadOf git@github.com
 
 if IMAGE_PREFLIGHT_STATUS=7 python3 deploy/mkchad_release.py --release v2-fixture --image "$image"; then exit 1; fi
 if IMAGE_INSTALL_STATUS=7 python3 deploy/mkchad_release.py --release v2-fixture --image "$image"; then exit 1; fi
-python3 deploy/mkchad_release.py --release v2-fixture --image "$image"
+rm "$HOME/.local/bin/mkchad-opencode-server"
+printf '%s\n' legacy > "$HOME/.local/bin/nvim_library.sh"
+if python3 deploy/mkchad_release.py --release v2-fixture --image "$image"; then exit 1; fi
+python3 deploy/mkchad_release.py --release v2-fixture --image "$image" --replace-partial
 
 printf '%s\n' 'return { updated = true }' > "$canonical/components/mkchad/init.lua"
 git -C "$canonical/components/mkchad" add init.lua

@@ -337,7 +337,7 @@ def _checkout_release(release: str, log) -> tuple[pathlib.Path, pathlib.Path]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Run the public two-argument release launcher.
+    """Run the public release launcher.
 
     Args:
         argv: Optional public CLI arguments; process arguments are used when omitted.
@@ -354,6 +354,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0], allow_abbrev=False)
     parser.add_argument("--release", required=True)
     parser.add_argument("--image", type=pathlib.Path, required=True)
+    parser.add_argument("--replace-partial", action="store_true", help="assert the managed service is inactive and replace legacy partial state")
     args = parser.parse_args(argv)
     try:
         _validate_tag(args.release)
@@ -384,6 +385,7 @@ def main(argv: list[str] | None = None) -> int:
                             args.release,
                             "--image",
                             str(args.image.absolute()),
+                            *(["--replace-partial"] if args.replace_partial else []),
                             "--log-path",
                             str(log_path),
                             "--result-path",

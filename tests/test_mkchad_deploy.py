@@ -57,10 +57,11 @@ class DeploymentContractTests(unittest.TestCase):
         self.assertEqual(self.deploy.validate_release_v2_document(different_pin), different_pin)
 
     def test_only_internal_handoff_is_parsed(self):
-        handoff = ["deploy", "--release", "v2", "--image", "/tmp/image.sif", "--log-path", "/tmp/run.log", "--result-path", "/tmp/result.json", "--run-id", "123e4567-e89b-12d3-a456-426614174000"]
+        handoff = ["deploy", "--release", "v2", "--image", "/tmp/image.sif", "--replace-partial", "--log-path", "/tmp/run.log", "--result-path", "/tmp/result.json", "--run-id", "123e4567-e89b-12d3-a456-426614174000"]
         with mock.patch.object(self.deploy, "execute_deployment", return_value=0) as execute:
             self.assertEqual(self.deploy.main(handoff), 0)
         self.assertEqual(execute.call_args.kwargs["release_tag"], "v2")
+        self.assertTrue(execute.call_args.kwargs["replace_partial"])
         for old in ("validate-release", "recover", "supervise", "deploy --verified-release x"):
             with self.subTest(old=old), self.assertRaises(SystemExit):
                 self.deploy.main(old.split())
@@ -200,7 +201,7 @@ class DeploymentExecutionTests(unittest.TestCase):
     def _write_manifest(self):
         (self.repo / "deploy" / "release.json").write_text(json.dumps(self.manifest), encoding="utf-8")
 
-    def _execute(self, run_id="123e4567-e89b-12d3-a456-426614174000"):
+    def _execute(self, run_id="123e4567-e89b-12d3-a456-426614174000", *, replace_partial=False):
         self.result = self.root / "result.json"
         return self.deploy.execute_deployment(
             self.repo,
@@ -209,6 +210,7 @@ class DeploymentExecutionTests(unittest.TestCase):
             log_path=self.root / "run.log",
             result_path=self.result,
             run_id=run_id,
+            replace_partial=replace_partial,
         )
 
     def _result(self):
@@ -291,7 +293,7 @@ class DeploymentExecutionTests(unittest.TestCase):
         self.assertEqual(self._execute("223e4567-e89b-12d3-a456-426614174000"), 2)
         self.assertEqual(
             self._result()["diagnostic"],
-            f"partial target has no lifecycle command at {self.home / '.local' / 'bin' / 'mkchad-opencode-server'}; detected pre-existing managed paths: {partial}",
+            f"partial target has no lifecycle command at {self.home / '.local' / 'bin' / 'mkchad-opencode-server'}; detected pre-existing managed paths: {partial}; rerun with --replace-partial only after confirming the managed service is inactive",
         )
         self.assertFalse(self._destination("msk_containers").exists())
         partial.unlink()
@@ -316,6 +318,29 @@ class DeploymentExecutionTests(unittest.TestCase):
         (mkchad / "init.lua").write_text("user change\n", encoding="ascii")
         self.assertEqual(self._execute("323e4567-e89b-12d3-a456-426614174000"), 2)
         self.assertEqual((mkchad / "init.lua").read_text(encoding="ascii"), "user change\n")
+
+    def test_replace_partial_allows_verified_replacement_of_legacy_tools(self):
+        partial = self.home / ".local" / "bin" / "nvim_library.sh"
+        partial.parent.mkdir(parents=True)
+        partial.write_text("legacy tool\n", encoding="ascii")
+
+        self.assertEqual(self._execute(replace_partial=True), 0)
+
+        self.assertNotEqual(partial.read_text(encoding="ascii"), "legacy tool\n")
+        self.assertTrue((self.home / ".local" / "bin" / "mkchad-opencode-server").is_file())
+
+    def test_replace_partial_does_not_bypass_an_active_managed_service(self):
+        self.assertEqual(self._execute(), 0)
+        source = self.root / "sources" / "mkchad"
+        (source / "init.lua").write_text("return { changed = true }\n", encoding="ascii")
+        subprocess.run(["git", "-C", str(source), "add", "init.lua"], check=True)
+        subprocess.run(["git", "-C", str(source), "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-q", "-m", "change"], check=True)
+        next(component for component in self.manifest["components"] if component["name"] == "mkchad")["commit"] = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
+        self._write_manifest()
+        os.environ["LIFECYCLE_STATUS"] = "healthy"
+
+        self.assertEqual(self._execute("223e4567-e89b-12d3-a456-426614174000", replace_partial=True), 2)
+        self.assertIn("managed service is active", self._result()["diagnostic"])
 
     def test_caller_image_inside_managed_directory_is_not_a_partial_target(self):
         container_dir = self.home / "containers"

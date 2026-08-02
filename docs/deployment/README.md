@@ -21,9 +21,9 @@ preserves the caller image for repair and rerun.
 
 The launcher fetches exactly `TAG` from
 `git@github.com:krafczyk/mkchad_dev.git`, checks out that release without
-submodules, and invokes only the deployer in that checkout. It accepts no
-remote override, parent SHA, development, validation, trust, supervisor, or
-recovery option.
+submodules, and invokes only the deployer in that checkout. Its only optional
+override is `--replace-partial`; it accepts no remote override, parent SHA,
+development, validation, supervisor, or recovery option.
 
 ## Release Authority
 
@@ -57,6 +57,19 @@ An existing clean component checkout does not require the lifecycle launcher to
 be preinstalled when no managed host tool or image exists yet. Deployment treats
 that configuration-only state as inactive, installs the pinned host tools, and
 then verifies the lifecycle and remaining release state normally.
+
+An older deployment may have managed host tools or images but no lifecycle
+launcher. After independently confirming that no MkChad/OpenCode service is
+running, pass `--replace-partial` to assert that the service is inactive and
+replace that legacy partial state through the normal verified installers:
+
+```bash
+mkchad-release --release TAG --image /absolute/path/to/image.sif --replace-partial
+```
+
+The option bypasses only the missing-lifecycle guard. A lifecycle launcher that
+reports an active noncompliant service still blocks, as do dirty or wrong-origin
+checkouts, unsafe installer outputs, and invalid image inputs.
 
 If an action fails, prior successful changes remain. Repair the reported step
 and rerun the same command; no rollback or recovery command exists.
