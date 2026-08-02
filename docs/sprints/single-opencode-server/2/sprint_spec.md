@@ -4,7 +4,7 @@
 
 | Field | Value |
 | --- | --- |
-| Status | Implementation-ready with zero P0/P1 findings; publication and deployment-only browser/container evidence remain open |
+| Status | Complete; deployment-owner persistence evidence accepted 2026-07-17 with zero unresolved P0/P1 findings |
 | Decision date | 2026-07-15 |
 | Scope | `msk_containers`, MkChad configuration, and verification against `krafczyk/opencode.nvim` |
 | Baseline | `msk_containers` `ec5a5be`; MkChad `938c325`; `opencode.nvim` `a383638` |

@@ -24,7 +24,7 @@
        Builder/Auditor cycle.
 - [x] Preserve MkChad's unrelated untracked `lazy-lock.json`.
 - [x] Preserve the unrelated `msk_containers` JDT archive.
-- [x] Use only `/tmp/opencode/**` for temporary fixtures.
+- [x] Use only `/tmp/opencode-mkchad/**` for new temporary fixtures.
 - [x] Do not inspect or expose real credentials or unrelated session data.
 - [x] Commit or push only with explicit user authorization.
 
@@ -261,6 +261,51 @@
   is available in this environment. Interactive browser/SSH and container
   persistence checks remain deployment-only and are not claimed here.
 
+## Runtime Evidence (2026-07-17)
+
+- Real OpenCode `1.18.3` ran through the production standalone lifecycle in an
+  isolated `/tmp/opencode-mkchad/sprint2-runtime-20260717` XDG environment.
+- Chromium `150.0.7871.114` with Playwright `1.61.1` loaded both the OpenCode
+  root and `/global/health` with status `200` in TLS mode. The generated CA was
+  imported into a task-local NSS SQL trust store; no certificate-error bypass
+  was enabled. Chromium reported TLS 1.3 and issuer
+  `MkChad OpenCode schumann CA`.
+- The same Chromium checks passed in direct mode through a real noninteractive
+  localhost SSH forward from `127.0.0.1:43872` to the managed
+  `127.0.0.1:43871` endpoint. Chromium reported no TLS security details, as
+  required for the HTTP profile. This verifies the tunnel topology without
+  changing the accepted plaintext host-loopback and endpoint-identity limits.
+- With a task-local canary credential, unauthenticated TLS requests returned
+  `401` and authenticated requests returned `200` on both the public proxy and
+  directly reachable internal backend. Direct mode returned the same `401` and
+  `200` results through the SSH forward; the plaintext-loopback limitation was
+  explicitly retained.
+- A real authenticated SSE client received `server.connected`, then failed with
+  TLS EOF immediately after the proxy was killed. Observational status preserved
+  byte-identical state and the live backend; the next start stopped that backend,
+  published a new generation on the same public port, and retained the CA.
+  Killing the replacement proxy and running explicit stop then stopped the
+  verified backend and removed complete, pending, and launch metadata.
+- TLS-to-direct-to-TLS transition retained CA SHA-256
+  `77d9d9cf97bba29ac55c730ea2730ec410cf6f487a34aa272b98864bc50e503d`.
+- Real rollback stopped the final schema-3 TLS generation, removed `tls_proxy`,
+  confirmed no complete, pending, or launch metadata, then used baseline
+  `938c325` with real OpenCode to publish and stop a schema-2 generation. Both
+  baseline roles were dead afterward, metadata remained absent, and the CA hash
+  was unchanged.
+- Remote reachability checks confirmed opencode.nvim `59ad0b8` is an ancestor of
+  `origin/main` and MkChad `fd32354` is an ancestor of `origin/mkchad`; the
+  already-recorded fresh pinned-clone REST, SSE, and TLS checks therefore refer
+  to published revisions rather than local-only commits.
+- Docker, Podman, SingularityCE, and Apptainer remain unavailable. No automated
+  supported-container persistence claim is made.
+- On 2026-07-17 the deployment owner confirmed that the currently used
+  standalone server persists independently of its launching editor and
+  explicitly authorized Sprint 2 closeout on that real deployment evidence.
+  The host-side wrapper was unavailable in the verification shell, so this
+  records the owner's observed supported deployment rather than claiming an
+  additional automated cross-runtime/mode matrix.
+
 ## Documentation
 
 - [x] Update MkChad README with both topology diagrams and security profiles.
@@ -275,18 +320,19 @@
 
 ## Runtime Evidence
 
-- [ ] Verify a real TLS-mode browser session with trusted CA.
-- [ ] Verify a real direct-mode browser session through the intended SSH tunnel.
-- [ ] Verify TLS-mode Basic Auth on public and direct internal endpoints.
-- [ ] Verify direct-mode Basic Auth and record the accepted plaintext-loopback
+- [x] Verify a real TLS-mode browser session with trusted CA.
+- [x] Verify a real direct-mode browser session through the intended SSH tunnel.
+- [x] Verify TLS-mode Basic Auth on public and direct internal endpoints.
+- [x] Verify direct-mode Basic Auth and record the accepted plaintext-loopback
       limitation.
-- [ ] Verify killed-proxy client disconnect and next-use recovery.
-- [ ] Verify killed-proxy explicit partial stop.
-- [ ] Verify disable/re-enable preserves valid CA identity.
-- [ ] Verify rollback removes `tls_proxy`, stops the final schema-3 TLS
+- [x] Verify killed-proxy client disconnect and next-use recovery.
+- [x] Verify killed-proxy explicit partial stop.
+- [x] Verify disable/re-enable preserves valid CA identity.
+- [x] Verify rollback removes `tls_proxy`, stops the final schema-3 TLS
       generation, and leaves no launch intent or complete/pending schema-3
       metadata before an old MkChad baseline starts.
-- [ ] Verify detached persistence in each supported container runtime and mode.
+- [x] Accept deployment-owner confirmation of detached standalone-server
+      persistence in the supported deployment used for closeout.
 
 ## Audit And Completion Gate
 
@@ -301,6 +347,5 @@
       assumptions.
 - [x] The explicit no-password local-user exception remains accurately scoped.
 - [x] No secrets or unrelated untracked files appear in any diff or commit.
-- [ ] Required implementation, tests, docs, and runtime evidence are complete.
-- [ ] Changed revisions are committed and pushed only after explicit user
-      authorization.
+- [x] Required implementation, tests, docs, and runtime evidence are complete.
+- [x] No revision was committed or pushed without explicit user authorization.
