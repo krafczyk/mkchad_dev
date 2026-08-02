@@ -663,10 +663,26 @@ class DeploymentValidationTests(unittest.TestCase):
                 pass
         self.assertEqual(target.read_text(encoding="ascii"), "keep\n")
 
+    def test_tree_entries_allow_dotfiles_but_reject_git_metadata(self):
+        object_id = "a" * 40
+        valid = subprocess.CompletedProcess([], 0, f"100644 blob {object_id}\t.gitignore\0", "")
+        with mock.patch.object(self.deploy, "run_git", return_value=valid):
+            self.assertEqual(self.deploy._tree_entries(self.root, "b" * 40), {".gitignore": ("100644", "blob", object_id)})
+
+        for path in (".git/config", "nested/.GIT/config", "../outside", "/absolute"):
+            invalid = subprocess.CompletedProcess([], 0, f"100644 blob {object_id}\t{path}\0", "")
+            with mock.patch.object(self.deploy, "run_git", return_value=invalid):
+                with self.assertRaisesRegex(self.deploy.DeploymentError, "unsupported path"):
+                    self.deploy._tree_entries(self.root, "b" * 40)
+
     def test_checkout_recovery_completes_and_restores_from_offline_bundle(self):
         data = self.root / "data"
         destination = data / "mkchad" / "components" / "msk_containers"
-        previous = self.make_checkout(destination, "msk_containers", {"tracked": "old\n", "other": "old other\n"})
+        previous = self.make_checkout(
+            destination,
+            "msk_containers",
+            {".gitignore": "generated\n", ".stylua.toml": "indent_type = 'Spaces'\n", "tracked": "old\n", "other": "old other\n"},
+        )
         (destination / "tracked").write_text("new\n", encoding="ascii")
         (destination / "other").write_text("new other\n", encoding="ascii")
         subprocess.run(["git", "-C", str(destination), "add", "tracked", "other"], check=True)
@@ -694,6 +710,8 @@ class DeploymentValidationTests(unittest.TestCase):
         subprocess.run(["git", "-C", str(destination), "checkout", previous, "--", "tracked"], check=True)
         restored = self.deploy.recover_checkout_resource(resource, "restore", component, authority, bundle_root, roots, DirectScope())
         self.assertEqual(restored["revision"], previous)
+        self.assertEqual((destination / ".gitignore").read_text(encoding="ascii"), "generated\n")
+        self.assertEqual((destination / ".stylua.toml").read_text(encoding="ascii"), "indent_type = 'Spaces'\n")
         self.assertEqual((destination / "tracked").read_text(encoding="ascii"), "old\n")
         self.assertEqual((destination / "other").read_text(encoding="ascii"), "old other\n")
 

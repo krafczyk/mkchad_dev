@@ -41,6 +41,7 @@ SHA256 = re.compile(r"^[0-9a-f]{64}$")
 SHA1 = re.compile(r"^[0-9a-f]{40}$")
 UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
 SAFE_RELATIVE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
+SAFE_TREE_RELATIVE = re.compile(r"^[A-Za-z0-9.][A-Za-z0-9._/-]*$")
 COMPONENT_DISPOSITIONS = {
     "msk_containers": "deployed",
     "mkchad": "deployed",
@@ -551,9 +552,13 @@ def _tree_entries(repository: pathlib.Path, commit: str) -> dict[str, tuple[str,
         if not line:
             continue
         match = re.fullmatch(r"([0-7]{6}) (blob|commit) ([0-9a-f]{40})\t(.+)", line)
-        if not match or not SAFE_RELATIVE.fullmatch(match.group(4)) or any(part in {".", ".."} for part in pathlib.PurePosixPath(match.group(4)).parts):
+        if not match:
             raise DeploymentError("pinned tree contains an unsupported path or entry")
-        entries[match.group(4)] = (match.group(1), match.group(2), match.group(3))
+        path = match.group(4)
+        parts = pathlib.PurePosixPath(path).parts
+        if not SAFE_TREE_RELATIVE.fullmatch(path) or any(part in {".", ".."} or part.casefold() == ".git" for part in parts):
+            raise DeploymentError("pinned tree contains an unsupported path or entry")
+        entries[path] = (match.group(1), match.group(2), match.group(3))
     return entries
 
 
