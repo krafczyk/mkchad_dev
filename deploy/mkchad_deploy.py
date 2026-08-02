@@ -83,7 +83,12 @@ def _relative(value: object, label: str) -> str:
 
 
 def validate_release_v2_document(document: dict) -> dict:
-    """Validate the closed schema-2 manifest without reading Git links or targets."""
+    """Validate and return a closed schema-2 manifest.
+
+    Raises:
+        DeploymentError: If component, artifact, action, destination, or
+            configuration metadata violates the release contract.
+    """
     if not isinstance(document, dict) or set(document) != {"schema", "components", "artifacts", "configuration"} or document.get("schema") != 2:
         raise DeploymentError("unsupported release schema")
     components = document.get("components")
@@ -158,7 +163,12 @@ def validate_release_v2_document(document: dict) -> dict:
 
 
 def validate_result_v1_document(document: dict) -> dict:
-    """Validate the closed terminal-result shape published for one completed run."""
+    """Validate and return one closed terminal deployment result.
+
+    Raises:
+        DeploymentError: If the document is incomplete, future-versioned, or
+            contains malformed component, action, artifact, or handoff data.
+    """
     fields = {"schema", "run_id", "release", "started_at", "completed_at", "outcome", "phase", "components", "artifact", "actions", "configuration_handoff", "failed_step", "diagnostic", "log_path"}
     if not isinstance(document, dict) or set(document) != fields or document.get("schema") != 1 or not UUID.fullmatch(document.get("run_id", "")):
         raise DeploymentError("malformed terminal result")
@@ -205,7 +215,7 @@ def validate_result_v1_document(document: dict) -> dict:
         if not isinstance(action, dict) or set(action) != {"component", "id", "phase", "status"}:
             raise DeploymentError("malformed terminal result action")
         key = (action.get("component"), action.get("id"))
-        if action.get("component") not in COMPONENTS or not isinstance(action.get("id"), str) or not re.fullmatch(r"[a-z][a-z0-9-]*", action["id"]) or action.get("phase") not in PHASES or action.get("status") not in {"pending", "succeeded", "skipped-compliant", "failed"} or key in action_ids:
+        if COMPONENTS.get(action.get("component")) != "deployed" or not isinstance(action.get("id"), str) or not re.fullmatch(r"[a-z][a-z0-9-]*", action["id"]) or action.get("phase") not in PHASES or action.get("status") not in {"pending", "succeeded", "skipped-compliant", "failed"} or key in action_ids:
             raise DeploymentError("malformed terminal result action")
         action_ids.add(key)
     handoff = document.get("configuration_handoff")
@@ -330,10 +340,10 @@ def _validate_actions(component: dict, checkout: pathlib.Path):
             raise DeploymentError(f"action does not match its pinned blob: {action['id']}")
 
 
-def _stage_image(source: pathlib.Path, staging: pathlib.Path, artifact: dict, revision: str) -> pathlib.Path:
+def _stage_image(source: pathlib.Path, staging: pathlib.Path, artifact: dict) -> pathlib.Path:
     """Copy a matching caller image to the installer-required raw-image name."""
     raw_arch = {"x86_64": "x86", "aarch64": "aarch64", "ppc64le": "ppc64le"}[artifact["architecture"]]
-    target = staging / f"neovim_0.0.0_g{revision}_{artifact['sha256']}_{raw_arch}.sif"
+    target = staging / f"nvim_container_{raw_arch}.sif"
     if not source.is_file() or source.is_symlink():
         raise DeploymentError("caller image is not a regular file")
     digest = hashlib.sha256()
@@ -424,10 +434,11 @@ def _run_action(action: dict, component: dict, image: pathlib.Path, recovery: pa
 
 def _installer_sources(msk_checkout: pathlib.Path) -> list[pathlib.Path]:
     """Return the exact host-tool files owned by the pinned installer checkout."""
-    paths = sorted((msk_checkout / "container_tools").glob("*.sh"))
+    paths = set((msk_checkout / "container_tools").glob("*.sh"))
     bin_dir = msk_checkout / "nvim" / "bin"
-    paths.extend(path for path in (bin_dir / name for name in ("nvim", "nvim_shell", "nvim_clear_data", "mkchad", "mkchad-container-bootstrap", "mkchad-status-host-evidence", "mkchad-opencode-server-image", "mkchad-opencode-server", "install_nvim_container")) if path.is_file())
-    return paths
+    paths.update(bin_dir.glob("*.sh"))
+    paths.update(path for path in (bin_dir / name for name in ("nvim", "nvim_shell", "nvim_clear_data", "mkchad", "mkchad-container-bootstrap", "mkchad-status-host-evidence", "mkchad-opencode-server-image", "mkchad-opencode-server", "install_nvim_container")) if path.is_file())
+    return sorted(paths, key=lambda path: path.name)
 
 
 def _managed_paths(roots: dict[str, pathlib.Path], msk_checkout: pathlib.Path) -> list[pathlib.Path]:
@@ -497,7 +508,29 @@ def _publish(path: pathlib.Path, document: dict):
 
 
 def execute_deployment(repo: pathlib.Path, image: pathlib.Path, *, release_tag: str, log_path: pathlib.Path, result_path: pathlib.Path, run_id: str) -> int:
-    """Preflight, apply, verify, and report one schema-2 release deployment."""
+    """Preflight, apply, verify, and report one schema-2 release deployment.
+
+    Args:
+        repo: Release checkout containing the authoritative manifest.
+        image: Caller-supplied raw SIF artifact.
+        release_tag: Exact launcher-selected release tag.
+        log_path: Launcher-owned absolute run-log path.
+        result_path: Launcher-owned path for atomic terminal-result publication.
+        run_id: Launcher-generated UUID binding the result to this invocation.
+
+    Returns:
+        Zero after verified success, or two after a published failure or
+        interruption.
+
+    Raises:
+        DeploymentError: If launcher handoff metadata is malformed before a run
+            can be admitted.
+
+    Side effects:
+        Fetches temporary repositories, runs bounded component actions, updates
+        clean final checkouts and installer outputs, and atomically publishes a
+        terminal result. Earlier successful changes remain after later failure.
+    """
     if not TAG.fullmatch(release_tag) or ".." in release_tag or not UUID.fullmatch(run_id):
         raise DeploymentError("invalid launcher handoff")
     started_at, roots, current, phase, failure_step = _timestamp(), _roots(), None, "preflight", "preflight"
@@ -517,7 +550,7 @@ def execute_deployment(repo: pathlib.Path, image: pathlib.Path, *, release_tag: 
         _git(["-C", str(nested), "checkout", "--detach", deployed["container_tools"]["commit"]])
         for name, component in deployed.items():
             _validate_actions(component, staged[name][1])
-        staged_image = _stage_image(image, staging, artifact, deployed["msk_containers"]["commit"])
+        staged_image = _stage_image(image, staging, artifact)
         _runtime_image(staged_image, artifact["architecture"])
         plans = {
             name: (
@@ -631,7 +664,17 @@ def execute_deployment(repo: pathlib.Path, image: pathlib.Path, *, release_tag: 
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Run only the internal launcher handoff CLI for one release deployment."""
+    """Run the internal launcher handoff CLI.
+
+    Args:
+        argv: Optional CLI arguments; process arguments are used when omitted.
+
+    Returns:
+        The synchronous deployment status, or two for invalid deployment input.
+
+    Side effects:
+        Performs the deployment and writes the launcher-selected result path.
+    """
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0], allow_abbrev=False)
     parser.add_argument("deploy")
     parser.add_argument("--release", required=True)

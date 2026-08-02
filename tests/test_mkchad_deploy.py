@@ -1,6 +1,7 @@
 """Focused schema-2 deployment contract and CLI tests."""
 
 import copy
+import fcntl
 import hashlib
 import importlib.util
 import json
@@ -134,12 +135,16 @@ class DeploymentExecutionTests(unittest.TestCase):
             "NVIM_CONTAINER_DIR": str(self.home / "containers"),
             "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": str(self.home / ".gitconfig"),
+            "TMPDIR": str(self.root),
             "PATH": str(self.bin) + os.pathsep + os.environ["PATH"],
         })
         self.environment.start()
         self.addCleanup(self.environment.stop)
+        previous_tempdir = tempfile.tempdir
+        tempfile.tempdir = str(self.root)
+        self.addCleanup(setattr, tempfile, "tempdir", previous_tempdir)
         runtime = self.bin / "apptainer"
-        runtime.write_text("#!/bin/sh\nprintf '%s\\n' x86_64\n", encoding="ascii")
+        runtime.write_text("#!/bin/sh\nprintf '%s\\n' \"${FAKE_IMAGE_ARCH:-x86_64}\"\n", encoding="ascii")
         runtime.chmod(0o755)
         self.commits = self._sources()
         (self.home / ".gitconfig").write_text(
@@ -176,12 +181,13 @@ class DeploymentExecutionTests(unittest.TestCase):
         msk = self._repo(
             "msk_containers",
             {
-                "bin/install_nvim.sh": "#!/bin/sh\nset -eu\n[ \"${1:-}\" != --check ] || exit \"${HOST_PREFLIGHT_STATUS:-0}\"\nmkdir -p \"$HOME/.local/bin\"\ncp container_tools/*.sh nvim/bin/* \"$HOME/.local/bin/\"\nchmod 755 \"$HOME/.local/bin\"/*\n",
+                "bin/install_nvim.sh": "#!/bin/sh\nset -eu\nif [ \"${1:-}\" = --check ]; then\n  { [ \"$#\" -eq 1 ] || { [ \"$#\" -eq 3 ] && [ \"$2\" = --recovery-dir ] && [ -d \"$3\" ]; }; } || exit 2\n  exit \"${HOST_PREFLIGHT_STATUS:-0}\"\nfi\n[ \"$#\" -eq 2 ] && [ \"$1\" = --recovery-dir ] && [ -d \"$2\" ] || exit 2\nmkdir -p \"$HOME/.local/bin\"\ncp container_tools/*.sh nvim/bin/* \"$HOME/.local/bin/\"\nchmod 755 \"$HOME/.local/bin\"/*\n",
                 "nvim/bin/nvim": "#!/bin/sh\nexit 0\n",
+                "nvim/bin/nvim_library.sh": "#!/bin/sh\nreturn 0\n",
                 "nvim/bin/mkchad-opencode-server": "#!/bin/sh\nprintf '{\"schema\":1,\"ok\":true,\"command\":\"status\",\"status\":\"%s\"}\\n' \"${LIFECYCLE_STATUS:-inactive}\"\n",
-                "nvim/bin/install_nvim_container": "#!/bin/sh\nset -eu\n[ \"${1:-}\" != --dry-run ] || exit \"${IMAGE_PREFLIGHT_STATUS:-0}\"\n[ \"${IMAGE_INSTALL_STATUS:-0}\" = 0 ] || exit \"$IMAGE_INSTALL_STATUS\"\nfor source; do :; done\nmkdir -p \"$NVIM_CONTAINER_DIR\"\ncp \"$source\" \"$NVIM_CONTAINER_DIR/neovim_fixture.sif\"\nln -sfn neovim_fixture.sif \"$NVIM_CONTAINER_DIR/neovim.sif\"\n",
+                "nvim/bin/install_nvim_container": "#!/bin/sh\nset -eu\ndry_run=0\nif [ \"${1:-}\" = --dry-run ]; then dry_run=1; shift; fi\n[ \"$#\" -eq 3 ] && [ \"$1\" = --source-revision ] && [ \"${#2}\" -eq 40 ] && [ \"${3##*/}\" = nvim_container_x86.sif ] || exit 2\n[ \"$dry_run\" -eq 0 ] || exit \"${IMAGE_PREFLIGHT_STATUS:-0}\"\n[ \"${IMAGE_INSTALL_STATUS:-0}\" = 0 ] || exit \"$IMAGE_INSTALL_STATUS\"\nmkdir -p \"$NVIM_CONTAINER_DIR\"\ncp \"$3\" \"$NVIM_CONTAINER_DIR/neovim_fixture.sif\"\nln -sfn neovim_fixture.sif \"$NVIM_CONTAINER_DIR/neovim.sif\"\n",
             },
-            {"bin/install_nvim.sh", "nvim/bin/nvim", "nvim/bin/mkchad-opencode-server", "nvim/bin/install_nvim_container"},
+            {"bin/install_nvim.sh", "nvim/bin/nvim", "nvim/bin/nvim_library.sh", "nvim/bin/mkchad-opencode-server", "nvim/bin/install_nvim_container"},
         )
         mkchad = self._repo("mkchad", {".gitignore": "opencode-server.json\nlazy-lock.json\n", "init.lua": "return {}\n"})
         return {"msk_containers": msk, "container_tools": tools, "mkchad": mkchad}
@@ -214,6 +220,16 @@ class DeploymentExecutionTests(unittest.TestCase):
         first = self._result()
         self.assertEqual(first["outcome"], "succeeded")
         self.assertEqual([action["status"] for action in first["actions"]], ["succeeded"] * 5)
+        for name in ("msk_containers", "container_tools", "mkchad"):
+            destination = self._destination(name)
+            self.assertEqual(subprocess.check_output(["git", "-C", str(destination), "rev-parse", "HEAD"], text=True).strip(), self.commits[name])
+            self.assertEqual(subprocess.check_output(["git", "-C", str(destination), "config", "--get", "remote.origin.url"], text=True).strip().removesuffix(".git"), f"git@github.com:krafczyk/{name}")
+        installed_image = self.home / "containers" / os.readlink(self.home / "containers" / "neovim.sif")
+        self.assertEqual(hashlib.sha256(installed_image.read_bytes()).hexdigest(), self.manifest["artifacts"]["nvim-image"][0]["sha256"])
+        self.assertEqual((self.home / ".local" / "bin" / "nvim_library.sh").stat().st_mode & 0o777, 0o755)
+        preserved = {"opencode-server.json": "private\n", "lazy-lock.json": "{}\n"}
+        for name, contents in preserved.items():
+            (self._destination("mkchad") / name).write_text(contents, encoding="ascii")
         source = self.root / "sources" / "mkchad"
         (source / "init.lua").write_text("return { updated = true }\n", encoding="ascii")
         subprocess.run(["git", "-C", str(source), "add", "init.lua"], check=True)
@@ -221,6 +237,7 @@ class DeploymentExecutionTests(unittest.TestCase):
         next(component for component in self.manifest["components"] if component["name"] == "mkchad")["commit"] = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
         self._write_manifest()
         self.assertEqual(self._execute("223e4567-e89b-12d3-a456-426614174000"), 0)
+        self.assertEqual({name: (self._destination("mkchad") / name).read_text(encoding="ascii") for name in preserved}, preserved)
         os.environ["LIFECYCLE_STATUS"] = "healthy"
         self.assertEqual(self._execute("323e4567-e89b-12d3-a456-426614174000"), 0)
         self.assertEqual([action["status"] for action in self._result()["actions"]], ["succeeded", "succeeded", "skipped-compliant", "skipped-compliant", "succeeded"])
@@ -252,6 +269,44 @@ class DeploymentExecutionTests(unittest.TestCase):
         self.assertFalse(list(self.state.rglob("*recovery*")))
         os.environ.pop("IMAGE_INSTALL_STATUS")
         self.assertEqual(self._execute("223e4567-e89b-12d3-a456-426614174000"), 0)
+
+    def test_preflight_refuses_unavailable_inputs_partial_targets_and_lock_contention(self):
+        msk_component = next(component for component in self.manifest["components"] if component["name"] == "msk_containers")
+        valid_commit = msk_component["commit"]
+        msk_component["commit"] = "f" * 40
+        self._write_manifest()
+        self.assertEqual(self._execute(), 2)
+        self.assertFalse(self._destination("msk_containers").exists())
+        msk_component["commit"] = valid_commit
+        self._write_manifest()
+
+        partial = self.home / ".local" / "bin" / "nvim_library.sh"
+        partial.parent.mkdir(parents=True)
+        partial.write_text("partial\n", encoding="ascii")
+        self.assertEqual(self._execute("223e4567-e89b-12d3-a456-426614174000"), 2)
+        self.assertFalse(self._destination("msk_containers").exists())
+        partial.unlink()
+
+        lock = self.state / "mkchad" / "deployment.lock"
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        with lock.open("w") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertEqual(self._execute("323e4567-e89b-12d3-a456-426614174000"), 2)
+        self.assertFalse(self._destination("msk_containers").exists())
+
+        os.environ["FAKE_IMAGE_ARCH"] = "aarch64"
+        self.assertEqual(self._execute("423e4567-e89b-12d3-a456-426614174000"), 2)
+        self.assertFalse(self._destination("msk_containers").exists())
+
+    def test_wrong_origin_and_tracked_work_are_preserved(self):
+        self.assertEqual(self._execute(), 0)
+        mkchad = self._destination("mkchad")
+        subprocess.run(["git", "-C", str(mkchad), "remote", "set-url", "origin", "git@github.com:krafczyk/other"], check=True)
+        self.assertEqual(self._execute("223e4567-e89b-12d3-a456-426614174000"), 2)
+        subprocess.run(["git", "-C", str(mkchad), "remote", "set-url", "origin", "git@github.com:krafczyk/mkchad"], check=True)
+        (mkchad / "init.lua").write_text("user change\n", encoding="ascii")
+        self.assertEqual(self._execute("323e4567-e89b-12d3-a456-426614174000"), 2)
+        self.assertEqual((mkchad / "init.lua").read_text(encoding="ascii"), "user change\n")
 
 
 if __name__ == "__main__":

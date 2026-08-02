@@ -10,7 +10,17 @@
       "type": "array",
       "minItems": 8,
       "maxItems": 8,
-      "items": {"oneOf": [{"$ref": "#/$defs/msk_containers"}, {"$ref": "#/$defs/container_tools"}, {"$ref": "#/$defs/mkchad"}, {"$ref": "#/$defs/opencode"}, {"$ref": "#/$defs/opencode_nvim"}, {"$ref": "#/$defs/opencode_project_reload"}, {"$ref": "#/$defs/compound_engineering"}, {"$ref": "#/$defs/opencode_sprint_loop"}]}
+      "items": {"oneOf": [{"$ref": "#/$defs/msk_containers"}, {"$ref": "#/$defs/container_tools"}, {"$ref": "#/$defs/mkchad"}, {"$ref": "#/$defs/opencode"}, {"$ref": "#/$defs/opencode_nvim"}, {"$ref": "#/$defs/opencode_project_reload"}, {"$ref": "#/$defs/compound_engineering"}, {"$ref": "#/$defs/opencode_sprint_loop"}]},
+      "allOf": [
+        {"contains": {"$ref": "#/$defs/msk_containers"}, "minContains": 1, "maxContains": 1},
+        {"contains": {"$ref": "#/$defs/container_tools"}, "minContains": 1, "maxContains": 1},
+        {"contains": {"$ref": "#/$defs/mkchad"}, "minContains": 1, "maxContains": 1},
+        {"contains": {"$ref": "#/$defs/opencode"}, "minContains": 1, "maxContains": 1},
+        {"contains": {"$ref": "#/$defs/opencode_nvim"}, "minContains": 1, "maxContains": 1},
+        {"contains": {"$ref": "#/$defs/opencode_project_reload"}, "minContains": 1, "maxContains": 1},
+        {"contains": {"$ref": "#/$defs/compound_engineering"}, "minContains": 1, "maxContains": 1},
+        {"contains": {"$ref": "#/$defs/opencode_sprint_loop"}, "minContains": 1, "maxContains": 1}
+      ]
     },
     "artifacts": {
       "type": "object",
@@ -20,7 +30,12 @@
         "nvim-image": {
           "type": "array",
           "minItems": 1,
-          "items": {"$ref": "#/$defs/image"}
+          "items": {"$ref": "#/$defs/image"},
+          "allOf": [
+            {"contains": {"properties": {"architecture": {"const": "x86_64"}}}, "minContains": 0, "maxContains": 1},
+            {"contains": {"properties": {"architecture": {"const": "aarch64"}}}, "minContains": 0, "maxContains": 1},
+            {"contains": {"properties": {"architecture": {"const": "ppc64le"}}}, "minContains": 0, "maxContains": 1}
+          ]
         }
       }
     },
@@ -59,7 +74,7 @@
           "type": "array",
           "items": {
             "oneOf": [
-              {"type": "string", "minLength": 1, "not": {"pattern": "[{}]"}},
+              {"type": "string", "minLength": 1, "not": {"pattern": "^(?:/)|[{}\\u0000]"}},
               {"type": "object", "required": ["token"], "additionalProperties": false, "properties": {"token": {"enum": ["recovery_dir", "staged_image", "component_revision"]}}}
             ]
           }

@@ -12,6 +12,7 @@ import os
 import pathlib
 import re
 import selectors
+import signal
 import shutil
 import subprocess
 import sys
@@ -38,6 +39,16 @@ RESULT_FIELDS = {
     "diagnostic",
     "log_path",
 }
+COMPONENT_DISPOSITIONS = {
+    "msk_containers": "deployed",
+    "container_tools": "deployed",
+    "mkchad": "deployed",
+    "opencode": "embedded",
+    "opencode.nvim": "configuration-owned",
+    "opencode-project-reload": "configuration-owned",
+    "compound-engineering": "configuration-owned",
+    "opencode_sprint_loop": "disabled",
+}
 REDACT_ASSIGNMENT = re.compile(r"(?i)\b(?P<key>[A-Za-z0-9_-]*(?:password|token|secret|api[_-]?key)[A-Za-z0-9_-]*)=[^\s]+")
 COMMAND_TIMEOUT = 300
 
@@ -48,6 +59,10 @@ class ReleaseError(RuntimeError):
 
 class InvocationBusy(RuntimeError):
     """Raised when another public release invocation owns the diagnostic lock."""
+
+
+class ReleaseInterrupted(RuntimeError):
+    """Raised after an interrupted child has completed its own cleanup."""
 
 
 def _timestamp() -> str:
@@ -99,8 +114,8 @@ def _write_stream(stream, log, data: bytes):
     log.flush()
 
 
-def _run(command: list[str], *, cwd: pathlib.Path, log, timeout: float = COMMAND_TIMEOUT) -> int:
-    """Run one bounded command while preserving stdout/stderr channels in the log."""
+def _run(command: list[str], *, cwd: pathlib.Path, log, timeout: float | None = COMMAND_TIMEOUT) -> int:
+    """Run one command while preserving stdout/stderr channels in the log."""
     try:
         process = subprocess.Popen(
             command,
@@ -109,6 +124,7 @@ def _run(command: list[str], *, cwd: pathlib.Path, log, timeout: float = COMMAND
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             close_fds=True,
+            start_new_session=timeout is not None,
         )
     except OSError as exc:
         raise ReleaseError(f"cannot start {command[0]}: {exc}") from exc
@@ -116,21 +132,33 @@ def _run(command: list[str], *, cwd: pathlib.Path, log, timeout: float = COMMAND
     selector = selectors.DefaultSelector()
     selector.register(process.stdout, selectors.EVENT_READ, sys.stdout)
     selector.register(process.stderr, selectors.EVENT_READ, sys.stderr)
-    deadline = time.monotonic() + timeout
+    deadline = time.monotonic() + timeout if timeout is not None else None
     try:
         while selector.get_map():
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                process.kill()
-                process.wait()
+            remaining = deadline - time.monotonic() if deadline is not None else None
+            if remaining is not None and remaining <= 0:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGTERM)
+                process.wait(timeout=5)
                 raise ReleaseError(f"command timed out after {timeout:g} seconds: {command[0]}")
-            for key, _ in selector.select(min(0.1, remaining)):
+            for key, _ in selector.select(0.1 if remaining is None else min(0.1, remaining)):
                 data = os.read(key.fileobj.fileno(), 65536)
                 if not data:
                     selector.unregister(key.fileobj)
                     continue
                 _write_stream(key.data, log, data)
-        return process.wait(timeout=max(0.1, deadline - time.monotonic()))
+        return process.wait() if deadline is None else process.wait(timeout=max(0.1, deadline - time.monotonic()))
+    except KeyboardInterrupt:
+        with contextlib.suppress(ProcessLookupError):
+            process.send_signal(signal.SIGINT)
+        try:
+            stdout, stderr = process.communicate(timeout=15)
+        except subprocess.TimeoutExpired:
+            process.terminate()
+            stdout, stderr = process.communicate(timeout=5)
+        _write_stream(sys.stdout, log, stdout)
+        _write_stream(sys.stderr, log, stderr)
+        raise ReleaseInterrupted from None
     except subprocess.TimeoutExpired as exc:
         process.kill()
         process.wait()
@@ -215,20 +243,71 @@ def _publish_result(path: pathlib.Path, document: dict):
     os.replace(temporary, path)
 
 
-def _matching_child_result(path: pathlib.Path, *, run_id: str, release: str, log_path: pathlib.Path) -> bool:
+def _valid_result_document(document: object) -> bool:
+    """Return whether a child document satisfies the closed result-v1 contract."""
+    if not isinstance(document, dict) or set(document) != RESULT_FIELDS or document.get("schema") != 1:
+        return False
+    if document.get("outcome") not in {"succeeded", "failed", "interrupted"} or document.get("phase") not in {"preflight", "apply", "verify"}:
+        return False
+    timestamp = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
+    if not all(isinstance(document.get(key), str) and timestamp.fullmatch(document[key]) for key in ("started_at", "completed_at")):
+        return False
+    components = document.get("components")
+    if not isinstance(components, list) or len(components) != len(COMPONENT_DISPOSITIONS):
+        return False
+    observed_names = set()
+    for component in components:
+        if not isinstance(component, dict) or set(component) != {"name", "disposition", "requested_commit", "observed_commit"}:
+            return False
+        name = component.get("name")
+        if name not in COMPONENT_DISPOSITIONS or name in observed_names or component.get("disposition") != COMPONENT_DISPOSITIONS[name] or not re.fullmatch(r"[0-9a-f]{40}", component.get("requested_commit", "")):
+            return False
+        if component.get("observed_commit") is not None and not re.fullmatch(r"[0-9a-f]{40}", component["observed_commit"]):
+            return False
+        observed_names.add(name)
+    artifact = document.get("artifact")
+    if not isinstance(artifact, dict) or set(artifact) != {"architecture", "expected_sha256", "observed_sha256"} or artifact.get("architecture") not in {"x86_64", "aarch64", "ppc64le"} or not re.fullmatch(r"[0-9a-f]{64}", artifact.get("expected_sha256", "")):
+        return False
+    if artifact.get("observed_sha256") is not None and not re.fullmatch(r"[0-9a-f]{64}", artifact["observed_sha256"]):
+        return False
+    actions = document.get("actions")
+    if not isinstance(actions, list):
+        return False
+    action_keys = set()
+    for action in actions:
+        if not isinstance(action, dict) or set(action) != {"component", "id", "phase", "status"}:
+            return False
+        key = (action.get("component"), action.get("id"))
+        if COMPONENT_DISPOSITIONS.get(action.get("component")) != "deployed" or not isinstance(action.get("id"), str) or not re.fullmatch(r"[a-z][a-z0-9-]*", action["id"]) or action.get("phase") not in {"preflight", "apply", "verify"} or action.get("status") not in {"pending", "succeeded", "skipped-compliant", "failed"} or key in action_keys:
+            return False
+        action_keys.add(key)
+    handoff = document.get("configuration_handoff")
+    if not isinstance(handoff, dict) or set(handoff) != {"state", "contract_version", "guidance", "components"} or handoff.get("state") != "configuration-pending" or handoff.get("contract_version") != 1:
+        return False
+    handoff_components = handoff.get("components")
+    expected_handoff = {name for name, disposition in COMPONENT_DISPOSITIONS.items() if disposition == "configuration-owned"}
+    if not isinstance(handoff_components, list) or len(handoff_components) != len(expected_handoff) or {item.get("name") for item in handoff_components if isinstance(item, dict)} != expected_handoff:
+        return False
+    if not isinstance(document.get("diagnostic"), str) or not document["diagnostic"] or not isinstance(document.get("log_path"), str) or not document["log_path"].startswith("/"):
+        return False
+    return document.get("failed_step") is None or isinstance(document["failed_step"], str) and bool(document["failed_step"])
+
+
+def _matching_child_result(path: pathlib.Path, *, run_id: str, release: str, log_path: pathlib.Path, child_status: int | None = None) -> bool:
     """Return whether the child result is bound to this admitted run and log."""
     try:
         document = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return False
-    return (
-        isinstance(document, dict)
-        and set(document) == RESULT_FIELDS
-        and document.get("schema") == 1
+    matches = (
+        _valid_result_document(document)
         and document.get("run_id") == run_id
         and document.get("release") == release
         and document.get("log_path") == str(log_path)
     )
+    if not matches:
+        return False
+    return child_status is None or (child_status == 0) == (document.get("outcome") == "succeeded")
 
 
 def _checkout_release(release: str, log) -> tuple[pathlib.Path, pathlib.Path]:
@@ -272,6 +351,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--release", required=True)
     parser.add_argument("--image", type=pathlib.Path, required=True)
     args = parser.parse_args(argv)
+    try:
+        _validate_tag(args.release)
+    except ReleaseError as exc:
+        print("mkchad-release: " + str(exc), file=sys.stderr)
+        return 2
     state_root = _state_root()
     try:
         with _invocation_lock(state_root):
@@ -304,8 +388,9 @@ def main(argv: list[str] | None = None) -> int:
                         ],
                         cwd=deployer.parent.parent,
                         log=log,
+                        timeout=None,
                     )
-                    if _matching_child_result(result_path, run_id=run_id, release=args.release, log_path=log_path):
+                    if _matching_child_result(result_path, run_id=run_id, release=args.release, log_path=log_path, child_status=child_status):
                         os.replace(result_path, latest_result)
                         return child_status
                     diagnostic = "release deployer result does not match the admitted run" if result_path.exists() else "release deployer did not publish a matching terminal result"
@@ -314,6 +399,14 @@ def main(argv: list[str] | None = None) -> int:
                 except ReleaseError as exc:
                     _write_stream(sys.stderr, log, ("mkchad-release: " + str(exc) + "\n").encode())
                     _publish_result(latest_result, _fallback_result(run_id, args.release, started_at, log_path, str(exc)))
+                    return 2
+                except ReleaseInterrupted:
+                    if result_path.exists() and _matching_child_result(result_path, run_id=run_id, release=args.release, log_path=log_path):
+                        os.replace(result_path, latest_result)
+                    else:
+                        result = _fallback_result(run_id, args.release, started_at, log_path, "release deployment interrupted")
+                        result["outcome"] = "interrupted"
+                        _publish_result(latest_result, result)
                     return 2
                 finally:
                     result_path.unlink(missing_ok=True)

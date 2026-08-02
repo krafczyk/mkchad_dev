@@ -40,12 +40,18 @@ class ReleaseLauncherTests(unittest.TestCase):
     def setUp(self):
         self.launcher = load_launcher()
         self.validate_result = load_result_validator()
-        self.root = pathlib.Path(tempfile.mkdtemp(prefix="mkchad-release-test-"))
+        self.root = pathlib.Path(tempfile.mkdtemp(prefix="mkchad-release-test-", dir="/tmp/mkchad-v1"))
         self.home = self.root / "home"
         self.state = self.root / "state"
         self.temp = self.root / "temporary"
         for path in (self.home, self.state, self.temp):
             path.mkdir()
+        self.temp_environment = mock.patch.dict(os.environ, {"TMPDIR": str(self.temp)}, clear=False)
+        self.temp_environment.start()
+        self.addCleanup(self.temp_environment.stop)
+        previous_tempdir = tempfile.tempdir
+        tempfile.tempdir = str(self.temp)
+        self.addCleanup(setattr, tempfile, "tempdir", previous_tempdir)
         self.image = self.root / "image with spaces.sif"
         self.image.write_bytes(b"image")
 
@@ -79,6 +85,7 @@ if capture:
 print('child standard output')
 print('child standard error', file=sys.stderr)
 mode = os.environ.get('MKCHAD_RELEASE_CHILD_MODE', 'success')
+child_exit = int(os.environ.get('MKCHAD_RELEASE_CHILD_EXIT', '0'))
 if mode not in ('missing', 'stale'):
     document = {
         'schema': 1,
@@ -86,8 +93,8 @@ if mode not in ('missing', 'stale'):
         'release': release,
         'started_at': '2026-08-02T12:00:00Z',
         'completed_at': '2026-08-02T12:00:01Z',
-        'outcome': 'succeeded',
-        'phase': 'verify',
+        'outcome': 'unknown' if mode == 'malformed' else ('succeeded' if child_exit == 0 else 'failed'),
+        'phase': 'verify' if child_exit == 0 else 'apply',
         'components': [
             {'name': name, 'disposition': disposition, 'requested_commit': '0' * 40, 'observed_commit': None}
             for name, disposition in [
@@ -107,14 +114,14 @@ if mode not in ('missing', 'stale'):
                 {'name': 'compound-engineering', 'repository': 'git@github.com:krafczyk/compound-engineering-plugin', 'commit': '0' * 40},
             ],
         },
-        'failed_step': None,
-        'diagnostic': 'child completed',
+        'failed_step': None if child_exit == 0 else 'fixture-action',
+        'diagnostic': 'child completed' if child_exit == 0 else 'fixture child failed',
         'log_path': log_path if mode != 'wrong-log' else '/tmp/wrong.log',
     }
     result_path.write_text(json.dumps(document), encoding='utf-8')
 if mode == 'stale':
     pathlib.Path(os.environ['XDG_STATE_HOME']).joinpath('mkchad/deploy/latest-result.json').write_text('{"stale": true}', encoding='utf-8')
-raise SystemExit(int(os.environ.get('MKCHAD_RELEASE_CHILD_EXIT', '0')))
+raise SystemExit(child_exit)
 """,
                 encoding="utf-8",
             )
@@ -172,7 +179,7 @@ raise SystemExit(int(os.environ.get('MKCHAD_RELEASE_CHILD_EXIT', '0')))
         source, remote, _ = self.remote_with_release()
         status, _, _ = self.invoke(remote, release="../main")
         self.assertEqual(status, 2)
-        self.assertEqual(self.latest_result()["outcome"], "failed")
+        self.assertFalse(self.deploy_root.exists())
         status, _, _ = self.invoke(remote, release="missing")
         self.assertEqual(status, 2)
         subprocess.run(["git", "-C", str(source), "branch", "branch-only"], check=True)
@@ -249,15 +256,45 @@ raise SystemExit(int(os.environ.get('MKCHAD_RELEASE_CHILD_EXIT', '0')))
     def test_child_status_and_missing_or_mismatched_results_use_the_right_terminal_result(self):
         _, remote, _ = self.remote_with_release()
         self.assertEqual(self.invoke(remote, child_exit=7)[0], 7)
-        self.assertEqual(self.latest_result()["diagnostic"], "child completed")
+        self.assertEqual(self.latest_result()["outcome"], "failed")
+        self.assertEqual(self.latest_result()["diagnostic"], "fixture child failed")
         self.assertEqual(self.invoke(remote, child_mode="missing", child_exit=9)[0], 9)
         self.assertIn("did not publish", self.latest_result()["diagnostic"])
         self.assertEqual(self.invoke(remote, child_mode="wrong-log")[0], 2)
         self.assertIn("does not match", self.latest_result()["diagnostic"])
         self.assertEqual(self.invoke(remote, child_mode="wrong-run")[0], 2)
         self.assertIn("does not match", self.latest_result()["diagnostic"])
+        self.assertEqual(self.invoke(remote, child_mode="malformed")[0], 2)
+        self.assertIn("does not match", self.latest_result()["diagnostic"])
         self.assertEqual(self.invoke(remote, child_mode="stale")[0], 2)
         self.assertIn("did not publish", self.latest_result()["diagnostic"])
+
+    def test_interruption_promotes_the_run_bound_interrupted_result(self):
+        checkout = self.root / "interrupted-checkout"
+        deployer = checkout / "deploy" / "mkchad_deploy.py"
+        deployer.parent.mkdir(parents=True)
+        deployer.write_text("pass\n", encoding="ascii")
+
+        def interrupt(command, **_kwargs):
+            def value(option):
+                return command[command.index(option) + 1]
+
+            result = self.launcher._fallback_result(
+                value("--run-id"),
+                value("--release"),
+                "2026-08-02T00:00:00Z",
+                pathlib.Path(value("--log-path")),
+                "deployment interrupted",
+            )
+            result["outcome"] = "interrupted"
+            pathlib.Path(value("--result-path")).write_text(json.dumps(result), encoding="utf-8")
+            raise self.launcher.ReleaseInterrupted
+
+        with mock.patch.dict(os.environ, {"HOME": str(self.home), "XDG_STATE_HOME": str(self.state)}, clear=False), mock.patch.object(
+            self.launcher, "_checkout_release", return_value=(checkout, deployer)
+        ), mock.patch.object(self.launcher, "_run", side_effect=interrupt):
+            self.assertEqual(self.launcher.main(["--release", "v1", "--image", str(self.image)]), 2)
+        self.assertEqual(self.latest_result()["outcome"], "interrupted")
 
     def test_contention_does_not_rotate_logs_or_replace_the_result(self):
         import fcntl

@@ -39,7 +39,11 @@ mkdir -p "$canonical/components/msk_containers/bin" "$canonical/components/msk_c
 cat > "$canonical/components/msk_containers/bin/install_nvim.sh" <<'SH'
 #!/usr/bin/env sh
 set -eu
-[ "${1:-}" != --check ] || exit 0
+if [ "${1:-}" = --check ]; then
+  { [ "$#" -eq 1 ] || { [ "$#" -eq 3 ] && [ "$2" = --recovery-dir ] && [ -d "$3" ]; }; } || exit 2
+  exit 0
+fi
+[ "$#" -eq 2 ] && [ "$1" = --recovery-dir ] && [ -d "$2" ] || exit 2
 mkdir -p "$HOME/.local/bin"
 cp container_tools/*.sh nvim/bin/* "$HOME/.local/bin/"
 chmod 755 "$HOME/.local/bin"/*
@@ -48,17 +52,24 @@ cat > "$canonical/components/msk_containers/nvim/bin/nvim" <<'SH'
 #!/usr/bin/env sh
 exit 0
 SH
+cat > "$canonical/components/msk_containers/nvim/bin/nvim_library.sh" <<'SH'
+#!/usr/bin/env sh
+return 0
+SH
 cat > "$canonical/components/msk_containers/nvim/bin/mkchad-opencode-server" <<'SH'
 #!/usr/bin/env sh
-printf '%s\n' '{"schema":1,"ok":true,"command":"status","status":"inactive"}'
+printf '{"schema":1,"ok":true,"command":"status","status":"%s"}\n' "${LIFECYCLE_STATUS:-inactive}"
 SH
 cat > "$canonical/components/msk_containers/nvim/bin/install_nvim_container" <<'SH'
 #!/usr/bin/env sh
 set -eu
-[ "${1:-}" != --dry-run ] || exit 0
-for source; do :; done
+dry_run=0
+if [ "${1:-}" = --dry-run ]; then dry_run=1; shift; fi
+[ "$#" -eq 3 ] && [ "$1" = --source-revision ] && [ "${#2}" -eq 40 ] && [ "${3##*/}" = nvim_container_x86.sif ] || exit 2
+[ "$dry_run" -eq 0 ] || exit "${IMAGE_PREFLIGHT_STATUS:-0}"
+[ "${IMAGE_INSTALL_STATUS:-0}" = 0 ] || exit "$IMAGE_INSTALL_STATUS"
 mkdir -p "$NVIM_CONTAINER_DIR"
-cp "$source" "$NVIM_CONTAINER_DIR/neovim_fixture.sif"
+cp "$3" "$NVIM_CONTAINER_DIR/neovim_fixture.sif"
 ln -sfn neovim_fixture.sif "$NVIM_CONTAINER_DIR/neovim.sif"
 SH
 chmod 755 "$canonical/components/msk_containers/bin/install_nvim.sh" "$canonical/components/msk_containers/nvim/bin/"*
@@ -101,14 +112,46 @@ git -C "$canonical/source" tag v2-fixture
 git clone -q --bare "$canonical/source" "$canonical/release.git"
 git config --global url."file://$canonical/components/".insteadOf git@github.com:krafczyk/
 git config --global url."file://$canonical/release.git".insteadOf git@github.com:krafczyk/mkchad_dev.git
-for _ in 1 2 3 4; do python3 deploy/mkchad_release.py --release v2-fixture --image "$image"; done
+
+if IMAGE_PREFLIGHT_STATUS=7 python3 deploy/mkchad_release.py --release v2-fixture --image "$image"; then exit 1; fi
+if IMAGE_INSTALL_STATUS=7 python3 deploy/mkchad_release.py --release v2-fixture --image "$image"; then exit 1; fi
+python3 deploy/mkchad_release.py --release v2-fixture --image "$image"
+
+printf '%s\n' 'return { updated = true }' > "$canonical/components/mkchad/init.lua"
+git -C "$canonical/components/mkchad" add init.lua
+git -C "$canonical/components/mkchad" -c user.name=test -c user.email=test@example.invalid commit -q -m update
+python3 - "$canonical/source/deploy/release.json" "$canonical/components/mkchad" <<'PY'
+import json
+import pathlib
+import subprocess
+import sys
+
+manifest_path = pathlib.Path(sys.argv[1])
+source = pathlib.Path(sys.argv[2])
+manifest = json.loads(manifest_path.read_text())
+next(component for component in manifest["components"] if component["name"] == "mkchad")["commit"] = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
+manifest_path.write_text(json.dumps(manifest) + "\n")
+PY
+git -C "$canonical/source" add deploy/release.json
+git -C "$canonical/source" -c user.name=test -c user.email=test@example.invalid commit -q -m update
+git -C "$canonical/source" tag v2-fixture-update
+git --git-dir="$canonical/release.git" fetch -q "$canonical/source" refs/tags/v2-fixture-update:refs/tags/v2-fixture-update
+python3 deploy/mkchad_release.py --release v2-fixture-update --image "$image"
+
+printf dirty > "$XDG_CONFIG_HOME/mkchad/untracked-user-work"
+if python3 deploy/mkchad_release.py --release v2-fixture-update --image "$image"; then exit 1; fi
+test "$(cat "$XDG_CONFIG_HOME/mkchad/untracked-user-work")" = dirty
+rm "$XDG_CONFIG_HOME/mkchad/untracked-user-work"
+printf wrong > "$canonical/wrong-image.sif"
+if python3 deploy/mkchad_release.py --release v2-fixture-update --image "$canonical/wrong-image.sif"; then exit 1; fi
+LIFECYCLE_STATUS=healthy python3 deploy/mkchad_release.py --release v2-fixture-update --image "$image"
 test "$(printf '%s\n' "$XDG_STATE_HOME"/mkchad/deploy/logs/*.log | wc -l)" -eq 3
 python3 - "$XDG_STATE_HOME/mkchad/deploy/latest-result.json" <<'PY'
 import json
 import pathlib
 import sys
 value = json.loads(pathlib.Path(sys.argv[1]).read_text())
-assert value["release"] == "v2-fixture"
+assert value["release"] == "v2-fixture-update"
 assert value["outcome"] == "succeeded"
 assert value["diagnostic"] == "deployment verified; configuration is pending"
 assert [action["status"] for action in value["actions"]] == ["succeeded", "succeeded", "skipped-compliant", "skipped-compliant", "succeeded"]
