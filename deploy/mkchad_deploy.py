@@ -2003,7 +2003,12 @@ def classify_recovery_resources(resources: list[dict], components: dict, authori
                     and not any(destination.iterdir())
                 ):
                     continue
-            if resource.get("previous") is None and resource.get("state") == "installed" and _identity(destination) != tuple(resource.get("identity", ())):
+            identity_changed = (
+                resource.get("previous") is None
+                and resource.get("state") == "installed"
+                and _identity(destination) != tuple(resource.get("identity", ()))
+            )
+            if identity_changed and mode != "complete":
                 raise DeploymentError("new checkout identity changed after installation")
             if resource.get("previous") is None and resource.get("state") not in {"pending", "installed"}:
                 raise DeploymentError("new checkout has no valid ownership state")
@@ -2013,7 +2018,11 @@ def classify_recovery_resources(resources: list[dict], components: dict, authori
             try:
                 current = preflight_existing_checkout(destination, active_authority["repository"], resource["intended"], preserved)
             except DeploymentError:
+                if identity_changed:
+                    raise DeploymentError("new checkout identity changed after installation") from None
                 current = classify_checkout_mixture(destination, active_authority["repository"], resource.get("previous"), resource["intended"], preserved)
+            if identity_changed and not current["compliant"]:
+                raise DeploymentError("new checkout identity changed after installation")
             if current["head"] not in {value for value in (resource.get("previous"), resource.get("intended")) if value}:
                 raise DeploymentError("checkout has later edits or unknown recovery state")
         elif kind == "host-tools":

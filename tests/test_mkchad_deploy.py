@@ -675,6 +675,37 @@ class DeploymentValidationTests(unittest.TestCase):
                 with self.assertRaisesRegex(self.deploy.DeploymentError, "unsupported path"):
                     self.deploy._tree_entries(self.root, "b" * 40)
 
+    def test_complete_accepts_exact_recreated_checkout_but_restore_requires_identity(self):
+        data = self.root / "data"
+        destination = data / "mkchad" / "components" / "msk_containers"
+        intended = self.make_checkout(destination, "msk_containers")
+        component = self.release()["components"][0]
+        authority = {
+            "commit": intended,
+            "repository": "github.com/krafczyk/msk_containers",
+            "url": "git@github.com:krafczyk/msk_containers",
+        }
+        recorded_identity = list(self.deploy._identity(destination))
+        recorded_identity[1] += 1
+        resource = {
+            "kind": "checkout",
+            "name": "msk_containers",
+            "previous": None,
+            "intended": intended,
+            "identity": recorded_identity,
+            "state": "installed",
+        }
+        components = {"msk_containers": component}
+        authorities = {"msk_containers": authority}
+        roots = {"xdg_data_home": data}
+
+        self.deploy.classify_recovery_resources([resource], components, authorities, roots, "complete")
+        with self.assertRaisesRegex(self.deploy.DeploymentError, "identity changed"):
+            self.deploy.classify_recovery_resources([resource], components, authorities, roots, "restore")
+        (destination / "tracked").write_text("later edit\n", encoding="ascii")
+        with self.assertRaisesRegex(self.deploy.DeploymentError, "identity changed"):
+            self.deploy.classify_recovery_resources([resource], components, authorities, roots, "complete")
+
     def test_checkout_recovery_completes_and_restores_from_offline_bundle(self):
         data = self.root / "data"
         destination = data / "mkchad" / "components" / "msk_containers"
