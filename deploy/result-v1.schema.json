@@ -2,10 +2,11 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "MkChad terminal deployment result schema 1",
   "type": "object",
-  "required": ["schema", "release", "started_at", "completed_at", "outcome", "phase", "components", "artifact", "actions", "configuration_handoff", "failed_step", "diagnostic", "log_path"],
+  "required": ["schema", "run_id", "release", "started_at", "completed_at", "outcome", "phase", "components", "artifact", "actions", "configuration_handoff", "failed_step", "diagnostic", "log_path"],
   "additionalProperties": false,
   "properties": {
     "schema": {"const": 1},
+    "run_id": {"type": "string", "format": "uuid"},
     "release": {"type": "string", "pattern": "^(?!-)(?!.*\\.\\.)[A-Za-z0-9][A-Za-z0-9._/-]*$"},
     "started_at": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"},
     "completed_at": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"},

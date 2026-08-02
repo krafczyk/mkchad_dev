@@ -660,9 +660,14 @@ def validate_result_v1_document(document: dict) -> dict:
             configuration-handoff, timestamp, or log metadata. This pure
             validator does not read files or alter persistent state.
     """
-    required = {"schema", "release", "started_at", "completed_at", "outcome", "phase", "components", "artifact", "actions", "configuration_handoff", "failed_step", "diagnostic", "log_path"}
+    required = {"schema", "run_id", "release", "started_at", "completed_at", "outcome", "phase", "components", "artifact", "actions", "configuration_handoff", "failed_step", "diagnostic", "log_path"}
     if not isinstance(document, dict) or set(document) != required or document.get("schema") != 1:
         raise DeploymentError("result has unknown or missing fields or an unsupported schema")
+    try:
+        if str(uuid.UUID(document.get("run_id"))) != document["run_id"]:
+            raise ValueError
+    except (AttributeError, TypeError, ValueError):
+        raise DeploymentError("invalid result run id") from None
     if not isinstance(document.get("release"), str) or not re.fullmatch(r"(?!-)(?!.*\.\.)[A-Za-z0-9][A-Za-z0-9._/-]*", document["release"]):
         raise DeploymentError("invalid result release")
     timestamp = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")

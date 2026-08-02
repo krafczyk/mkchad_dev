@@ -1236,6 +1236,7 @@ class DeploymentContractTests(unittest.TestCase):
         release = self.release()
         result = {
             "schema": 1,
+            "run_id": "123e4567-e89b-12d3-a456-426614174000",
             "release": "v2.0.0",
             "started_at": "2026-08-02T12:00:00Z",
             "completed_at": "2026-08-02T12:01:00Z",
@@ -1330,6 +1331,7 @@ class DeploymentContractTests(unittest.TestCase):
 
         for mutate, message in [
             (lambda value: value.__setitem__("schema", 2), "schema"),
+            (lambda value: value.__setitem__("run_id", "not-a-uuid"), "run id"),
             (lambda value: value.__setitem__("environment", {}), "unknown or missing"),
             (lambda value: value["components"].pop(), "components"),
             (lambda value: value["components"][0].__setitem__("requested_commit", "bad"), "commit"),
