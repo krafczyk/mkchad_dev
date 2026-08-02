@@ -277,11 +277,12 @@ class DeploymentValidationTests(unittest.TestCase):
         ]
         with mock.patch.dict(os.environ, {"MKCHAD_CONTAINER_RUNTIME": str(runtime)}), mock.patch.object(
             self.deploy, "_contained_git"
-        ), mock.patch.object(self.deploy, "run_git", side_effect=git_results):
+        ) as contained_git, mock.patch.object(self.deploy, "run_git", side_effect=git_results):
             self.deploy.validate_image_runtime(scope, self.root / "image.sif", artifact, self.root / "msk", "a" * 40, self.root / "opencode", {"url": "remote", "commit": "b" * 40})
 
         self.assertTrue(all("--contain" in command for command in scope.commands))
         self.assertEqual(scope.commands[-1][-4:], ["env", "HOME=/tmp", "opencode", "--version"])
+        self.assertEqual(contained_git.call_args.args[1][-1], "refs/tags/v*:refs/tags/v*")
 
     def test_journal_rejects_future_and_moved_receipts(self):
         state = self.root / "state"

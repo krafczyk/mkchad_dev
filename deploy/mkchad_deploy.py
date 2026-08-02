@@ -1326,7 +1326,7 @@ def validate_image_runtime(scope: SessionScope, staged_image: pathlib.Path, arti
     expected = run_git(["-C", str(staged_msk), "show", f"{msk_commit}:nvim/component-manifest.json"]).stdout
     if json.loads(expected) != manifest:
         raise DeploymentError("image component manifest does not match pinned msk_containers")
-    _contained_git(scope, ["-C", str(staged_opencode), "fetch", "--force", opencode_authority["url"], "refs/tags/v*-mkchad.*:refs/tags/v*-mkchad.*"])
+    _contained_git(scope, ["-C", str(staged_opencode), "fetch", "--force", opencode_authority["url"], "refs/tags/v*:refs/tags/v*"])
     tags = run_git(["-C", str(staged_opencode), "for-each-ref", "--format=%(refname:short)", "--points-at", opencode_authority["commit"], "refs/tags/v*-mkchad.*"]).stdout.splitlines()
     if len(tags) != 1:
         raise DeploymentError("OpenCode gitlink has no unique mkchad release tag")
