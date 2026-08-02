@@ -37,7 +37,7 @@ COMPONENTS = {
     "compound-engineering": "configuration-owned",
     "opencode_sprint_loop": "disabled",
 }
-CONFIGURATION_COMPONENTS = frozenset({"opencode.nvim", "opencode-project-reload", "compound-engineering"})
+CONFIGURATION_COMPONENTS = frozenset(name for name, disposition in COMPONENTS.items() if disposition == "configuration-owned")
 PHASES = ("preflight", "apply", "verify")
 TOKENS = frozenset({"recovery_dir", "staged_image", "component_revision"})
 ARCHITECTURES = frozenset({"x86_64", "aarch64", "ppc64le"})
@@ -324,7 +324,7 @@ def _validate_actions(component: dict, checkout: pathlib.Path):
             entry = os.lstat(path)
         except OSError as exc:
             raise DeploymentError(f"action is absent from the pinned tree: {action['id']}") from exc
-        if not match or match.group(3) != action["path"] or not stat.S_ISREG(entry.st_mode) or stat.S_ISLNK(entry.st_mode) or not entry.st_mode & stat.S_IXUSR or not int(match.group(1), 8) & stat.S_IXUSR:
+        if not match or match.group(3) != action["path"] or not stat.S_ISREG(entry.st_mode) or not entry.st_mode & stat.S_IXUSR or not int(match.group(1), 8) & stat.S_IXUSR:
             raise DeploymentError(f"action is not an executable regular file: {action['id']}")
         if _git(["-C", str(checkout), "hash-object", "--no-filters", str(path)]).stdout.strip() != match.group(2):
             raise DeploymentError(f"action does not match its pinned blob: {action['id']}")
@@ -334,9 +334,16 @@ def _stage_image(source: pathlib.Path, staging: pathlib.Path, artifact: dict, re
     """Copy a matching caller image to the installer-required raw-image name."""
     raw_arch = {"x86_64": "x86", "aarch64": "aarch64", "ppc64le": "ppc64le"}[artifact["architecture"]]
     target = staging / f"neovim_0.0.0_g{revision}_{artifact['sha256']}_{raw_arch}.sif"
-    if not source.is_file() or source.is_symlink() or _digest(source) != artifact["sha256"]:
+    if not source.is_file() or source.is_symlink():
+        raise DeploymentError("caller image is not a regular file")
+    digest = hashlib.sha256()
+    with source.open("rb") as input_file, target.open("xb") as output_file:
+        for block in iter(lambda: input_file.read(1024 * 1024), b""):
+            digest.update(block)
+            output_file.write(block)
+    if digest.hexdigest() != artifact["sha256"]:
+        target.unlink(missing_ok=True)
         raise DeploymentError("caller image digest does not match the release artifact")
-    shutil.copyfile(source, target)
     return target
 
 
@@ -437,15 +444,27 @@ def _complete_compliance(plans: dict[str, tuple[pathlib.Path, dict]], roots: dic
     """Require all checkout, host-tool, and active-image state before verify-only use."""
     if not all(plan["compliant"] for _, plan in plans.values()):
         return False
-    for source in _installer_sources(msk_checkout):
-        target = roots["home"] / ".local" / "bin" / source.name
-        if not target.is_file() or stat.S_IMODE(target.stat().st_mode) != 0o755 or _digest(target) != _digest(source):
-            return False
+    if _host_tool_mismatch(msk_checkout, roots["home"]) is not None:
+        return False
     try:
-        container_dir = pathlib.Path(os.environ.get("NVIM_CONTAINER_DIR", roots["home"] / "containers"))
-        return _digest(container_dir / os.readlink(container_dir / "neovim.sif")) == artifact["sha256"]
+        return _active_image_digest(roots["home"]) == artifact["sha256"]
     except OSError:
         return False
+
+
+def _host_tool_mismatch(msk_checkout: pathlib.Path, home: pathlib.Path) -> str | None:
+    """Return the first installer-owned host tool that differs from its source."""
+    for source in _installer_sources(msk_checkout):
+        target = home / ".local" / "bin" / source.name
+        if not target.is_file() or stat.S_IMODE(target.stat().st_mode) != 0o755 or _digest(target) != _digest(source):
+            return source.name
+    return None
+
+
+def _active_image_digest(home: pathlib.Path) -> str:
+    """Return the digest of the image selected by the active managed link."""
+    container_dir = pathlib.Path(os.environ.get("NVIM_CONTAINER_DIR", home / "containers"))
+    return _digest(container_dir / os.readlink(container_dir / "neovim.sif"))
 
 
 def _result(release: dict, roots: dict[str, pathlib.Path], artifact: dict, run_id: str, tag: str, started_at: str, log_path: pathlib.Path, actions: list[dict], outcome: str, phase: str, failed_step: str | None, diagnostic: str) -> dict:
@@ -479,7 +498,7 @@ def _publish(path: pathlib.Path, document: dict):
 
 def execute_deployment(repo: pathlib.Path, image: pathlib.Path, *, release_tag: str, log_path: pathlib.Path, result_path: pathlib.Path, run_id: str) -> int:
     """Preflight, apply, verify, and report one schema-2 release deployment."""
-    if not TAG.fullmatch(release_tag) or release_tag.startswith("-") or ".." in release_tag or not UUID.fullmatch(run_id):
+    if not TAG.fullmatch(release_tag) or ".." in release_tag or not UUID.fullmatch(run_id):
         raise DeploymentError("invalid launcher handoff")
     started_at, roots, current, phase, failure_step = _timestamp(), _roots(), None, "preflight", "preflight"
     manifest = validate_release_v2_document(_load(repo / "deploy" / "release.json", "release manifest"))
@@ -565,7 +584,7 @@ def execute_deployment(repo: pathlib.Path, image: pathlib.Path, *, release_tag: 
                             shutil.rmtree(temporary)
             for item in actions:
                 if item["phase"] == "apply":
-                    if active or compliant:
+                    if compliant:
                         item["status"] = "skipped-compliant"
                     else:
                         current = item
@@ -590,13 +609,11 @@ def execute_deployment(repo: pathlib.Path, image: pathlib.Path, *, release_tag: 
                 if _existing(plans[name][0], component, staged[name][1])["head"] != component["commit"]:
                     raise DeploymentError(f"deployed checkout is not at its manifest commit: {name}")
             failure_step = "host-tool-verification"
-            for source in _installer_sources(plans["msk_containers"][0]):
-                target = roots["home"] / ".local" / "bin" / source.name
-                if not target.is_file() or stat.S_IMODE(target.stat().st_mode) != 0o755 or _digest(target) != _digest(source):
-                    raise DeploymentError(f"host-tool verification failed: {source.name}")
-            container_dir = pathlib.Path(os.environ.get("NVIM_CONTAINER_DIR", roots["home"] / "containers"))
+            mismatch = _host_tool_mismatch(plans["msk_containers"][0], roots["home"])
+            if mismatch is not None:
+                raise DeploymentError(f"host-tool verification failed: {mismatch}")
             failure_step = "installed-image-verification"
-            if _digest(container_dir / os.readlink(container_dir / "neovim.sif")) != artifact["sha256"]:
+            if _active_image_digest(roots["home"]) != artifact["sha256"]:
                 raise DeploymentError("installed image digest does not match the release artifact")
             _publish(result_path, _result(manifest, roots, artifact, run_id, release_tag, started_at, log_path, actions, "succeeded", phase, None, "deployment verified; configuration is pending"))
             return 0

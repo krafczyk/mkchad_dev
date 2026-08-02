@@ -218,7 +218,7 @@ class DeploymentExecutionTests(unittest.TestCase):
         (source / "init.lua").write_text("return { updated = true }\n", encoding="ascii")
         subprocess.run(["git", "-C", str(source), "add", "init.lua"], check=True)
         subprocess.run(["git", "-C", str(source), "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-q", "-m", "update"], check=True)
-        self.manifest["components"][1]["commit"] = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
+        next(component for component in self.manifest["components"] if component["name"] == "mkchad")["commit"] = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
         self._write_manifest()
         self.assertEqual(self._execute("223e4567-e89b-12d3-a456-426614174000"), 0)
         os.environ["LIFECYCLE_STATUS"] = "healthy"

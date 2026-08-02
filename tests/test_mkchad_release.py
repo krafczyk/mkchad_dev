@@ -1,4 +1,4 @@
-"""Focused tests for the future installed MkChad release launcher."""
+"""Focused tests for the installed MkChad release launcher."""
 
 import contextlib
 import importlib.util
@@ -17,7 +17,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 
 def load_launcher():
-    """Load the future launcher directly from the parent checkout."""
+    """Load the launcher directly from the parent checkout."""
     spec = importlib.util.spec_from_file_location("mkchad_release", ROOT / "deploy/mkchad_release.py")
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
@@ -26,7 +26,7 @@ def load_launcher():
 
 
 def load_result_validator():
-    """Load U1's result validator without changing the active deployment flow."""
+    """Load the deployer's result validator for launcher contract checks."""
     spec = importlib.util.spec_from_file_location("mkchad_deploy_result_contract", ROOT / "deploy/mkchad_deploy.py")
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None

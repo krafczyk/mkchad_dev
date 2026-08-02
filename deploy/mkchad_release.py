@@ -57,7 +57,7 @@ def _timestamp() -> str:
 
 def _validate_tag(tag: str):
     """Reject tag syntax that could select a revision other than one exact tag."""
-    if not TAG.fullmatch(tag) or tag.startswith("-") or ".." in tag or tag.endswith("/"):
+    if not TAG.fullmatch(tag) or ".." in tag or tag.endswith("/"):
         raise ReleaseError("invalid release tag")
 
 
