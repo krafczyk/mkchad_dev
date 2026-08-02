@@ -31,6 +31,8 @@ repository that they apply to.
   safely reloads one project instance.
 - `compound-engineering/`: active Compound Engineering fork for cross-harness
   persona routing and shared global settings.
+- `config_files/`: visible host-specific configuration repository, applied
+  independently of release deployment.
 
 ## Cross-Repository Ownership
 

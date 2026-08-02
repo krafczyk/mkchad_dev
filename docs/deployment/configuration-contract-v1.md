@@ -32,6 +32,11 @@ selected MkChad tree to ignore rather than own both paths.
 
 ## Configuration Phase
 
+The development workspace may include `config_files` as a host-branch
+submodule for inspection and independent maintenance. It is not a release
+component and is excluded from release validation, deployment, receipts, and
+the configuration handoff.
+
 Use the canonical `github.com/krafczyk/config_files` repository on the branch
 matching the target host's short hostname. Its `config_files_scripts` gitlink
 must be checked out at the exact revision recorded by that repository. Review

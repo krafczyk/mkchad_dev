@@ -52,6 +52,7 @@ COMPONENT_DISPOSITIONS = {
     "compound-engineering": "configuration-owned",
     "opencode_sprint_loop": "disabled",
 }
+WORKSPACE_ONLY_SUBMODULES = frozenset({"config_files"})
 DEPLOYED_DESTINATIONS = {
     "msk_containers": ("xdg_data_home", "mkchad/components/msk_containers"),
     "mkchad": ("xdg_config_home", "mkchad"),
@@ -472,18 +473,45 @@ def _gitmodules_at(repo: pathlib.Path, commit: str) -> dict[str, str]:
     return modules
 
 
-def derive_gitlinks(repo: pathlib.Path, commit: str) -> dict[str, dict[str, str]]:
-    """Derive exact child commits and canonical repositories from parent gitlinks."""
+def derive_gitlinks(
+    repo: pathlib.Path,
+    commit: str,
+    *,
+    excluded: frozenset[str] = frozenset(),
+) -> dict[str, dict[str, str]]:
+    """Derive exact child commits and canonical repositories from selected gitlinks.
+
+    Args:
+        repo: Git repository containing the selected commit.
+        commit: Full commit SHA whose ``.gitmodules`` and tree are authoritative.
+        excluded: Workspace-only submodule paths omitted before gitlink and
+            repository validation.
+
+    Returns:
+        Mapping of selected submodule paths to commits, URLs, and canonical
+        repository identities.
+
+    Raises:
+        DeploymentError: If the commit, selected metadata, gitlinks, or
+            repository identities are malformed. The function does not fetch
+            or modify any child repository.
+    """
     if not SHA1.fullmatch(commit):
         raise DeploymentError("parent commit must be a full SHA")
     result = {}
     for path, url in _gitmodules_at(repo, commit).items():
+        if path in excluded:
+            continue
         line = run_git(["ls-tree", commit, "--", path], repo).stdout.strip()
         match = re.fullmatch(r"160000 commit ([0-9a-f]{40})\t(.+)", line)
         if not match or match.group(2) != path:
             raise DeploymentError(f"missing gitlink for {path}")
         result[path] = {"commit": match.group(1), "url": url, "repository": canonical_github_repository(url)}
     return result
+
+
+def _derive_release_gitlinks(repo: pathlib.Path, commit: str) -> dict[str, dict[str, str]]:
+    return derive_gitlinks(repo, commit, excluded=WORKSPACE_ONLY_SUBMODULES)
 
 
 def inspect_git_config(destination: pathlib.Path):
@@ -1572,7 +1600,7 @@ def _release_file(repo: pathlib.Path) -> pathlib.Path:
 def validate_candidate(repo: pathlib.Path, parent_commit: str | None = None) -> tuple[dict, dict]:
     """Validate candidate metadata and derive authority only from parent gitlinks."""
     commit = parent_commit or run_git(["rev-parse", "HEAD"], repo).stdout.strip()
-    gitlinks = derive_gitlinks(repo, commit)
+    gitlinks = _derive_release_gitlinks(repo, commit)
     release = validate_release_document(load_release_json(_release_file(repo)), list(gitlinks))
     return release, gitlinks
 
@@ -2436,7 +2464,7 @@ def recover(
         try:
             repository = retained_parent / "parent.git"
             run_git(["clone", "--mirror", str(bundle / "parent.bundle"), str(repository)])
-            authorities = derive_gitlinks(repository, authority["parent_commit"])
+            authorities = _derive_release_gitlinks(repository, authority["parent_commit"])
         finally:
             shutil.rmtree(retained_parent, ignore_errors=True)
         if authorities != recorded_authorities:

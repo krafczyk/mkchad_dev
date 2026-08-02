@@ -21,3 +21,7 @@
 	path = opencode
 	url = git@github.com:krafczyk/opencode.git
 	branch = custom-task-view
+[submodule "config_files"]
+	path = config_files
+	url = git@github.com:krafczyk/config_files.git
+	branch = schumann

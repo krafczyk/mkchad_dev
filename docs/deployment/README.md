@@ -100,6 +100,9 @@ successful component receipt. The independent configuration phase reviews the
 gitlink-derived configuration-owned revisions, applies and verifies the correct
 `config_files` host branch, and starts the managed service only after status
 agrees with the selected release.
+`config_files` may be visible as a workspace-only submodule for that phase. It
+is not a release component; release validation, deployment, and receipts
+exclude it.
 Machine-observed process-group cleanup and an operator's explicit quiescence
 assertion are recorded separately. Recovery never signals journal PIDs. It
 requires `--confirm-processes-quiesced` only for an `in_progress` record and

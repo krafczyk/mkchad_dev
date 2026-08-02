@@ -111,11 +111,63 @@ class DeploymentValidationTests(unittest.TestCase):
         parsed = self.deploy.load_release_json(release_path)
         self.assertEqual(parsed["schema"], 1)
 
+    def test_config_files_is_workspace_only(self):
+        release = self.deploy.load_release_json(ROOT / "deploy" / "release.json")
+        self.deploy.validate_release_document(release, list(self.deploy.COMPONENT_DISPOSITIONS))
+        self.assertNotIn("config_files", [component["name"] for component in release["components"]])
+        schema = json.loads((ROOT / "deploy" / "release-v1.schema.json").read_text(encoding="utf-8"))
+        component_schema = schema["properties"]["components"]
+        self.assertEqual((component_schema["minItems"], component_schema["maxItems"]), (7, 7))
+        self.assertNotIn("config_files", component_schema["items"]["properties"]["name"]["enum"])
+        self.assertEqual(
+            subprocess.check_output(
+                ["git", "config", "-f", str(ROOT / ".gitmodules"), "--get", "submodule.config_files.url"],
+                text=True,
+            ).strip(),
+            "git@github.com:krafczyk/config_files.git",
+        )
+        self.assertEqual(
+            subprocess.check_output(
+                ["git", "config", "-f", str(ROOT / ".gitmodules"), "--get", "submodule.config_files.branch"],
+                text=True,
+            ).strip(),
+            "schumann",
+        )
+        index_entry = subprocess.check_output(["git", "ls-files", "--stage", "config_files"], cwd=ROOT, text=True).split()
+        self.assertEqual(index_entry[0], "160000")
+
+    def test_release_gitlink_derivation_skips_workspace_only_metadata(self):
+        modules = {
+            "config_files": "not-a-release-repository",
+            "mkchad": "git@github.com:krafczyk/mkchad",
+        }
+        tree = subprocess.CompletedProcess([], 0, "160000 commit " + "b" * 40 + "\tmkchad\n", "")
+        with mock.patch.object(self.deploy, "_gitmodules_at", return_value=modules), mock.patch.object(
+            self.deploy, "run_git", return_value=tree
+        ) as run_git:
+            gitlinks = self.deploy._derive_release_gitlinks(self.root, "a" * 40)
+        self.assertEqual(set(gitlinks), {"mkchad"})
+        run_git.assert_called_once_with(["ls-tree", "a" * 40, "--", "mkchad"], self.root)
+
+    def test_validate_candidate_uses_release_only_gitlinks(self):
+        gitlinks = {
+            name: {"repository": f"github.com/krafczyk/{name}", "url": f"git@github.com:krafczyk/{name}", "commit": format(index, "040x")}
+            for index, name in enumerate(self.deploy.COMPONENT_DISPOSITIONS, 1)
+        }
+        with mock.patch.object(self.deploy, "_derive_release_gitlinks", return_value=gitlinks), mock.patch.object(
+            self.deploy, "_release_file", return_value=self.root / "release.json"
+        ), mock.patch.object(self.deploy, "load_release_json", return_value=self.release()
+        ):
+            release, release_gitlinks = self.deploy.validate_candidate(self.root, "a" * 40)
+        self.assertNotIn("config_files", release_gitlinks)
+        self.assertNotIn("config_files", [component["name"] for component in release["components"]])
+
     def test_configuration_handoff_uses_only_gitlink_derived_pins(self):
         gitlinks = {
             name: {"repository": f"github.com/krafczyk/{name}", "commit": format(index, "040x")}
             for index, name in enumerate(self.deploy.COMPONENT_DISPOSITIONS, 1)
         }
+        self.deploy.validate_release_document(self.release(), list(self.deploy.COMPONENT_DISPOSITIONS))
         handoff = self.deploy.configuration_handoff(self.release(), gitlinks)
         self.assertEqual(handoff["contract_version"], 1)
         self.assertEqual(handoff["guidance"], "docs/deployment/README.md")
@@ -1064,13 +1116,17 @@ ln -sfn "${target##*/}" "$HOME/containers/neovim.sif"
         shutil.copy(ROOT / "deploy" / "receipt-v1.schema.json", parent / "deploy" / "receipt-v1.schema.json")
         (parent / "docs" / "deployment" / "README.md").write_text("fixture guidance\n", encoding="ascii")
         modules = []
-        for name in self.deploy.COMPONENT_DISPOSITIONS:
+        for name in [*self.deploy.COMPONENT_DISPOSITIONS, "config_files"]:
             modules.extend([f'[submodule "{name}"]', f"\tpath = {name}", f"\turl = git@github.com:krafczyk/{name}"])
         (parent / ".gitmodules").write_text("\n".join(modules) + "\n", encoding="utf-8")
         subprocess.run(["git", "init", "-q", str(parent)], check=True)
         subprocess.run(["git", "-C", str(parent), "add", "."], check=True)
         for name, commit in child_commits.items():
             subprocess.run(["git", "-C", str(parent), "update-index", "--add", "--cacheinfo", f"160000,{commit},{name}"], check=True)
+        subprocess.run(
+            ["git", "-C", str(parent), "update-index", "--add", "--cacheinfo", f"160000,{'f' * 40},config_files"],
+            check=True,
+        )
         subprocess.run(["git", "-C", str(parent), "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-q", "-m", "release"], check=True)
         parent_commit = subprocess.check_output(["git", "-C", str(parent), "rev-parse", "HEAD"], text=True).strip()
         evidence = fixture / "verified-release.json"
