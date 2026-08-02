@@ -58,13 +58,22 @@ def _safe_directory(path: pathlib.Path):
         raise BootstrapError("directory must be current-user-owned mode 0700")
 
 
-def _unsafe_writable_ancestor(entry: os.stat_result) -> bool:
-    """Return whether another local user can replace a path through an ancestor."""
+def _unsafe_writable_ancestor(entry: os.stat_result, *, trust_group_writable_ancestors: bool = False) -> bool:
+    """Return whether an untrusted local user can replace an ancestor.
+
+    Args:
+        entry: Metadata for one path ancestor.
+        trust_group_writable_ancestors: Treat group-write access to a
+            current-user-owned ancestor as trusted. World-write and foreign
+            ownership remain unsafe except for root-owned sticky shared roots.
+    """
     if entry.st_uid not in {0, os.getuid()}:
         return True
-    writable = bool(entry.st_mode & 0o022)
-    protected_shared_root = entry.st_uid == 0 and bool(entry.st_mode & stat.S_ISVTX)
-    return writable and not protected_shared_root
+    if entry.st_mode & 0o002:
+        return not (entry.st_uid == 0 and bool(entry.st_mode & stat.S_ISVTX))
+    if entry.st_mode & 0o020:
+        return not (trust_group_writable_ancestors and entry.st_uid == os.getuid())
+    return False
 
 
 def _fsync_directory(path: pathlib.Path):
@@ -76,16 +85,20 @@ def _fsync_directory(path: pathlib.Path):
         os.close(fd)
 
 
-def validate_installed_bootstrap(script: pathlib.Path):
+def validate_installed_bootstrap(script: pathlib.Path, *, trust_group_writable_ancestors: bool = False):
     """Validate the separately provisioned bootstrap path without a digest sidecar.
 
     Args:
         script: Installed bootstrap path that must be absolute, current-user-owned,
             regular, and non-writable by group or other users.
+        trust_group_writable_ancestors: Permit group-write access to
+            current-user-owned ancestors when the operator trusts every
+            principal granted that access.
 
     Raises:
-        BootstrapError: If an ancestor is linked, a user-owned ancestor is writable,
-            or the script is not a safe current-user-owned regular file.
+        BootstrapError: If an ancestor is linked or unsafe under the selected
+            trust mode, or the script is not a safe current-user-owned regular
+            file.
     """
     if not script.is_absolute():
         raise BootstrapError("installed bootstrap path must be absolute")
@@ -95,7 +108,7 @@ def validate_installed_bootstrap(script: pathlib.Path):
         entry = os.lstat(current)
         if stat.S_ISLNK(entry.st_mode) or not stat.S_ISDIR(entry.st_mode):
             raise BootstrapError(f"bootstrap path contains a symlink or non-directory: {current}")
-        if _unsafe_writable_ancestor(entry):
+        if _unsafe_writable_ancestor(entry, trust_group_writable_ancestors=trust_group_writable_ancestors):
             raise BootstrapError(f"bootstrap ancestor is group or world writable: {current}")
     entry = os.lstat(script)
     if not stat.S_ISREG(entry.st_mode) or stat.S_ISLNK(entry.st_mode) or entry.st_uid != os.getuid() or entry.st_mode & 0o022:
@@ -614,7 +627,7 @@ def main(argv: list[str] | None = None) -> int:
         Creates a private temporary checkout for deployment, or invokes the
         retained deployer for recovery. Recovery never contacts a remote.
     """
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0], allow_abbrev=False)
     subcommands = parser.add_subparsers(dest="command")
     recover = subcommands.add_parser("recover")
     recover.add_argument("--deployment-id", required=True)
@@ -626,9 +639,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--development-commit")
     parser.add_argument("--remote", default=DEFAULT_REMOTE)
     parser.add_argument("--image", type=pathlib.Path)
+    parser.add_argument(
+        "--trust-bootstrap-group-writable-ancestors",
+        action="store_true",
+        help="trust group-write access on current-user-owned bootstrap ancestors",
+    )
     args = parser.parse_args(argv)
     try:
-        validate_installed_bootstrap(pathlib.Path(__file__).absolute())
+        validate_installed_bootstrap(
+            pathlib.Path(__file__).absolute(),
+            trust_group_writable_ancestors=args.trust_bootstrap_group_writable_ancestors,
+        )
+        if args.trust_bootstrap_group_writable_ancestors:
+            print(
+                "mkchad-release-bootstrap: warning: trusting every group-class or ACL writer on current-user-owned bootstrap ancestors",
+                file=sys.stderr,
+            )
         if args.command == "recover":
             if args.release or args.expected_parent_commit or args.development_commit or args.image or args.remote != DEFAULT_REMOTE:
                 raise BootstrapError("recover accepts only recovery-specific arguments")

@@ -14,15 +14,25 @@ caller-selected candidate scripts are never release authority.
 The authority-bound candidate exposes these commands:
 
 ```text
-python3 ~/.local/libexec/mkchad-release-bootstrap --release TAG --expected-parent-commit FULL_SHA --image IMAGE
-python3 ~/.local/libexec/mkchad-release-bootstrap --development-commit FULL_SHA --image IMAGE
+python3 ~/.local/libexec/mkchad-release-bootstrap [--trust-bootstrap-group-writable-ancestors] --release TAG --expected-parent-commit FULL_SHA --image IMAGE
+python3 ~/.local/libexec/mkchad-release-bootstrap [--trust-bootstrap-group-writable-ancestors] --development-commit FULL_SHA --image IMAGE
 python3 deploy/mkchad_deploy.py validate-release --release TAG --expected-parent-commit FULL_SHA --image IMAGE
 python3 deploy/mkchad_deploy.py deploy --verified-release EVIDENCE --verified-parent-bundle BUNDLE --image IMAGE
-python3 ~/.local/libexec/mkchad-release-bootstrap recover --deployment-id UUID --mode complete|restore --state-root DIR [--confirm-processes-quiesced]
+python3 ~/.local/libexec/mkchad-release-bootstrap [--trust-bootstrap-group-writable-ancestors] recover --deployment-id UUID --mode complete|restore --state-root DIR [--confirm-processes-quiesced]
 ```
 
 `--state-root` names the canonical mode-`0700` deployment-record directory,
 normally `~/.local/state/mkchad/deployments`.
+
+The bootstrap rejects group- or world-writable path ancestors by default,
+except for root-owned sticky shared roots such as `/tmp`. On a host where a
+current-user-owned ancestor is necessarily group-writable, the operator may
+pass `--trust-bootstrap-group-writable-ancestors` only when every principal
+with group-class or ACL write access to those ancestors is trusted to supply
+the deployment bootstrap. The option changes that invocation's trust boundary
+and emits a warning. It permits only group-write access on current-user-owned
+ancestors; foreign ownership, ordinary world-write access, symlinks,
+non-directories, and a group- or world-writable bootstrap file remain rejected.
 
 No delegated cgroup or service-manager scope is required. Every Git, runtime,
 and installer child starts in a new POSIX session with closed standard input,

@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 import pathlib
+import stat
 import subprocess
 import tempfile
 import unittest
@@ -107,15 +108,48 @@ class BootstrapAuthorityTests(unittest.TestCase):
         script.chmod(0o666)
         with self.assertRaisesRegex(self.bootstrap.BootstrapError, "safe regular"):
             self.bootstrap.validate_installed_bootstrap(script)
+        with self.assertRaisesRegex(self.bootstrap.BootstrapError, "safe regular"):
+            self.bootstrap.validate_installed_bootstrap(script, trust_group_writable_ancestors=True)
         unsafe = self.root / "unsafe"
         unsafe.mkdir()
-        unsafe.chmod(0o777)
+        unsafe.chmod(0o770)
         nested_script = unsafe / "bootstrap.py"
         nested_script.write_text("pass\n", encoding="ascii")
         with self.assertRaisesRegex(self.bootstrap.BootstrapError, "ancestor"):
             self.bootstrap.validate_installed_bootstrap(nested_script)
+        self.bootstrap.validate_installed_bootstrap(nested_script, trust_group_writable_ancestors=True)
+        unsafe.chmod(0o707)
+        with self.assertRaisesRegex(self.bootstrap.BootstrapError, "ancestor"):
+            self.bootstrap.validate_installed_bootstrap(nested_script, trust_group_writable_ancestors=True)
+        linked = self.root / "linked"
+        linked.symlink_to(unsafe, target_is_directory=True)
+        with self.assertRaisesRegex(self.bootstrap.BootstrapError, "symlink"):
+            self.bootstrap.validate_installed_bootstrap(linked / "bootstrap.py", trust_group_writable_ancestors=True)
         foreign = mock.Mock(st_uid=os.getuid() + 1, st_mode=0o040755)
         self.assertTrue(self.bootstrap._unsafe_writable_ancestor(foreign))
+        self.assertTrue(self.bootstrap._unsafe_writable_ancestor(foreign, trust_group_writable_ancestors=True))
+        root_group_writable = mock.Mock(st_uid=0, st_mode=stat.S_IFDIR | 0o770)
+        self.assertTrue(self.bootstrap._unsafe_writable_ancestor(root_group_writable, trust_group_writable_ancestors=True))
+        protected_shared_root = mock.Mock(st_uid=0, st_mode=stat.S_IFDIR | stat.S_ISVTX | 0o777)
+        self.assertFalse(self.bootstrap._unsafe_writable_ancestor(protected_shared_root))
+        self.assertFalse(self.bootstrap._unsafe_writable_ancestor(protected_shared_root, trust_group_writable_ancestors=True))
+
+    def test_group_writable_ancestor_trust_requires_explicit_cli_option(self):
+        with mock.patch.object(self.bootstrap, "validate_installed_bootstrap") as validate, mock.patch("builtins.print") as output:
+            result = self.bootstrap.main(["--trust-bootstrap-group-writable-ancestors"])
+        self.assertEqual(result, 2)
+        validate.assert_called_once_with(pathlib.Path(self.bootstrap.__file__).absolute(), trust_group_writable_ancestors=True)
+        output.assert_any_call(
+            "mkchad-release-bootstrap: warning: trusting every group-class or ACL writer on current-user-owned bootstrap ancestors",
+            file=self.bootstrap.sys.stderr,
+        )
+        with mock.patch.object(self.bootstrap, "validate_installed_bootstrap") as abbreviated_validate, mock.patch.object(
+            self.bootstrap.sys, "stderr"
+        ):
+            with self.assertRaises(SystemExit) as raised:
+                self.bootstrap.main(["--trust"])
+        self.assertEqual(raised.exception.code, 2)
+        abbreviated_validate.assert_not_called()
 
     def test_git_timeout_terminates_the_process_group(self):
         binary = self.root / "bin"
