@@ -2634,14 +2634,14 @@ def _v2_existing_checkout(destination: pathlib.Path, component: dict, staged: pa
         if not item:
             continue
         path = item[3:]
-        nested_tools = component["name"] == "msk_containers" and path == "container_tools"
+        nested_tools = component["name"] == "msk_containers" and path.rstrip("/") == "container_tools"
         if nested_tools:
             continue
         if path not in preserved:
             raise DeploymentError(f"existing checkout has local work: {path}")
         if _v2_git(["check-ignore", "--quiet", "--", path], destination, check=False).returncode:
             raise DeploymentError(f"preserved path is not ignored: {path}")
-        if _v2_git(["cat-file", "-e", f"{component['commit']}:{path}"], destination, check=False).returncode == 0:
+        if _v2_git(["-C", str(staged), "cat-file", "-e", f"{component['commit']}:{path}"], check=False).returncode == 0:
             raise DeploymentError(f"desired component tree owns preserved path: {path}")
     head = _v2_git(["rev-parse", "HEAD"], destination).stdout.strip()
     return {"kind": "existing", "head": head, "compliant": head == component["commit"]}
@@ -2736,8 +2736,9 @@ def _v2_lifecycle(roots: dict[str, pathlib.Path], plans: dict[str, tuple[pathlib
     return payload["status"], True
 
 
-def preflight_release(repo: pathlib.Path, image: pathlib.Path, *, manifest_path: pathlib.Path | None = None, roots: dict[str, pathlib.Path] | None = None, staging_root: pathlib.Path | None = None, lifecycle_timeout: float = V2_LIFECYCLE_TIMEOUT) -> dict:
-    """Stage and validate every schema-2 deployment input before final mutation.
+@contextlib.contextmanager
+def preflight_release_inputs(repo: pathlib.Path, image: pathlib.Path, *, manifest_path: pathlib.Path | None = None, roots: dict[str, pathlib.Path] | None = None, staging_root: pathlib.Path | None = None, lifecycle_timeout: float = V2_LIFECYCLE_TIMEOUT):
+    """Hold complete schema-2 preflight inputs through checkout application.
 
     Args:
         repo: Release checkout containing the default manifest.
@@ -2747,14 +2748,15 @@ def preflight_release(repo: pathlib.Path, image: pathlib.Path, *, manifest_path:
         staging_root: Optional disposable parent for private staging.
         lifecycle_timeout: Status-command timeout, which must exceed 35 seconds.
 
-    Returns:
-        A preflight classification including lifecycle state and whether later
-        units may perform verify-only work.
+    Yields:
+        Preflighted manifest components, bare repositories, destination plans,
+        staged image metadata, and lifecycle classification. The deployment lock
+        remains held while the caller consumes these exact staged inputs.
 
     Raises:
         DeploymentError: If any deployed commit, action, image, destination, or
-        lifecycle state cannot be validated. No final checkout, installer path,
-        or managed image is changed.
+        lifecycle state cannot be validated. Nothing is yielded and no final
+        checkout, installer path, or managed image is changed.
     """
     if lifecycle_timeout <= 35:
         raise DeploymentError("lifecycle timeout must exceed 35 seconds")
@@ -2787,9 +2789,161 @@ def preflight_release(repo: pathlib.Path, image: pathlib.Path, *, manifest_path:
         with UserLock(roots["xdg_state_home"] / "mkchad" / "deployment.lock"):
             lifecycle, verify_only = _v2_lifecycle(roots, plans, deployed["msk_containers"]["_staged"], artifact, lifecycle_timeout)
             _v2_run_preflight_actions(deployed, staged_image, staging)
-        return {"state": "preflighted", "lifecycle": lifecycle, "verify_only": verify_only, "components": {name: plan[1] for name, plan in plans.items()}, "artifact": {"architecture": artifact["architecture"], "sha256": artifact["sha256"]}}
+            yield {
+                "state": "preflighted",
+                "lifecycle": lifecycle,
+                "verify_only": verify_only,
+                "components": deployed,
+                "bare": staged_bare,
+                "plans": plans,
+                "roots": roots,
+                "artifact": artifact,
+            }
     finally:
         shutil.rmtree(staging, ignore_errors=True)
+
+
+def preflight_release(repo: pathlib.Path, image: pathlib.Path, *, manifest_path: pathlib.Path | None = None, roots: dict[str, pathlib.Path] | None = None, staging_root: pathlib.Path | None = None, lifecycle_timeout: float = V2_LIFECYCLE_TIMEOUT) -> dict:
+    """Stage and validate every schema-2 deployment input without applying it.
+
+    Args:
+        repo: Release checkout containing the default manifest.
+        image: Caller-supplied raw SIF file.
+        manifest_path: Optional schema-2 manifest replacing ``deploy/release.json``.
+        roots: Optional named target roots, primarily for isolated tests.
+        staging_root: Optional disposable parent for private staging.
+        lifecycle_timeout: Status-command timeout, which must exceed 35 seconds.
+
+    Returns:
+        A detached preflight classification including lifecycle state and whether
+        a later deployment may perform verify-only work.
+
+    Raises:
+        DeploymentError: If any deployed commit, action, image, destination, or
+        lifecycle state cannot be validated. No final checkout, installer path,
+        or managed image is changed.
+    """
+    with preflight_release_inputs(
+        repo,
+        image,
+        manifest_path=manifest_path,
+        roots=roots,
+        staging_root=staging_root,
+        lifecycle_timeout=lifecycle_timeout,
+    ) as prepared:
+        return {
+            "state": prepared["state"],
+            "lifecycle": prepared["lifecycle"],
+            "verify_only": prepared["verify_only"],
+            "components": {name: plan[1] for name, plan in prepared["plans"].items()},
+            "artifact": {"architecture": prepared["artifact"]["architecture"], "sha256": prepared["artifact"]["sha256"]},
+        }
+
+
+def _v2_prepare_checkout(staged: pathlib.Path, temporary: pathlib.Path, component: dict):
+    """Build one detached exact checkout from its already staged bare repository."""
+    _v2_git(["init", str(temporary)])
+    _v2_git(["-C", str(temporary), "fetch", "--no-tags", str(staged), component["commit"]])
+    _v2_git(["-C", str(temporary), "remote", "add", "origin", component["repository"]])
+    _v2_git(["-C", str(temporary), "checkout", "--detach", "--no-recurse-submodules", component["commit"]])
+
+
+def _v2_verify_checkout(destination: pathlib.Path, component: dict, staged: pathlib.Path):
+    """Verify one final checkout still has the declared origin and exact HEAD."""
+    observed = _v2_existing_checkout(destination, component, staged)
+    if observed["head"] != component["commit"]:
+        raise DeploymentError(f"deployed checkout is not at its manifest commit: {component['name']}")
+    return observed
+
+
+def _v2_apply_checkout(prepared: dict, name: str) -> dict:
+    """Install or detached-update one preflighted component without local repair.
+
+    Existing checkouts are revalidated immediately before their local fetch and
+    checkout. Absent checkouts are prepared in a sibling temporary directory,
+    then renamed only after the final destination absence check.
+    """
+    component = prepared["components"][name]
+    staged = prepared["bare"][name]
+    destination, plan = prepared["plans"][name]
+    if plan["kind"] == "existing":
+        current = _v2_existing_checkout(destination, component, component["_staged"])
+        if current != plan:
+            raise DeploymentError(f"checkout changed after complete preflight: {name}")
+        if current["compliant"]:
+            return {"name": name, "result": "skipped-compliant", "previous_commit": current["head"], "commit": component["commit"]}
+        _v2_git(["-C", str(destination), "fetch", "--no-tags", str(staged), component["commit"]])
+        _v2_git(["-C", str(destination), "checkout", "--detach", "--no-recurse-submodules", component["commit"]])
+        return {"name": name, "result": "updated", "previous_commit": current["head"], "commit": component["commit"]}
+
+    if destination.exists() or destination.is_symlink():
+        # Git may create the uninitialized submodule directory with its parent
+        # checkout. Only that empty placeholder is removed before the nested
+        # checkout receives its independently pinned repository.
+        if name == "container_tools" and destination.is_dir() and not destination.is_symlink():
+            try:
+                destination.rmdir()
+            except OSError as exc:
+                raise DeploymentError(f"nested checkout destination is not empty: {destination}") from exc
+        else:
+            raise DeploymentError(f"destination appeared after complete preflight: {destination}")
+    destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if destination.parent.is_symlink() or not destination.parent.is_dir():
+        raise DeploymentError(f"destination has an invalid parent: {destination}")
+    temporary = pathlib.Path(tempfile.mkdtemp(prefix=f".{name}-", dir=destination.parent))
+    try:
+        _v2_prepare_checkout(staged, temporary, component)
+        if destination.exists() or destination.is_symlink():
+            raise DeploymentError(f"destination appeared before final rename: {destination}")
+        os.rename(temporary, destination)
+    finally:
+        if temporary.exists():
+            shutil.rmtree(temporary)
+    return {"name": name, "result": "installed", "previous_commit": None, "commit": component["commit"]}
+
+
+def verify_preflighted_checkouts(prepared: dict) -> list[dict]:
+    """Verify all deployed checkout origins and exact heads after application.
+
+    Args:
+        prepared: Value yielded by :func:`preflight_release_inputs` while its
+            deployment lock and staged bare repositories remain available.
+
+    Returns:
+        One final observed checkout classification in manifest apply order.
+
+    Raises:
+        DeploymentError: If any deployed destination no longer matches its
+            declared repository or manifest commit. This function does not
+            mutate checkouts.
+    """
+    return [
+        {"name": name, **_v2_verify_checkout(prepared["plans"][name][0], prepared["components"][name], prepared["components"][name]["_staged"])}
+        for name in ("msk_containers", "container_tools", "mkchad")
+    ]
+
+
+def apply_preflighted_checkouts(prepared: dict) -> list[dict]:
+    """Apply and verify the three staged deployed checkouts in fixed order.
+
+    Args:
+        prepared: Value yielded by :func:`preflight_release_inputs` while its
+            deployment lock and staged bare repositories remain available.
+
+    Returns:
+        Per-component apply results in ``msk_containers``, ``container_tools``,
+        then ``mkchad`` order.
+
+    Raises:
+        DeploymentError: On the first checkout failure or final verification
+            mismatch. Earlier successful checkouts remain in their ordinary Git
+            state for an operator repair and rerun; no rollback is attempted.
+    """
+    results = []
+    for name in ("msk_containers", "container_tools", "mkchad"):
+        results.append(_v2_apply_checkout(prepared, name))
+    verify_preflighted_checkouts(prepared)
+    return results
 
 
 def _installer_trust_environment() -> dict[str, str] | None:

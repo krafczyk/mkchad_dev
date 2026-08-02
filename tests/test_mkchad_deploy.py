@@ -1399,6 +1399,197 @@ class DeploymentPreflightTests(unittest.TestCase):
 
 
 
+class DeploymentCheckoutTests(unittest.TestCase):
+    """Exercise exact schema-2 checkout application from held staging inputs."""
+
+    def setUp(self):
+        self.deploy = load_module("mkchad_deploy_checkouts", "deploy/mkchad_deploy.py")
+        self.root = pathlib.Path(tempfile.mkdtemp(prefix="mkchad-v2-checkouts-", dir="/tmp/mkchad-v1"))
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.home = self.root / "home"
+        self.config = self.root / "config"
+        self.data = self.root / "data"
+        self.state = self.root / "state"
+        for path in (self.home, self.config, self.data, self.state):
+            path.mkdir(mode=0o700)
+        self.roots = {"home": self.home, "xdg_config_home": self.config, "xdg_data_home": self.data, "xdg_state_home": self.state}
+        self.binary = self.root / "bin"
+        self.binary.mkdir(mode=0o700)
+        patcher = mock.patch.dict(os.environ, {
+            "HOME": str(self.home), "XDG_CONFIG_HOME": str(self.config), "XDG_DATA_HOME": str(self.data),
+            "XDG_STATE_HOME": str(self.state), "PATH": str(self.binary) + os.pathsep + os.environ["PATH"],
+        })
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.commits = self._sources()
+        self._runtime()
+        self._lifecycle()
+
+    def _commit(self, repository, message, stage=True):
+        if stage:
+            subprocess.run(["git", "-C", str(repository), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(repository), "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-q", "-m", message], check=True)
+        return subprocess.check_output(["git", "-C", str(repository), "rev-parse", "HEAD"], text=True).strip()
+
+    def _repo(self, name, files, executable=()):
+        repository = self.root / "sources" / name
+        repository.mkdir(parents=True)
+        for relative, content in files.items():
+            path = repository / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="ascii")
+            if relative in executable:
+                path.chmod(0o755)
+        subprocess.run(["git", "init", "-q", str(repository)], check=True)
+        return repository, self._commit(repository, "initial")
+
+    def _sources(self):
+        tools, old_tools = self._repo("container_tools", {"tool.sh": "#!/bin/sh\necho old\n"}, {"tool.sh"})
+        (tools / "tool.sh").write_text("#!/bin/sh\necho manifest\n", encoding="ascii")
+        tools_commit = self._commit(tools, "manifest tools")
+        msk, old_msk = self._repo("msk_containers", {
+            "bin/install_nvim.sh": "#!/bin/sh\nexit 0\n", "nvim/bin/install_nvim_container": "#!/bin/sh\nexit 0\n",
+            ".gitmodules": '[submodule "container_tools"]\n\tpath = container_tools\n\turl = git@github.com:krafczyk/container_tools\n',
+        }, {"bin/install_nvim.sh", "nvim/bin/install_nvim_container"})
+        subprocess.run(["git", "-C", str(msk), "update-index", "--add", "--cacheinfo", f"160000,{old_tools},container_tools"], check=True)
+        msk_commit = self._commit(msk, "parent gitlink differs from manifest", stage=False)
+        mkchad, old_mkchad = self._repo("mkchad", {".gitignore": "opencode-server.json\nlazy-lock.json\n", "init.lua": "return { old = true }\n"})
+        (mkchad / "init.lua").write_text("return { manifest = true }\n", encoding="ascii")
+        mkchad_commit = self._commit(mkchad, "manifest mkchad")
+        (self.home / ".gitconfig").write_text("[url \"file://" + str(self.root / "sources") + "/\"]\n\tinsteadOf = git@github.com:krafczyk/\n", encoding="ascii")
+        return {"container_tools": tools_commit, "msk_containers": msk_commit, "mkchad": mkchad_commit,
+                "old_container_tools": old_tools, "old_msk_containers": old_msk, "old_mkchad": old_mkchad}
+
+    def _runtime(self):
+        runtime = self.binary / "apptainer"
+        runtime.write_text("#!/bin/sh\nprintf '%s\\n' x86_64\n", encoding="ascii")
+        runtime.chmod(0o755)
+
+    def _lifecycle(self):
+        launcher = self.home / ".local" / "bin" / "mkchad-opencode-server"
+        launcher.parent.mkdir(parents=True, exist_ok=True)
+        launcher.write_text("#!/bin/sh\nprintf '%s\\n' '{\"schema\": 1, \"ok\": true, \"command\": \"status\", \"status\": \"inactive\"}'\n", encoding="ascii")
+        launcher.chmod(0o755)
+
+    def _manifest(self):
+        manifest = json.loads((ROOT / "tests" / "fixtures" / "deployment" / "release-v2.json").read_text(encoding="utf-8"))
+        for component in manifest["components"]:
+            if component["name"] in self.commits:
+                component["commit"] = self.commits[component["name"]]
+        image = self.root / "image.sif"
+        image.write_bytes(b"fixture sif\n")
+        manifest["artifacts"]["nvim-image"][0]["sha256"] = hashlib.sha256(image.read_bytes()).hexdigest()
+        path = self.root / "release-v2.json"
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        return path, image
+
+    def _destination(self, name):
+        if name == "mkchad":
+            return self.config / "mkchad"
+        base = self.data / "mkchad" / "components" / "msk_containers"
+        return base / "container_tools" if name == "container_tools" else base
+
+    def _checkout(self, name, commit):
+        destination = self._destination(name)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "clone", "-q", str(self.root / "sources" / name), str(destination)], check=True)
+        subprocess.run(["git", "-C", str(destination), "checkout", "-q", "--detach", commit], check=True)
+        subprocess.run(["git", "-C", str(destination), "remote", "set-url", "origin", "git@github.com:krafczyk/" + name], check=True)
+        return destination
+
+    def _prepared(self):
+        manifest, image = self._manifest()
+        return self.deploy.preflight_release_inputs(self.root, image, manifest_path=manifest, roots=self.roots, staging_root=self.root)
+
+    def _head(self, name):
+        return subprocess.check_output(["git", "-C", str(self._destination(name)), "rev-parse", "HEAD"], text=True).strip()
+
+    def test_fresh_apply_installs_manifest_pins_and_verifies_nested_divergence(self):
+        with self._prepared() as prepared:
+            result = self.deploy.apply_preflighted_checkouts(prepared)
+        self.assertEqual([item["name"] for item in result], ["msk_containers", "container_tools", "mkchad"])
+        self.assertEqual([item["result"] for item in result], ["installed", "installed", "installed"])
+        for name in ("msk_containers", "container_tools", "mkchad"):
+            self.assertEqual(self._head(name), self.commits[name])
+            self.assertEqual(subprocess.check_output(["git", "-C", str(self._destination(name)), "config", "--get", "remote.origin.url"], text=True).strip(), "git@github.com:krafczyk/" + name)
+        self.assertNotEqual(self.commits["container_tools"], self.commits["old_container_tools"])
+
+    def test_clean_updates_preserve_declared_mkchad_files_and_rerun_is_noop(self):
+        for name in ("msk_containers", "container_tools", "mkchad"):
+            self._checkout(name, self.commits["old_" + name])
+        preserved = {"opencode-server.json": "private\n", "lazy-lock.json": "{\"lock\": true}\n"}
+        for name, content in preserved.items():
+            (self._destination("mkchad") / name).write_text(content, encoding="ascii")
+        with self._prepared() as prepared:
+            updated = self.deploy.apply_preflighted_checkouts(prepared)
+        self.assertEqual([item["result"] for item in updated], ["updated", "updated", "updated"])
+        self.assertEqual({name: (self._destination("mkchad") / name).read_text(encoding="ascii") for name in preserved}, preserved)
+        with self._prepared() as prepared:
+            repeated = self.deploy.apply_preflighted_checkouts(prepared)
+        self.assertEqual([item["result"] for item in repeated], ["skipped-compliant"] * 3)
+
+    def test_manifest_cannot_overwrite_a_declared_preserved_path(self):
+        source = self.root / "sources" / "mkchad"
+        (source / "opencode-server.json").write_text("release owned\n", encoding="ascii")
+        subprocess.run(["git", "-C", str(source), "add", "-f", "opencode-server.json"], check=True)
+        self.commits["mkchad"] = self._commit(source, "incorrectly own preserved path", stage=False)
+        checkout = self._checkout("mkchad", self.commits["old_mkchad"])
+        preserved = checkout / "opencode-server.json"
+        preserved.write_text("private\n", encoding="ascii")
+        with self.assertRaisesRegex(self.deploy.DeploymentError, "owns preserved path"):
+            with self._prepared():
+                pass
+        self.assertEqual(preserved.read_text(encoding="ascii"), "private\n")
+
+    def test_nested_checkout_is_independently_refused_when_dirty_or_wrong_origin(self):
+        self._checkout("msk_containers", self.commits["msk_containers"])
+        tools = self._checkout("container_tools", self.commits["container_tools"])
+        (tools / "dirty").write_text("no\n", encoding="ascii")
+        with self.assertRaisesRegex(self.deploy.DeploymentError, "local work"):
+            with self._prepared():
+                pass
+        (tools / "dirty").unlink()
+        subprocess.run(["git", "-C", str(tools), "remote", "set-url", "origin", "git@github.com:krafczyk/other"], check=True)
+        with self.assertRaisesRegex(self.deploy.DeploymentError, "wrong origin"):
+            with self._prepared():
+                pass
+
+    def test_failure_retains_earlier_success_and_rerun_completes(self):
+        original = self.deploy._v2_apply_checkout
+
+        def fail_mkchad(prepared, name):
+            if name == "mkchad":
+                raise self.deploy.DeploymentError("forced mkchad failure")
+            return original(prepared, name)
+
+        with self.assertRaisesRegex(self.deploy.DeploymentError, "forced mkchad"):
+            with self._prepared() as prepared, mock.patch.object(self.deploy, "_v2_apply_checkout", side_effect=fail_mkchad):
+                self.deploy.apply_preflighted_checkouts(prepared)
+        self.assertEqual(self._head("msk_containers"), self.commits["msk_containers"])
+        self.assertEqual(self._head("container_tools"), self.commits["container_tools"])
+        self.assertFalse(self._destination("mkchad").exists())
+        with self._prepared() as prepared:
+            result = self.deploy.apply_preflighted_checkouts(prepared)
+        self.assertEqual([item["result"] for item in result], ["skipped-compliant", "skipped-compliant", "installed"])
+
+    def test_destination_appearance_and_interruption_leave_ordinary_git_state(self):
+        original = self.deploy._v2_prepare_checkout
+
+        def appear_then_prepare(staged, temporary, component):
+            original(staged, temporary, component)
+            self._destination(component["name"]).mkdir()
+
+        with self.assertRaisesRegex(self.deploy.DeploymentError, "destination appeared"):
+            with self._prepared() as prepared, mock.patch.object(self.deploy, "_v2_prepare_checkout", side_effect=appear_then_prepare):
+                self.deploy.apply_preflighted_checkouts(prepared)
+        self.assertTrue(self._destination("msk_containers").is_dir())
+        shutil.rmtree(self._destination("msk_containers"))
+        with self.assertRaises(KeyboardInterrupt):
+            with self._prepared() as prepared, mock.patch.object(self.deploy, "_v2_prepare_checkout", side_effect=KeyboardInterrupt):
+                self.deploy.apply_preflighted_checkouts(prepared)
+        self.assertFalse((self.state / "mkchad" / "deploy").exists())
+
+
 class DeploymentContractTests(unittest.TestCase):
     """Exercise the future release manifest and terminal result contracts."""
 
