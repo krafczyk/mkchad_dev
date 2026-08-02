@@ -2505,6 +2505,293 @@ def _roots() -> dict[str, pathlib.Path]:
     return {"home": home, "xdg_config_home": pathlib.Path(os.environ.get("XDG_CONFIG_HOME", home / ".config")), "xdg_data_home": pathlib.Path(os.environ.get("XDG_DATA_HOME", home / ".local/share")), "xdg_state_home": pathlib.Path(os.environ.get("XDG_STATE_HOME", home / ".local/state"))}
 
 
+V2_LIFECYCLE_STATUSES = frozenset({"inactive", "healthy", "degraded", "blocked", "starting", "stopping", "failed"})
+V2_LIFECYCLE_TIMEOUT = 40
+V2_COMMAND_TIMEOUT = 300
+
+
+def _v2_git(argv: list[str], cwd: pathlib.Path | None = None, check: bool = True) -> subprocess.CompletedProcess:
+    """Run one schema-2 staging Git command with hooks disabled.
+
+    The caller's ordinary Git configuration remains available for configured
+    canonical-remote transport.  Deployment-owned staging checkouts never run
+    hooks or templates.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-c", "core.hooksPath=/dev/null", "-c", "init.templateDir=", *argv],
+            cwd=cwd,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=V2_COMMAND_TIMEOUT,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise DeploymentError(f"git staging command failed: {argv[0]}") from exc
+    if check and result.returncode:
+        raise DeploymentError(f"git staging command failed: {argv[0]}")
+    return result
+
+
+def _v2_stage_component(component: dict, staging: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
+    """Fetch one deployed manifest commit into bare storage and a worktree."""
+    name, commit = component["name"], component["commit"]
+    bare = staging / f"{name}.git"
+    worktree = staging / name
+    _v2_git(["init", "--bare", str(bare)])
+    try:
+        _v2_git(["-C", str(bare), "fetch", "--no-tags", component["repository"], commit])
+    except DeploymentError as exc:
+        raise DeploymentError(f"staged component commit is unavailable: {name}") from exc
+    if _v2_git(["-C", str(bare), "cat-file", "-e", commit + "^{commit}"], check=False).returncode:
+        raise DeploymentError(f"staged component commit is unavailable: {name}")
+    _v2_git(["-C", str(bare), "worktree", "add", "--detach", str(worktree), commit])
+    return bare, worktree
+
+
+def _v2_stage_nested_tools(bare: pathlib.Path, destination: pathlib.Path, commit: str) -> pathlib.Path:
+    """Materialize the independently pinned nested tools checkout in staging."""
+    _v2_git(["clone", "--no-checkout", str(bare), str(destination)])
+    _v2_git(["-C", str(destination), "checkout", "--detach", "--no-recurse-submodules", commit])
+    return destination
+
+
+def _v2_validate_action_files(staged: pathlib.Path, component: dict):
+    """Prove each declared action is the pinned executable blob in staging."""
+    commit = component["commit"]
+    for action in component["actions"]:
+        path = action["path"]
+        line = _v2_git(["-C", str(staged), "ls-tree", commit, "--", path]).stdout.strip()
+        match = re.fullmatch(r"([0-7]{6}) blob ([0-9a-f]{40,64})\t(.+)", line)
+        target = staged / path
+        if not match or match.group(3) != path:
+            raise DeploymentError(f"action is absent from the pinned tree: {action['id']}")
+        try:
+            entry = os.lstat(target)
+        except OSError as exc:
+            raise DeploymentError(f"staged action is missing: {action['id']}") from exc
+        if not stat.S_ISREG(entry.st_mode) or stat.S_ISLNK(entry.st_mode) or not entry.st_mode & stat.S_IXUSR or not (int(match.group(1), 8) & stat.S_IXUSR):
+            raise DeploymentError(f"action is not an executable regular file: {action['id']}")
+        blob = _v2_git(["-C", str(staged), "hash-object", "--no-filters", str(target)]).stdout.strip()
+        if blob != match.group(2):
+            raise DeploymentError(f"staged action does not match its pinned blob: {action['id']}")
+
+
+def _v2_stage_image(source: pathlib.Path, staging: pathlib.Path, artifact: dict, msk_commit: str) -> pathlib.Path:
+    """Copy and hash the caller SIF under the installer raw-image filename."""
+    architecture = artifact["architecture"]
+    raw_architecture = {"x86_64": "x86", "aarch64": "aarch64", "ppc64le": "ppc64le"}[architecture]
+    destination = staging / f"neovim_0.0.0_g{msk_commit}_{artifact['sha256']}_{raw_architecture}.sif"
+    try:
+        source_entry = os.lstat(source)
+    except OSError as exc:
+        raise DeploymentError("caller image is unavailable") from exc
+    if not stat.S_ISREG(source_entry.st_mode) or stat.S_ISLNK(source_entry.st_mode):
+        raise DeploymentError("caller image is not a regular file")
+    digest = hashlib.sha256()
+    with source.open("rb") as input_file, destination.open("xb") as output_file:
+        while block := input_file.read(1024 * 1024):
+            digest.update(block)
+            output_file.write(block)
+    os.chmod(destination, 0o600)
+    if digest.hexdigest() != artifact["sha256"]:
+        destination.unlink(missing_ok=True)
+        raise DeploymentError("staged image digest mismatch")
+    return destination
+
+
+def _v2_validate_image_runtime(image: pathlib.Path, architecture: str):
+    """Validate staged-image architecture through the preferred container runtime."""
+    runtime = shutil.which("apptainer") or shutil.which("singularity")
+    if runtime is None:
+        raise DeploymentError("no Apptainer or Singularity runtime is available")
+    try:
+        result = subprocess.run([runtime, "exec", str(image), "uname", "-m"], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=V2_LIFECYCLE_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise DeploymentError("image architecture inspection failed") from exc
+    observed = result.stdout.strip().lower()
+    normalized = {"amd64": "x86_64", "x86": "x86_64", "arm64": "aarch64", "ppc64el": "ppc64le"}.get(observed, observed)
+    if result.returncode or normalized != architecture:
+        raise DeploymentError("staged image architecture does not match the release artifact")
+
+
+def _v2_existing_checkout(destination: pathlib.Path, component: dict, staged: pathlib.Path) -> dict:
+    """Validate a schema-2 existing checkout and its narrowly declared residue."""
+    try:
+        top = _v2_git(["rev-parse", "--show-toplevel"], destination).stdout.strip()
+        if pathlib.Path(top) != destination:
+            raise DeploymentError("destination is not its Git top level")
+        # Inspect the configured origin rather than its transport-expanded URL.
+        origin = _v2_git(["config", "--get", "remote.origin.url"], destination).stdout.strip()
+    except DeploymentError as exc:
+        raise DeploymentError(f"destination is not the expected Git checkout: {destination}") from exc
+    if canonical_github_repository(origin) != canonical_github_repository(component["repository"]):
+        raise DeploymentError("existing checkout has wrong origin")
+    preserved = set(component.get("preserved_paths", ()))
+    status = _v2_git(["status", "--porcelain=v1", "-z", "--ignored=matching", "--untracked-files=all"], destination).stdout.split("\0")
+    for item in status:
+        if not item:
+            continue
+        path = item[3:]
+        nested_tools = component["name"] == "msk_containers" and path == "container_tools"
+        if nested_tools:
+            continue
+        if path not in preserved:
+            raise DeploymentError(f"existing checkout has local work: {path}")
+        if _v2_git(["check-ignore", "--quiet", "--", path], destination, check=False).returncode:
+            raise DeploymentError(f"preserved path is not ignored: {path}")
+        if _v2_git(["cat-file", "-e", f"{component['commit']}:{path}"], destination, check=False).returncode == 0:
+            raise DeploymentError(f"desired component tree owns preserved path: {path}")
+    head = _v2_git(["rev-parse", "HEAD"], destination).stdout.strip()
+    return {"kind": "existing", "head": head, "compliant": head == component["commit"]}
+
+
+def _v2_destination_preflight(roots: dict[str, pathlib.Path], component: dict, staged: pathlib.Path) -> tuple[pathlib.Path, dict]:
+    """Classify one final checkout without creating its path or parents."""
+    destination = resolve_named_destination(roots, component["destination"]["root"], component["destination"]["path"])
+    if destination.exists() or destination.is_symlink():
+        return destination, _v2_existing_checkout(destination, component, staged)
+    parent = destination.parent
+    while not parent.exists() and not parent.is_symlink():
+        parent = parent.parent
+    if parent.is_symlink() or not parent.is_dir():
+        raise DeploymentError(f"destination has an invalid ancestor: {destination}")
+    return destination, {"kind": "absent", "compliant": False}
+
+
+def _v2_expand_action(action: dict, staged_image: pathlib.Path, component: dict, recovery: pathlib.Path) -> list[str]:
+    """Expand a typed preflight action into its fixed executable argument array."""
+    tokens = {"recovery_dir": str(recovery), "staged_image": str(staged_image), "component_revision": component["commit"]}
+    return [str(component["_staged"] / action["path"]), *(argument if isinstance(argument, str) else tokens[argument["token"]] for argument in action["args"])]
+
+
+def _v2_run_preflight_actions(components: dict[str, dict], staged_image: pathlib.Path, staging: pathlib.Path):
+    """Run all manifest preflight actions from disposable staged checkouts."""
+    recovery = pathlib.Path(tempfile.mkdtemp(prefix="recovery-", dir=staging))
+    os.chmod(recovery, 0o700)
+    for component in components.values():
+        for action in component["actions"]:
+            if action["phase"] != "preflight":
+                continue
+            argv = _v2_expand_action(action, staged_image, component, recovery)
+            try:
+                result = subprocess.run(argv, cwd=component["_staged"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=V2_COMMAND_TIMEOUT)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                raise DeploymentError(f"preflight action failed: {component['name']}:{action['id']}") from exc
+            if result.returncode:
+                raise DeploymentError(f"preflight action failed: {component['name']}:{action['id']}")
+
+
+def _v2_managed_paths(roots: dict[str, pathlib.Path], staged_msk: pathlib.Path) -> list[pathlib.Path]:
+    """Return host-tool and image paths whose presence makes a target partial."""
+    paths = [roots["home"] / ".local" / "bin" / source.name for source in installer_owned_sources(staged_msk)]
+    container_dir = pathlib.Path(os.environ.get("NVIM_CONTAINER_DIR", roots["home"] / "containers"))
+    paths.extend((container_dir / "neovim.sif", container_dir / "neovim.previous.sif"))
+    if container_dir.exists():
+        paths.extend(container_dir.glob("neovim_*_g*_*_*.sif"))
+    return paths
+
+
+def _v2_complete_compliance(plans: dict[str, tuple[pathlib.Path, dict]], roots: dict[str, pathlib.Path], staged_msk: pathlib.Path, artifact: dict) -> bool:
+    """Classify exact checkout, host-tool, and active-image agreement for active service handling."""
+    if not all(plan[1]["kind"] == "existing" and plan[1]["compliant"] for plan in plans.values()):
+        return False
+    for source in installer_owned_sources(staged_msk):
+        target = roots["home"] / ".local" / "bin" / source.name
+        try:
+            if not target.is_file() or stat.S_IMODE(target.stat().st_mode) != 0o755 or _digest(target) != _digest(source):
+                return False
+        except OSError:
+            return False
+    try:
+        verify_installed_image(roots["home"], artifact["sha256"])
+    except DeploymentError:
+        return False
+    return True
+
+
+def _v2_lifecycle(roots: dict[str, pathlib.Path], plans: dict[str, tuple[pathlib.Path, dict]], staged_msk: pathlib.Path, artifact: dict, timeout: float) -> tuple[str, bool]:
+    """Validate lifecycle status and return its state with active verify-only permission."""
+    launcher = roots["home"] / ".local" / "bin" / "mkchad-opencode-server"
+    if not launcher.exists() and not launcher.is_symlink():
+        destinations_absent = all(plan[1]["kind"] == "absent" for plan in plans.values())
+        managed_absent = not any(path.exists() or path.is_symlink() for path in _v2_managed_paths(roots, staged_msk))
+        if destinations_absent and managed_absent:
+            return "missing", False
+        raise DeploymentError("partial target has no lifecycle command")
+    if not launcher.is_file() or not os.access(launcher, os.X_OK):
+        raise DeploymentError("lifecycle command is unavailable")
+    try:
+        result = subprocess.run([str(launcher), "status", "--json"], env={**os.environ, "HOME": str(roots["home"]), "XDG_CONFIG_HOME": str(roots["xdg_config_home"]), "XDG_DATA_HOME": str(roots["xdg_data_home"]), "XDG_STATE_HOME": str(roots["xdg_state_home"])}, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+        payload = json.loads(result.stdout)
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
+        raise DeploymentError("managed service status is unavailable or malformed") from exc
+    if result.returncode or not isinstance(payload, dict) or payload.get("schema") != 1 or payload.get("ok") is not True or payload.get("command") != "status" or payload.get("status") not in V2_LIFECYCLE_STATUSES:
+        raise DeploymentError("managed service status is unavailable or malformed")
+    if payload["status"] == "inactive":
+        return "inactive", False
+    if not _v2_complete_compliance(plans, roots, staged_msk, artifact):
+        raise DeploymentError("managed service is active and target is not completely compliant")
+    return payload["status"], True
+
+
+def preflight_release(repo: pathlib.Path, image: pathlib.Path, *, manifest_path: pathlib.Path | None = None, roots: dict[str, pathlib.Path] | None = None, staging_root: pathlib.Path | None = None, lifecycle_timeout: float = V2_LIFECYCLE_TIMEOUT) -> dict:
+    """Stage and validate every schema-2 deployment input before final mutation.
+
+    Args:
+        repo: Release checkout containing the default manifest.
+        image: Caller-supplied raw SIF file.
+        manifest_path: Optional schema-2 manifest replacing ``deploy/release.json``.
+        roots: Optional named target roots, primarily for isolated tests.
+        staging_root: Optional disposable parent for private staging.
+        lifecycle_timeout: Status-command timeout, which must exceed 35 seconds.
+
+    Returns:
+        A preflight classification including lifecycle state and whether later
+        units may perform verify-only work.
+
+    Raises:
+        DeploymentError: If any deployed commit, action, image, destination, or
+        lifecycle state cannot be validated. No final checkout, installer path,
+        or managed image is changed.
+    """
+    if lifecycle_timeout <= 35:
+        raise DeploymentError("lifecycle timeout must exceed 35 seconds")
+    manifest_path = manifest_path or repo / "deploy" / "release.json"
+    release = validate_release_v2_document(load_release_json(manifest_path))
+    roots = roots or _roots()
+    for root in roots.values():
+        _safe_owned_directory(root)
+    parent = staging_root or pathlib.Path(tempfile.gettempdir())
+    _safe_owned_directory(parent)
+    staging = pathlib.Path(tempfile.mkdtemp(prefix="mkchad-preflight-", dir=parent))
+    os.chmod(staging, 0o700)
+    try:
+        deployed = {component["name"]: dict(component) for component in release["components"] if component["disposition"] == "deployed"}
+        staged_bare = {}
+        for component in deployed.values():
+            staged_bare[component["name"]], component["_staged"] = _v2_stage_component(component, staging)
+        nested = deployed["msk_containers"]["_staged"] / "container_tools"
+        if nested.is_symlink() or nested.is_file():
+            nested.unlink()
+        elif nested.exists():
+            shutil.rmtree(nested)
+        _v2_stage_nested_tools(staged_bare["container_tools"], nested, deployed["container_tools"]["commit"])
+        for component in deployed.values():
+            _v2_validate_action_files(component["_staged"], component)
+        artifact = _artifact_for(release)
+        staged_image = _v2_stage_image(image, staging, artifact, deployed["msk_containers"]["commit"])
+        _v2_validate_image_runtime(staged_image, artifact["architecture"])
+        plans = {name: _v2_destination_preflight(roots, component, component["_staged"]) for name, component in deployed.items()}
+        with UserLock(roots["xdg_state_home"] / "mkchad" / "deployment.lock"):
+            lifecycle, verify_only = _v2_lifecycle(roots, plans, deployed["msk_containers"]["_staged"], artifact, lifecycle_timeout)
+            _v2_run_preflight_actions(deployed, staged_image, staging)
+        return {"state": "preflighted", "lifecycle": lifecycle, "verify_only": verify_only, "components": {name: plan[1] for name, plan in plans.items()}, "artifact": {"architecture": artifact["architecture"], "sha256": artifact["sha256"]}}
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
 def _installer_trust_environment() -> dict[str, str] | None:
     """Return the fixed installer trust environment for a scoped deployment."""
     return {"MKCHAD_TRUST_GROUP_WRITABLE_ROOTS": "1"} if _TRUSTED_GROUP_WRITABLE_ROOTS.get() else None

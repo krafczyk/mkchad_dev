@@ -1181,6 +1181,224 @@ ln -sfn "${target##*/}" "$HOME/containers/neovim.sif"
         self.assertEqual(subprocess.check_output(["git", "-C", str(config / "mkchad"), "rev-parse", "HEAD"], text=True).strip(), child_commits["mkchad"])
 
 
+class DeploymentPreflightTests(unittest.TestCase):
+    """Exercise schema-2 staging and preflight without final-path mutation."""
+
+    def setUp(self):
+        self.deploy = load_module("mkchad_deploy_preflight", "deploy/mkchad_deploy.py")
+        self.root = pathlib.Path(tempfile.mkdtemp(prefix="mkchad-v2-preflight-", dir="/tmp/mkchad-v1"))
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.home = self.root / "home"
+        self.config = self.root / "config"
+        self.data = self.root / "data"
+        self.state = self.root / "state"
+        for path in (self.home, self.config, self.data, self.state):
+            path.mkdir(mode=0o700)
+        self.roots = {"home": self.home, "xdg_config_home": self.config, "xdg_data_home": self.data, "xdg_state_home": self.state}
+        self.binary = self.root / "bin"
+        self.binary.mkdir(mode=0o700)
+        environment = {
+            "HOME": str(self.home),
+            "XDG_CONFIG_HOME": str(self.config),
+            "XDG_DATA_HOME": str(self.data),
+            "XDG_STATE_HOME": str(self.state),
+            "PATH": str(self.binary) + os.pathsep + os.environ["PATH"],
+        }
+        patcher = mock.patch.dict(os.environ, environment)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.commits = self._sources()
+
+    def _repo(self, name, files, executable=()):
+        repository = self.root / "sources" / name
+        repository.mkdir(parents=True)
+        for relative, content in files.items():
+            path = repository / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="ascii")
+            if relative in executable:
+                path.chmod(0o755)
+        subprocess.run(["git", "init", "-q", str(repository)], check=True)
+        subprocess.run(["git", "-C", str(repository), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(repository), "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-q", "-m", name], check=True)
+        return subprocess.check_output(["git", "-C", str(repository), "rev-parse", "HEAD"], text=True).strip()
+
+    def _sources(self):
+        msk = self._repo(
+            "msk_containers",
+            {
+                "bin/install_nvim.sh": "#!/bin/sh\n[ \"$1\" = --check ] || exit 2\nexit \"${HOST_PREFLIGHT_STATUS:-0}\"\n",
+                "nvim/bin/install_nvim_container": "#!/bin/sh\n[ \"$1\" = --dry-run ] || exit 2\nexit \"${IMAGE_PREFLIGHT_STATUS:-0}\"\n",
+                "nvim/bin/nvim": "#!/bin/sh\nexit 0\n",
+                "plain.sh": "not executable\n",
+            },
+            {"bin/install_nvim.sh", "nvim/bin/install_nvim_container", "nvim/bin/nvim"},
+        )
+        tools = self._repo("container_tools", {"tool.sh": "#!/bin/sh\nexit 0\n"}, {"tool.sh"})
+        mkchad = self._repo("mkchad", {".gitignore": "opencode-server.json\nlazy-lock.json\n", "init.lua": "return {}\n"})
+        (self.home / ".gitconfig").write_text("[url \"file://" + str(self.root / "sources") + "/\"]\n\tinsteadOf = git@github.com:krafczyk/\n", encoding="ascii")
+        return {"msk_containers": msk, "container_tools": tools, "mkchad": mkchad}
+
+    def _manifest(self, *, mutate=None):
+        manifest = json.loads((ROOT / "tests" / "fixtures" / "deployment" / "release-v2.json").read_text(encoding="utf-8"))
+        for component in manifest["components"]:
+            if component["name"] in self.commits:
+                component["commit"] = self.commits[component["name"]]
+        image = self.root / "image.sif"
+        image.write_bytes(b"fixture sif\n")
+        manifest["artifacts"]["nvim-image"][0]["sha256"] = hashlib.sha256(image.read_bytes()).hexdigest()
+        if mutate:
+            mutate(manifest, image)
+        path = self.root / "release-v2.json"
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        return path, image, manifest
+
+    def _runtime(self, name="apptainer", architecture="x86_64"):
+        runtime = self.binary / name
+        runtime.write_text("#!/bin/sh\nprintf '%s\\n' \"$FAKE_IMAGE_ARCH\"\n", encoding="ascii")
+        runtime.chmod(0o755)
+        os.environ["FAKE_IMAGE_ARCH"] = architecture
+
+    def _lifecycle(self, payload, status=0):
+        launcher = self.home / ".local" / "bin" / "mkchad-opencode-server"
+        launcher.parent.mkdir(parents=True, exist_ok=True)
+        launcher.write_text("#!/bin/sh\nprintf '%s\\n' '" + json.dumps(payload) + "'\nexit " + str(status) + "\n", encoding="ascii")
+        launcher.chmod(0o755)
+        return launcher
+
+    def _checkout(self, name):
+        destination = self.data / "mkchad" / "components" / "msk_containers" / "container_tools" if name == "container_tools" else (self.data / "mkchad" / "components" / "msk_containers" if name == "msk_containers" else self.config / "mkchad")
+        subprocess.run(["git", "clone", "-q", str(self.root / "sources" / name), str(destination)], check=True)
+        subprocess.run(["git", "-C", str(destination), "remote", "set-url", "origin", "git@github.com:krafczyk/" + name], check=True)
+        return destination
+
+    def _preflight(self, **kwargs):
+        manifest, image, _ = self._manifest(**kwargs)
+        return self.deploy.preflight_release(self.root, image, manifest_path=manifest, roots=self.roots, staging_root=self.root)
+
+    def test_schema_2_preflight_is_available_without_checkout_mutation(self):
+        self._runtime()
+        result = self._preflight()
+        self.assertEqual(result["state"], "preflighted")
+        self.assertEqual(result["lifecycle"], "missing")
+        self.assertFalse((self.data / "mkchad" / "components" / "msk_containers").exists())
+        self.assertFalse((self.config / "mkchad").exists())
+
+    def test_staging_rejects_unavailable_commit_and_bad_action_entries(self):
+        self._runtime()
+        with self.assertRaisesRegex(self.deploy.DeploymentError, "unavailable"):
+            self._preflight(mutate=lambda manifest, image: manifest["components"][0].__setitem__("commit", "f" * 40))
+        with self.assertRaisesRegex(self.deploy.DeploymentError, "action path"):
+            self._preflight(mutate=lambda manifest, image: manifest["components"][0]["actions"][0].__setitem__("path", "../outside"))
+        for path, mode, message in [
+            ("missing.sh", None, "absent"),
+            ("plain.sh", None, "executable"),
+            ("link.sh", "symlink", "regular"),
+        ]:
+            with self.subTest(path=path):
+                source = self.root / "sources" / "msk_containers"
+                if mode == "symlink":
+                    target = source / path
+                    target.symlink_to("bin/install_nvim.sh")
+                    subprocess.run(["git", "-C", str(source), "add", path], check=True)
+                    subprocess.run(["git", "-C", str(source), "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-q", "-m", "link"], check=True)
+                    self.commits["msk_containers"] = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
+                with self.assertRaisesRegex(self.deploy.DeploymentError, message):
+                    self._preflight(mutate=lambda manifest, image, path=path: manifest["components"][0]["actions"][0].__setitem__("path", path))
+
+    def test_image_digest_architecture_runtime_and_dry_run_fail_before_targets(self):
+        self._runtime(architecture="aarch64")
+        with self.assertRaisesRegex(self.deploy.DeploymentError, "architecture"):
+            self._preflight()
+        self._runtime(architecture="x86_64")
+        with self.assertRaisesRegex(self.deploy.DeploymentError, "digest"):
+            self._preflight(mutate=lambda manifest, image: manifest["artifacts"]["nvim-image"][0].__setitem__("sha256", "0" * 64))
+        os.environ["IMAGE_PREFLIGHT_STATUS"] = "7"
+        with self.assertRaisesRegex(self.deploy.DeploymentError, "image-install-preflight"):
+            self._preflight()
+        self.assertFalse((self.data / "mkchad" / "components" / "msk_containers").exists())
+
+    def test_runtime_prefers_apptainer_falls_back_to_singularity_and_requires_one(self):
+        image = self.root / "runtime.sif"
+        image.write_bytes(b"x")
+        completed = subprocess.CompletedProcess([], 0, "x86_64\n", "")
+        with mock.patch.object(self.deploy.shutil, "which", side_effect=["/bin/apptainer", "/bin/singularity"]), mock.patch.object(self.deploy.subprocess, "run", return_value=completed) as run:
+            self.deploy._v2_validate_image_runtime(image, "x86_64")
+        self.assertEqual(run.call_args.args[0][0], "/bin/apptainer")
+        with mock.patch.object(self.deploy.shutil, "which", side_effect=[None, "/bin/singularity"]), mock.patch.object(self.deploy.subprocess, "run", return_value=completed) as run:
+            self.deploy._v2_validate_image_runtime(image, "x86_64")
+        self.assertEqual(run.call_args.args[0][0], "/bin/singularity")
+        with mock.patch.object(self.deploy.shutil, "which", return_value=None):
+            with self.assertRaisesRegex(self.deploy.DeploymentError, "no Apptainer"):
+                self.deploy._v2_validate_image_runtime(image, "x86_64")
+
+    def test_destinations_require_expected_clean_checkouts_and_narrow_preservation(self):
+        self._runtime()
+        self._lifecycle({"schema": 1, "ok": True, "command": "status", "status": "inactive"})
+        checkout = self._checkout("mkchad")
+        (checkout / "opencode-server.json").write_text("private\n", encoding="ascii")
+        result = self._preflight()
+        self.assertEqual(result["components"]["mkchad"]["kind"], "existing")
+        (checkout / "untracked").write_text("dirty\n", encoding="ascii")
+        with self.assertRaisesRegex(self.deploy.DeploymentError, "local work"):
+            self._preflight()
+        (checkout / "untracked").unlink()
+        (checkout / "init.lua").write_text("changed\n", encoding="ascii")
+        with self.assertRaisesRegex(self.deploy.DeploymentError, "local work"):
+            self._preflight()
+        subprocess.run(["git", "-C", str(checkout), "checkout", "--", "init.lua"], check=True)
+        subprocess.run(["git", "-C", str(checkout), "remote", "set-url", "origin", "git@github.com:krafczyk/other"], check=True)
+        with self.assertRaisesRegex(self.deploy.DeploymentError, "wrong origin"):
+            self._preflight()
+
+    def test_all_destinations_are_checked_before_preflight_actions(self):
+        self._runtime()
+        marker = self.root / "action-ran"
+        source = self.root / "sources" / "msk_containers" / "bin" / "install_nvim.sh"
+        source.write_text("#!/bin/sh\ntouch '" + str(marker) + "'\nexit 0\n", encoding="ascii")
+        subprocess.run(["git", "-C", str(source.parent.parent), "add", "bin/install_nvim.sh"], check=True)
+        subprocess.run(["git", "-C", str(source.parent.parent), "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-q", "-m", "marker"], check=True)
+        self.commits["msk_containers"] = subprocess.check_output(["git", "-C", str(source.parent.parent), "rev-parse", "HEAD"], text=True).strip()
+        bad = self.config / "mkchad"
+        bad.parent.mkdir(parents=True, exist_ok=True)
+        bad.write_text("not a checkout\n", encoding="ascii")
+        with self.assertRaisesRegex(self.deploy.DeploymentError, "expected Git checkout"):
+            self._preflight()
+        self.assertFalse(marker.exists())
+
+    def test_lock_and_lifecycle_classification_cover_fresh_partial_and_active_targets(self):
+        self._runtime()
+        with self.deploy.UserLock(self.state / "mkchad" / "deployment.lock"):
+            with self.assertRaisesRegex(self.deploy.DeploymentError, "another deployment"):
+                self._preflight()
+        tool = self.home / ".local" / "bin" / "nvim"
+        tool.parent.mkdir(parents=True, exist_ok=True)
+        tool.write_text("partial\n", encoding="ascii")
+        with self.assertRaisesRegex(self.deploy.DeploymentError, "partial target"):
+            self._preflight()
+        tool.unlink()
+        self._lifecycle({"schema": 1, "ok": True, "command": "status", "status": "inactive"})
+        self.assertEqual(self._preflight()["lifecycle"], "inactive")
+        self._lifecycle({"schema": 1, "ok": True, "command": "status", "status": "healthy"})
+        with self.assertRaisesRegex(self.deploy.DeploymentError, "not completely compliant"):
+            self._preflight()
+        with mock.patch.object(self.deploy, "_v2_complete_compliance", return_value=True):
+            self.assertTrue(self._preflight()["verify_only"])
+
+    def test_lifecycle_rejects_malformed_failed_and_timed_out_status(self):
+        self._runtime()
+        for payload, status in [({"schema": 2, "ok": True, "command": "status", "status": "inactive"}, 0), ({"schema": 1, "ok": False, "command": "status", "status": "blocked"}, 1)]:
+            self._lifecycle(payload, status)
+            with self.subTest(payload=payload), self.assertRaisesRegex(self.deploy.DeploymentError, "status"):
+                self._preflight()
+        self._lifecycle({"schema": 1, "ok": True, "command": "status", "status": "inactive"})
+        plans = {name: (self.root / name, {"kind": "absent", "compliant": False}) for name in self.commits}
+        with mock.patch.object(self.deploy.subprocess, "run", side_effect=subprocess.TimeoutExpired(["status"], 40)):
+            with self.assertRaisesRegex(self.deploy.DeploymentError, "status"):
+                self.deploy._v2_lifecycle(self.roots, plans, self.root / "sources" / "msk_containers", {"sha256": "0" * 64}, 40)
+
+
+
 class DeploymentContractTests(unittest.TestCase):
     """Exercise the future release manifest and terminal result contracts."""
 
