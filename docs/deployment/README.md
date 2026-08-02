@@ -12,6 +12,13 @@ install -Dm755 deploy/mkchad_release.py ~/.local/bin/mkchad-release
 mkchad-release --release TAG --image /absolute/path/to/nvim_container_x86.sif
 ```
 
+The caller-owned image may be stored directly under the managed container
+directory. The deployer excludes that exact source path when detecting an
+existing target, installs it under its canonical managed name, and removes the
+original only after the active image digest verifies. Other managed images in
+the directory still require lifecycle validation, and a failed installation
+preserves the caller image for repair and rerun.
+
 The launcher fetches exactly `TAG` from
 `git@github.com:krafczyk/mkchad_dev.git`, checks out that release without
 submodules, and invokes only the deployer in that checkout. It accepts no

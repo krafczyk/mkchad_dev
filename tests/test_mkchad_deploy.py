@@ -313,6 +313,42 @@ class DeploymentExecutionTests(unittest.TestCase):
         self.assertEqual(self._execute("323e4567-e89b-12d3-a456-426614174000"), 2)
         self.assertEqual((mkchad / "init.lua").read_text(encoding="ascii"), "user change\n")
 
+    def test_caller_image_inside_managed_directory_is_not_a_partial_target(self):
+        container_dir = self.home / "containers"
+        container_dir.mkdir()
+        source_image = container_dir / "neovim_x86_g1_fixture_build.sif"
+        self.image = self.image.replace(source_image)
+
+        self.assertEqual(self._execute(), 0)
+        self.assertFalse(source_image.exists())
+        self.assertTrue((container_dir / os.readlink(container_dir / "neovim.sif")).is_file())
+
+    def test_failed_install_preserves_caller_image_inside_managed_directory(self):
+        container_dir = self.home / "containers"
+        container_dir.mkdir()
+        source_image = container_dir / "neovim_x86_g1_fixture_build.sif"
+        self.image = self.image.replace(source_image)
+        os.environ["IMAGE_INSTALL_STATUS"] = "7"
+
+        self.assertEqual(self._execute(), 2)
+        self.assertTrue(source_image.is_file())
+
+    def test_active_canonical_caller_image_is_not_removed(self):
+        self.assertEqual(self._execute(), 0)
+        container_dir = self.home / "containers"
+        active_image = container_dir / os.readlink(container_dir / "neovim.sif")
+        self.image = active_image
+
+        self.assertEqual(self._execute("223e4567-e89b-12d3-a456-426614174000"), 0)
+        self.assertTrue(active_image.is_file())
+
+    def test_other_image_inside_managed_directory_remains_a_partial_target(self):
+        container_dir = self.home / "containers"
+        container_dir.mkdir()
+        (container_dir / "neovim_x86_g1_existing_build.sif").write_bytes(b"existing image\n")
+
+        self.assertEqual(self._execute(), 2)
+
     def test_existing_config_only_target_bootstraps_lifecycle_and_preserves_lazy_lock(self):
         mkchad = self._destination("mkchad")
         mkchad.parent.mkdir(parents=True, exist_ok=True)

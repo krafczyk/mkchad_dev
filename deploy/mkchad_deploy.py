@@ -441,14 +441,15 @@ def _installer_sources(msk_checkout: pathlib.Path) -> list[pathlib.Path]:
     return sorted(paths, key=lambda path: path.name)
 
 
-def _managed_paths(roots: dict[str, pathlib.Path], msk_checkout: pathlib.Path) -> list[pathlib.Path]:
-    """Return installer-owned paths whose presence makes a target non-fresh."""
+def _managed_paths(roots: dict[str, pathlib.Path], msk_checkout: pathlib.Path, caller_image: pathlib.Path) -> list[pathlib.Path]:
+    """Return pre-existing installer-owned paths, excluding the caller artifact."""
     paths = [roots["home"] / ".local" / "bin" / source.name for source in _installer_sources(msk_checkout)]
     container_dir = pathlib.Path(os.environ.get("NVIM_CONTAINER_DIR", roots["home"] / "containers"))
     paths.extend((container_dir / "neovim.sif", container_dir / "neovim.previous.sif"))
     if container_dir.exists():
         paths.extend(container_dir.glob("neovim_*_g*_*_*.sif"))
-    return paths
+    caller_image = pathlib.Path(os.path.abspath(caller_image))
+    return [path for path in paths if pathlib.Path(os.path.abspath(path)) != caller_image]
 
 
 def _complete_compliance(plans: dict[str, tuple[pathlib.Path, dict]], roots: dict[str, pathlib.Path], msk_checkout: pathlib.Path, artifact: dict) -> bool:
@@ -476,6 +477,23 @@ def _active_image_digest(home: pathlib.Path) -> str:
     """Return the digest of the image selected by the active managed link."""
     container_dir = pathlib.Path(os.environ.get("NVIM_CONTAINER_DIR", home / "containers"))
     return _digest(container_dir / os.readlink(container_dir / "neovim.sif"))
+
+
+def _consume_caller_image(source: pathlib.Path, roots: dict[str, pathlib.Path], expected_digest: str):
+    """Remove a co-located caller artifact after its managed image is verified."""
+    source = pathlib.Path(os.path.abspath(source))
+    container_dir = pathlib.Path(os.environ.get("NVIM_CONTAINER_DIR", roots["home"] / "containers"))
+    try:
+        container_dir = container_dir.resolve(strict=True)
+        if source.parent.resolve(strict=True) != container_dir:
+            return
+        if source.is_symlink() or not source.is_file() or _digest(source) != expected_digest:
+            raise DeploymentError("caller image changed before it could be consumed")
+        active = (container_dir / os.readlink(container_dir / "neovim.sif")).resolve(strict=True)
+        if source.resolve(strict=True) != active:
+            source.unlink()
+    except OSError as exc:
+        raise DeploymentError("caller image could not be consumed after verified installation") from exc
 
 
 def _result(release: dict, roots: dict[str, pathlib.Path], artifact: dict, run_id: str, tag: str, started_at: str, log_path: pathlib.Path, actions: list[dict], outcome: str, phase: str, failed_step: str | None, diagnostic: str) -> dict:
@@ -570,7 +588,7 @@ def execute_deployment(repo: pathlib.Path, image: pathlib.Path, *, release_tag: 
                 if not isinstance(payload, dict) or payload.get("schema") != 1 or payload.get("ok") is not True or payload.get("command") != "status" or payload.get("status") not in {"inactive", "healthy", "degraded", "blocked", "starting", "stopping", "failed"}:
                     raise DeploymentError("managed service status is unavailable or malformed")
                 active = payload["status"] != "inactive"
-            elif any(path.exists() or path.is_symlink() for path in _managed_paths(roots, staged["msk_containers"][1])):
+            elif any(path.exists() or path.is_symlink() for path in _managed_paths(roots, staged["msk_containers"][1], image)):
                 raise DeploymentError("partial target has no lifecycle command")
             recovery = staging / "recovery"
             recovery.mkdir(mode=0o700)
@@ -648,6 +666,8 @@ def execute_deployment(repo: pathlib.Path, image: pathlib.Path, *, release_tag: 
             failure_step = "installed-image-verification"
             if _active_image_digest(roots["home"]) != artifact["sha256"]:
                 raise DeploymentError("installed image digest does not match the release artifact")
+            failure_step = "caller-image-consumption"
+            _consume_caller_image(image, roots, artifact["sha256"])
             _publish(result_path, _result(manifest, roots, artifact, run_id, release_tag, started_at, log_path, actions, "succeeded", phase, None, "deployment verified; configuration is pending"))
             return 0
     except KeyboardInterrupt:
