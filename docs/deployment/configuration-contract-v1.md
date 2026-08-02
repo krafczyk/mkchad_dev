@@ -23,9 +23,12 @@ these meanings:
 - `opencode_sprint_loop` is frozen and disabled. Do not install or migrate it as
   part of this release.
 
-The `mkchad` checkout preserves only `opencode-server.json` as a
-configuration-owned path. It may be absent, the expected legacy link, or a
-current-user-owned regular file. Deployment does not read its contents.
+The `mkchad` checkout preserves `opencode-server.json` as a configuration-owned
+path and `lazy-lock.json` as generated plugin state. The server configuration
+may be absent, the expected legacy link, or a current-user-owned mode-`0600`
+regular file. The generated lock may be absent or a current-user-owned regular
+file with mode `0600` or `0644`. Deployment reads neither file and requires the
+selected MkChad tree to ignore rather than own both paths.
 
 ## Configuration Phase
 

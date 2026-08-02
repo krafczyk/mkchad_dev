@@ -355,14 +355,26 @@ class DeploymentValidationTests(unittest.TestCase):
 
     def test_preserved_mkchad_path_accepts_only_expected_link_or_private_file(self):
         checkout = self.root / "preserved"
-        commit = self.make_checkout(checkout, "mkchad", {".gitignore": "opencode-server.json\n"})
+        commit = self.make_checkout(checkout, "mkchad", {"tracked": "content\n"})
+        preserved_paths = {"opencode-server.json", "lazy-lock.json"}
         preserved = checkout / "opencode-server.json"
         preserved.symlink_to("../../config_files/.config/mkchad/opencode-server.json")
-        self.deploy.preflight_existing_checkout(checkout, "github.com/krafczyk/mkchad", commit, {"opencode-server.json"})
+        lazy_lock = checkout / "lazy-lock.json"
+        lazy_lock.write_text("{}\n", encoding="ascii")
+        lazy_lock.chmod(0o644)
+        self.deploy.preflight_existing_checkout(checkout, "github.com/krafczyk/mkchad", commit, preserved_paths)
         preserved.unlink()
         preserved.symlink_to("/tmp/unexpected")
         with self.assertRaisesRegex(self.deploy.DeploymentError, "unexpected legacy link"):
-            self.deploy.preflight_existing_checkout(checkout, "github.com/krafczyk/mkchad", commit, {"opencode-server.json"})
+            self.deploy.preflight_existing_checkout(checkout, "github.com/krafczyk/mkchad", commit, preserved_paths)
+        preserved.unlink()
+        preserved.write_text("{}\n", encoding="ascii")
+        preserved.chmod(0o600)
+        lazy_lock.chmod(0o666)
+        with self.assertRaisesRegex(self.deploy.DeploymentError, "generated lock"):
+            self.deploy.preflight_existing_checkout(checkout, "github.com/krafczyk/mkchad", commit, preserved_paths)
+        with self.assertRaisesRegex(self.deploy.DeploymentError, "generated lock"):
+            self.deploy.classify_checkout_mixture(checkout, "github.com/krafczyk/mkchad", commit, commit, preserved_paths)
 
     def test_pinned_tree_owns_executable_actions_and_configuration_pin(self):
         msk = self.root / "action-tree"

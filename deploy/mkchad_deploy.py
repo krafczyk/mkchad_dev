@@ -63,6 +63,7 @@ MSK_ACTION_CONTRACT = [
 ]
 LEGACY_MKCHAD_REVISION = "e91cbc39224d0637d9da59e1500cce6a355191c2"
 FORBIDDEN_AUTHORITY_ALIASES = {"trust", "signer", "signature", "fingerprint", "verified_release"}
+MKCHAD_PRESERVED_PATHS = frozenset({"opencode-server.json", "lazy-lock.json"})
 
 
 class DeploymentError(RuntimeError):
@@ -470,11 +471,46 @@ def _identity(path: pathlib.Path):
     return (entry.st_dev, entry.st_ino, entry.st_uid, stat.S_IFMT(entry.st_mode))
 
 
+def _validate_preserved_path(destination: pathlib.Path, path: str):
+    """Require one declared MkChad-owned exception to retain its safe shape."""
+    candidate = destination / path
+    entry = os.lstat(candidate)
+    if entry.st_uid != os.getuid():
+        raise DeploymentError(f"preserved path is unsafe: {path}")
+    if path == "opencode-server.json":
+        if stat.S_ISLNK(entry.st_mode):
+            target = os.readlink(candidate)
+            if not target.endswith("config_files/.config/mkchad/opencode-server.json"):
+                raise DeploymentError(f"preserved path has an unexpected legacy link: {path}")
+        elif not stat.S_ISREG(entry.st_mode) or stat.S_IMODE(entry.st_mode) != 0o600:
+            raise DeploymentError(f"preserved path is not a private regular file: {path}")
+        return
+    if path == "lazy-lock.json":
+        if not stat.S_ISREG(entry.st_mode) or stat.S_IMODE(entry.st_mode) not in {0o600, 0o644}:
+            raise DeploymentError("preserved generated lock is not a safe regular file")
+        return
+    raise DeploymentError(f"unsupported preserved path: {path}")
+
+
 def preflight_existing_checkout(destination: pathlib.Path, expected_repository: str, expected_commit: str, preserved: set[str] | None = None) -> dict:
     """Validate an existing checkout before an exact detached update or no-op.
 
-    Ignored and untracked paths block except the explicitly declared MkChad
-    ``opencode-server.json`` preservation path.  Linked worktrees, external Git
+    Args:
+        destination: Existing persistent component checkout.
+        expected_repository: Canonical repository identity required for origin.
+        expected_commit: Intended full commit SHA.
+        preserved: Declared ignored paths whose type, owner, and mode are
+            validated without reading their contents.
+
+    Returns:
+        Immutable preflight identity, current HEAD, and compliance result.
+
+    Raises:
+        DeploymentError: If repository identity, Git state, local paths, or a
+        preserved path cannot be proven safe. The function changes no files.
+
+    Ignored and untracked paths block except explicitly declared MkChad
+    configuration and generated-state paths. Linked worktrees, external Git
     dirs, wrong origins, unsafe local configuration, and tracked local changes
     all fail before the caller may mutate the checkout.
     """
@@ -504,16 +540,7 @@ def preflight_existing_checkout(destination: pathlib.Path, expected_repository: 
         path = line[3:]
         if path not in preserved:
             raise DeploymentError(f"existing checkout has local work: {path}")
-        candidate = destination / path
-        entry = os.lstat(candidate)
-        if entry.st_uid != os.getuid():
-            raise DeploymentError(f"preserved path is unsafe: {path}")
-        if stat.S_ISLNK(entry.st_mode):
-            target = os.readlink(candidate)
-            if not target.endswith("config_files/.config/mkchad/opencode-server.json"):
-                raise DeploymentError(f"preserved path has an unexpected legacy link: {path}")
-        elif not stat.S_ISREG(entry.st_mode) or stat.S_IMODE(entry.st_mode) != 0o600:
-            raise DeploymentError(f"preserved path is not a private regular file: {path}")
+        _validate_preserved_path(destination, path)
     head = run_git(["rev-parse", "HEAD"], destination).stdout.strip()
     return {"kind": "existing", "identity": before, "head": head, "compliant": head == expected_commit}
 
@@ -568,7 +595,22 @@ def _worktree_entry(repository: pathlib.Path, path: str, candidates: set[tuple[s
 
 
 def classify_checkout_mixture(destination: pathlib.Path, expected_repository: str, previous: str | None, intended: str, preserved: set[str]) -> dict:
-    """Accept only index/worktree entries drawn from the old or intended tree."""
+    """Classify a recovery checkout containing only old or intended tree state.
+
+    Args:
+        destination: Existing persistent component checkout.
+        expected_repository: Canonical repository identity required for origin.
+        previous: Recorded pre-deployment commit, when one existed.
+        intended: Release commit selected by the recovery authority.
+        preserved: Declared ignored paths validated independently of Git trees.
+
+    Returns:
+        Mixed-state checkout identity and current HEAD for recovery planning.
+
+    Raises:
+        DeploymentError: If the checkout contains third-state Git content,
+        unrelated local work, or an unsafe preserved path. No files are changed.
+    """
     if previous is None:
         raise DeploymentError("new checkout has unclassifiable local work")
     _safe_owned_directory(destination)
@@ -588,9 +630,14 @@ def classify_checkout_mixture(destination: pathlib.Path, expected_repository: st
             raise DeploymentError(f"checkout index has third-state content: {path}")
         if _worktree_entry(destination, path, allowed) not in allowed:
             raise DeploymentError(f"checkout worktree has third-state content: {path}")
-    for line in run_git(["status", "--porcelain=v1", "-z", "--untracked-files=all"], destination).stdout.split("\0"):
-        if line and line[3:] not in preserved and line[3:] not in set(old_entries) | set(new_entries):
-            raise DeploymentError(f"checkout mixture contains unrelated local work: {line[3:]}")
+    for line in run_git(["status", "--porcelain=v1", "-z", "--ignored=matching", "--untracked-files=all"], destination).stdout.split("\0"):
+        if not line:
+            continue
+        path = line[3:]
+        if path in preserved:
+            _validate_preserved_path(destination, path)
+        elif path not in set(old_entries) | set(new_entries):
+            raise DeploymentError(f"checkout mixture contains unrelated local work: {path}")
     return {"kind": "mixed", "identity": _identity(destination), "head": run_git(["rev-parse", "HEAD"], destination).stdout.strip(), "compliant": False}
 
 
@@ -728,7 +775,7 @@ def transactional_git_checkout(destination: pathlib.Path, target_commit: str, sc
 
 def preflight_component_destination(destination: pathlib.Path, component: dict, authority: dict, staged: pathlib.Path) -> dict:
     """Build an immutable destination plan before any component is changed."""
-    preserved = {"opencode-server.json"} if component["name"] == "mkchad" else set()
+    preserved = MKCHAD_PRESERVED_PATHS if component["name"] == "mkchad" else set()
     for path in preserved:
         tracked = run_git(["-C", str(staged), "cat-file", "-e", f"{authority['commit']}:{path}"], check=False)
         if tracked.returncode == 0:
@@ -1576,7 +1623,7 @@ def _no_replace_rename(source: pathlib.Path, destination: pathlib.Path):
 def install_or_update_component(destination: pathlib.Path, staged: pathlib.Path, component: dict, authority: dict, journal: DeploymentJournal, scope: SessionScope, preflight: dict):
     """Install an absent checkout or detached-update a preflighted clean checkout."""
     commit, repository = authority["commit"], authority["repository"]
-    preserved = {"opencode-server.json"} if component["name"] == "mkchad" else set()
+    preserved = MKCHAD_PRESERVED_PATHS if component["name"] == "mkchad" else set()
     if preflight["kind"] == "existing":
         current = preflight_existing_checkout(destination, repository, commit, preserved)
         if current != preflight:
@@ -1951,7 +1998,7 @@ def classify_recovery_resources(resources: list[dict], components: dict, authori
                 raise DeploymentError("new checkout has no valid ownership state")
             if resource.get("previous") is None and resource.get("state") == "pending" and mode == "restore":
                 raise DeploymentError("pending checkout ownership is ambiguous; restore cannot finalize")
-            preserved = {"opencode-server.json"} if name == "mkchad" else set()
+            preserved = MKCHAD_PRESERVED_PATHS if name == "mkchad" else set()
             try:
                 current = preflight_existing_checkout(destination, active_authority["repository"], resource["intended"], preserved)
             except DeploymentError:
@@ -2201,7 +2248,7 @@ def deploy(repo: pathlib.Path, verified_release: pathlib.Path, verified_parent_b
                     if component["disposition"] != "deployed":
                         continue
                     destination = destinations[component["name"]]
-                    preserved = {"opencode-server.json"} if component["name"] == "mkchad" else set()
+                    preserved = MKCHAD_PRESERVED_PATHS if component["name"] == "mkchad" else set()
                     final_checkout = preflight_existing_checkout(destination, gitlinks[component["name"]]["repository"], gitlinks[component["name"]]["commit"], preserved)
                     if not final_checkout["compliant"]:
                         raise DeploymentError(f"component verification failed: {component['name']}")
@@ -2534,7 +2581,7 @@ def recover_checkout_resource(resource: dict, mode: str, component: dict, author
     other = resource.get("previous") if mode == "complete" else resource.get("intended")
     git_bundle = bundle / ((bundle_name or name.replace(".", "-")) + ".bundle")
     _regular_owned(git_bundle, 0o600)
-    preserved = {"opencode-server.json"} if name == "mkchad" else set()
+    preserved = MKCHAD_PRESERVED_PATHS if name == "mkchad" else set()
     if bundle_name == "container-tools" and resource.get("previous") is None and resource.get("state") == "pending" and destination.is_dir() and not destination.is_symlink() and not any(destination.iterdir()):
         if mode == "restore":
             return {"name": name, "result": "parent-owned-placeholder-preserved", "revision": None}
