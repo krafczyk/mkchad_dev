@@ -46,6 +46,11 @@ An inactive service is required for mutation. When every checkout, host tool,
 and image already complies, an active service is allowed for a verify-only
 rerun. The omitted apply actions are recorded as `skipped-compliant`.
 
+An existing clean component checkout does not require the lifecycle launcher to
+be preinstalled when no managed host tool or image exists yet. Deployment treats
+that configuration-only state as inactive, installs the pinned host tools, and
+then verifies the lifecycle and remaining release state normally.
+
 If an action fails, prior successful changes remain. Repair the reported step
 and rerun the same command; no rollback or recovery command exists.
 

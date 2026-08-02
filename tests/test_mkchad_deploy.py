@@ -189,8 +189,13 @@ class DeploymentExecutionTests(unittest.TestCase):
             },
             {"bin/install_nvim.sh", "nvim/bin/nvim", "nvim/bin/nvim_library.sh", "nvim/bin/mkchad-opencode-server", "nvim/bin/install_nvim_container"},
         )
-        mkchad = self._repo("mkchad", {".gitignore": "opencode-server.json\nlazy-lock.json\n", "init.lua": "return {}\n"})
-        return {"msk_containers": msk, "container_tools": tools, "mkchad": mkchad}
+        old_mkchad = self._repo("mkchad", {".gitignore": "opencode-server.json\n", "init.lua": "return {}\n"})
+        mkchad_source = self.root / "sources" / "mkchad"
+        (mkchad_source / ".gitignore").write_text("opencode-server.json\nlazy-lock.json\n", encoding="ascii")
+        subprocess.run(["git", "-C", str(mkchad_source), "add", ".gitignore"], check=True)
+        subprocess.run(["git", "-C", str(mkchad_source), "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-q", "-m", "ignore generated lock"], check=True)
+        mkchad = subprocess.check_output(["git", "-C", str(mkchad_source), "rev-parse", "HEAD"], text=True).strip()
+        return {"msk_containers": msk, "container_tools": tools, "mkchad": mkchad, "old_mkchad": old_mkchad}
 
     def _write_manifest(self):
         (self.repo / "deploy" / "release.json").write_text(json.dumps(self.manifest), encoding="utf-8")
@@ -307,6 +312,20 @@ class DeploymentExecutionTests(unittest.TestCase):
         (mkchad / "init.lua").write_text("user change\n", encoding="ascii")
         self.assertEqual(self._execute("323e4567-e89b-12d3-a456-426614174000"), 2)
         self.assertEqual((mkchad / "init.lua").read_text(encoding="ascii"), "user change\n")
+
+    def test_existing_config_only_target_bootstraps_lifecycle_and_preserves_lazy_lock(self):
+        mkchad = self._destination("mkchad")
+        mkchad.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "clone", "-q", str(self.root / "sources" / "mkchad"), str(mkchad)], check=True)
+        subprocess.run(["git", "-C", str(mkchad), "checkout", "-q", "--detach", self.commits["old_mkchad"]], check=True)
+        subprocess.run(["git", "-C", str(mkchad), "remote", "set-url", "origin", "git@github.com:krafczyk/mkchad"], check=True)
+        lazy_lock = mkchad / "lazy-lock.json"
+        lazy_lock.write_text('{"plugins": {}}\n', encoding="ascii")
+
+        self.assertEqual(self._execute(), 0)
+
+        self.assertEqual(lazy_lock.read_text(encoding="ascii"), '{"plugins": {}}\n')
+        self.assertTrue((self.home / ".local" / "bin" / "mkchad-opencode-server").is_file())
 
 
 if __name__ == "__main__":

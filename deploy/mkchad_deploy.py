@@ -383,7 +383,7 @@ def _existing(destination: pathlib.Path, component: dict, staged: pathlib.Path) 
             path = entry[3:]
             if component["name"] == "msk_containers" and path.rstrip("/") == "container_tools":
                 continue
-            if path not in preserved or _git(["check-ignore", "--quiet", "--", path], destination, check=False).returncode:
+            if path not in preserved or _git(["check-ignore", "--quiet", "--", path], staged, check=False).returncode:
                 raise DeploymentError(f"existing checkout has local work: {path}")
             if _git(["-C", str(staged), "cat-file", "-e", f"{component['commit']}:{path}"], check=False).returncode == 0:
                 raise DeploymentError(f"desired component tree owns preserved path: {path}")
@@ -570,7 +570,7 @@ def execute_deployment(repo: pathlib.Path, image: pathlib.Path, *, release_tag: 
                 if not isinstance(payload, dict) or payload.get("schema") != 1 or payload.get("ok") is not True or payload.get("command") != "status" or payload.get("status") not in {"inactive", "healthy", "degraded", "blocked", "starting", "stopping", "failed"}:
                     raise DeploymentError("managed service status is unavailable or malformed")
                 active = payload["status"] != "inactive"
-            elif any(destination.exists() or destination.is_symlink() for destination, _ in plans.values()) or any(path.exists() or path.is_symlink() for path in _managed_paths(roots, staged["msk_containers"][1])):
+            elif any(path.exists() or path.is_symlink() for path in _managed_paths(roots, staged["msk_containers"][1])):
                 raise DeploymentError("partial target has no lifecycle command")
             recovery = staging / "recovery"
             recovery.mkdir(mode=0o700)
