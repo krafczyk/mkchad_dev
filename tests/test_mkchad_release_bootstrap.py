@@ -134,6 +134,19 @@ class BootstrapAuthorityTests(unittest.TestCase):
         protected_shared_root = mock.Mock(st_uid=0, st_mode=stat.S_IFDIR | stat.S_ISVTX | 0o777)
         self.assertFalse(self.bootstrap._unsafe_writable_ancestor(protected_shared_root))
         self.assertFalse(self.bootstrap._unsafe_writable_ancestor(protected_shared_root, trust_group_writable_ancestors=True))
+        unsafe.chmod(0o770)
+        private_state = unsafe / "state"
+        private_state.mkdir(mode=0o700)
+        with self.assertRaisesRegex(self.bootstrap.BootstrapError, "group or world writable"):
+            self.bootstrap._safe_directory(private_state)
+        self.bootstrap._safe_directory(private_state, trusted_group_writable_roots={unsafe})
+        unsafe_descendant = unsafe / "descendant"
+        unsafe_descendant.mkdir(mode=0o770)
+        unsafe_descendant.chmod(0o770)
+        strict_state = unsafe_descendant / "state"
+        strict_state.mkdir(mode=0o700)
+        with self.assertRaisesRegex(self.bootstrap.BootstrapError, "group or world writable"):
+            self.bootstrap._safe_directory(strict_state, trusted_group_writable_roots={unsafe})
 
     def test_group_writable_ancestor_trust_requires_explicit_cli_option(self):
         with mock.patch.object(self.bootstrap, "validate_installed_bootstrap") as validate, mock.patch("builtins.print") as output:
@@ -142,6 +155,16 @@ class BootstrapAuthorityTests(unittest.TestCase):
         validate.assert_called_once_with(pathlib.Path(self.bootstrap.__file__).absolute(), trust_group_writable_ancestors=True)
         output.assert_any_call(
             "mkchad-release-bootstrap: warning: trusting every group-class or ACL writer on root- or current-user-owned bootstrap ancestors",
+            file=self.bootstrap.sys.stderr,
+        )
+        with mock.patch.object(self.bootstrap, "validate_installed_bootstrap") as deployment_validate, mock.patch(
+            "builtins.print"
+        ) as deployment_output:
+            result = self.bootstrap.main(["--trust-group-writable-deployment-roots"])
+        self.assertEqual(result, 2)
+        deployment_validate.assert_called_once_with(pathlib.Path(self.bootstrap.__file__).absolute(), trust_group_writable_ancestors=False)
+        deployment_output.assert_any_call(
+            "mkchad-release-bootstrap: warning: trusting every group-class or ACL writer on root- or current-user-owned deployment and recovery roots",
             file=self.bootstrap.sys.stderr,
         )
         with mock.patch.object(self.bootstrap, "validate_installed_bootstrap") as abbreviated_validate, mock.patch.object(
@@ -264,6 +287,32 @@ class BootstrapAuthorityTests(unittest.TestCase):
         self.assertEqual(result, 2)
         recovery.assert_not_called()
 
+    def test_recovery_forwards_group_writable_root_trust(self):
+        deployment_id = "123e4567-e89b-12d3-a456-426614174000"
+        deployer = self.root / "deployer.py"
+        completed = subprocess.CompletedProcess([], 0, "", "")
+        with mock.patch.object(self.bootstrap, "validate_installed_bootstrap"), mock.patch.object(
+            self.bootstrap, "authenticated_recovery_deployer", return_value=deployer
+        ) as authenticate, mock.patch.object(self.bootstrap.subprocess, "run", return_value=completed) as run, mock.patch("builtins.print"):
+            result = self.bootstrap.main(
+                [
+                    "--trust-bootstrap-group-writable-ancestors",
+                    "--trust-group-writable-deployment-roots",
+                    "recover",
+                    "--deployment-id",
+                    deployment_id,
+                    "--mode",
+                    "restore",
+                    "--state-root",
+                    str(self.root),
+                ]
+            )
+        self.assertEqual(result, 0)
+        trusted_roots = authenticate.call_args.kwargs["trusted_group_writable_roots"]
+        self.assertIn(pathlib.Path(os.environ["HOME"]), trusted_roots)
+        self.assertEqual(authenticate.call_args.args, (self.root, deployment_id))
+        self.assertIn("--trust-group-writable-roots", run.call_args.args[0])
+
     def test_public_release_entrypoint_forwards_both_authority_files(self):
         private = self.root / "main-private"
         private.mkdir(mode=0o700)
@@ -291,11 +340,53 @@ class BootstrapAuthorityTests(unittest.TestCase):
         ), mock.patch.object(self.bootstrap, "write_evidence", side_effect=write_evidence), mock.patch.object(
             self.bootstrap.subprocess, "Popen", return_value=process
         ) as popen:
-            self.assertEqual(self.bootstrap.main(["--release", "v1", "--expected-parent-commit", "a" * 40, "--image", str(self.root / "image.sif")]), 0)
+            self.assertEqual(
+                self.bootstrap.main(
+                    [
+                        "--trust-bootstrap-group-writable-ancestors",
+                        "--trust-group-writable-deployment-roots",
+                        "--release",
+                        "v1",
+                        "--expected-parent-commit",
+                        "a" * 40,
+                        "--image",
+                        str(self.root / "image.sif"),
+                    ]
+                ),
+                0,
+            )
         command = popen.call_args.args[0]
         self.assertIn("--verified-release", command)
         self.assertIn("--verified-parent-bundle", command)
         self.assertIn("--bootstrap-root", command)
+        self.assertIn("--trust-group-writable-roots", command)
+
+        default_private = self.root / "default-main-private"
+        default_private.mkdir(mode=0o700)
+        default_process = mock.Mock()
+        default_process.wait.return_value = 0
+        with mock.patch.object(self.bootstrap, "validate_installed_bootstrap"), mock.patch.object(
+            self.bootstrap.tempfile, "mkdtemp", return_value=str(default_private)
+        ), mock.patch.object(self.bootstrap, "verify_annotated_tag", return_value=authority), mock.patch.object(
+            self.bootstrap, "prepare_verified_checkout", return_value=candidate
+        ), mock.patch.object(self.bootstrap, "write_parent_bundle", side_effect=write_bundle), mock.patch.object(
+            self.bootstrap, "write_evidence", side_effect=write_evidence
+        ), mock.patch.object(self.bootstrap.subprocess, "Popen", return_value=default_process) as default_popen, mock.patch("builtins.print"):
+            self.assertEqual(
+                self.bootstrap.main(
+                    [
+                        "--trust-bootstrap-group-writable-ancestors",
+                        "--release",
+                        "v1",
+                        "--expected-parent-commit",
+                        "a" * 40,
+                        "--image",
+                        str(self.root / "image.sif"),
+                    ]
+                ),
+                0,
+            )
+        self.assertNotIn("--trust-group-writable-roots", default_popen.call_args.args[0])
 
     def test_prehandoff_failure_removes_private_bootstrap_root(self):
         private = self.root / "failed-private"

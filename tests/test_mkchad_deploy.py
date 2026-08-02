@@ -212,10 +212,186 @@ class DeploymentValidationTests(unittest.TestCase):
         bundle = self.root / "parent.bundle"
         image = self.root / "image.sif"
         with mock.patch.object(self.deploy, "spawn_supervisor", return_value=0) as supervisor:
-            result = self.deploy.main(["deploy", "--verified-release", str(evidence), "--verified-parent-bundle", str(bundle), "--image", str(image)])
+            result = self.deploy.main(
+                [
+                    "deploy",
+                    "--verified-release",
+                    str(evidence),
+                    "--verified-parent-bundle",
+                    str(bundle),
+                    "--image",
+                    str(image),
+                    "--trust-group-writable-roots",
+                ]
+            )
         self.assertEqual(result, 0)
         command = supervisor.call_args.args[0]
         self.assertEqual(command[command.index("--verified-parent-bundle") + 1], str(bundle))
+        self.assertIn("--trust-group-writable-roots", command)
+        with mock.patch.object(self.deploy.sys, "stderr"):
+            with self.assertRaises(SystemExit):
+                self.deploy.main(
+                    [
+                        "deploy",
+                        "--verified-release",
+                        str(evidence),
+                        "--verified-parent-bundle",
+                        str(bundle),
+                        "--image",
+                        str(image),
+                        "--trust",
+                    ]
+                )
+
+    def test_managed_root_requires_explicit_group_write_trust(self):
+        path = pathlib.Path("/managed/home")
+        system = mock.Mock(st_uid=0, st_mode=self.deploy.stat.S_IFDIR | 0o755)
+        managed = mock.Mock(st_uid=0, st_mode=self.deploy.stat.S_IFDIR | 0o770)
+        with mock.patch.object(self.deploy.os, "lstat", side_effect=[system, managed]):
+            with self.assertRaisesRegex(self.deploy.DeploymentError, "ownership or mode"):
+                self.deploy._safe_owned_directory(path)
+        with self.deploy._trusted_group_writable_roots([path]), mock.patch.object(
+            self.deploy.os, "lstat", side_effect=[system, managed]
+        ):
+            self.deploy._safe_owned_directory(path)
+        descendant = path / ".local"
+        private_descendant = mock.Mock(st_uid=os.getuid(), st_mode=self.deploy.stat.S_IFDIR | 0o700)
+        with self.deploy._trusted_group_writable_roots([path]), mock.patch.object(
+            self.deploy.os, "lstat", side_effect=[system, managed, private_descendant]
+        ):
+            self.deploy._safe_owned_directory(descendant)
+        writable_descendant = mock.Mock(st_uid=os.getuid(), st_mode=self.deploy.stat.S_IFDIR | 0o770)
+        with self.deploy._trusted_group_writable_roots([path]), mock.patch.object(
+            self.deploy.os, "lstat", side_effect=[system, managed, writable_descendant]
+        ):
+            with self.assertRaisesRegex(self.deploy.DeploymentError, "ownership or mode"):
+                self.deploy._safe_owned_directory(descendant)
+        world_writable = mock.Mock(st_uid=0, st_mode=self.deploy.stat.S_IFDIR | 0o777)
+        with self.deploy._trusted_group_writable_roots([path]), mock.patch.object(
+            self.deploy.os, "lstat", side_effect=[system, world_writable]
+        ):
+            with self.assertRaisesRegex(self.deploy.DeploymentError, "ownership or mode"):
+                self.deploy._safe_owned_directory(path)
+        foreign = mock.Mock(st_uid=os.getuid() + 1, st_mode=self.deploy.stat.S_IFDIR | 0o755)
+        with self.deploy._trusted_group_writable_roots([path]), mock.patch.object(
+            self.deploy.os, "lstat", side_effect=[foreign, managed]
+        ):
+            with self.assertRaisesRegex(self.deploy.DeploymentError, "ownership or mode"):
+                self.deploy._safe_owned_directory(path)
+
+    def test_supervisor_applies_group_writable_root_trust(self):
+        repo = self.root / "repo"
+        evidence = self.root / "evidence.json"
+        bundle = self.root / "parent.bundle"
+        image = self.root / "image.sif"
+        roots = {"home": pathlib.Path("/managed/home"), "xdg_config_home": pathlib.Path("/managed/home/.config")}
+        observed = []
+
+        def record_trust(*_args):
+            observed.append(self.deploy._TRUSTED_GROUP_WRITABLE_ROOTS.get())
+            return {"state": "succeeded"}
+
+        with mock.patch.object(self.deploy, "_roots", return_value=roots), mock.patch.object(
+            self.deploy, "deploy", side_effect=record_trust
+        ), mock.patch.object(self.deploy, "cleanup_bootstrap_root"), mock.patch("builtins.print"):
+            result = self.deploy.main(
+                [
+                    "supervise",
+                    "--repo",
+                    str(repo),
+                    "--verified-release",
+                    str(evidence),
+                    "--verified-parent-bundle",
+                    str(bundle),
+                    "--image",
+                    str(image),
+                    "--trust-group-writable-roots",
+                ]
+            )
+        self.assertEqual(result, 0)
+        self.assertEqual(observed, [frozenset(roots.values())])
+        with mock.patch.object(self.deploy, "_roots", return_value=roots), mock.patch.object(
+            self.deploy, "deploy", side_effect=record_trust
+        ), mock.patch.object(self.deploy, "cleanup_bootstrap_root"), mock.patch("builtins.print"):
+            result = self.deploy.main(
+                [
+                    "supervise",
+                    "--repo",
+                    str(repo),
+                    "--verified-release",
+                    str(evidence),
+                    "--verified-parent-bundle",
+                    str(bundle),
+                    "--image",
+                    str(image),
+                ]
+            )
+        self.assertEqual(result, 0)
+        self.assertEqual(observed[-1], frozenset())
+
+    def test_installer_actions_receive_group_writable_root_trust(self):
+        destination = self.root / "msk"
+        destination.mkdir(mode=0o700)
+        installer = destination / "installer"
+        installer.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+        installer.chmod(0o700)
+        bundle = self.root / "bundle"
+        bundle.mkdir(mode=0o700)
+        journal = mock.Mock(bundle=bundle)
+        scope = mock.Mock()
+        scope.run.return_value = subprocess.CompletedProcess([str(installer)], 0, "", "")
+        component = {"name": "msk_containers", "actions": [{"id": "host-tools-check", "path": "installer", "args": []}]}
+        with self.deploy._trusted_group_writable_roots([self.root]):
+            self.deploy.run_installer_actions(
+                scope,
+                component,
+                destination,
+                self.root / "image.sif",
+                "a" * 64,
+                "managed.sif",
+                "b" * 40,
+                journal,
+            )
+        scope.run.assert_called_once_with(
+            [str(installer)],
+            extra_env={"MKCHAD_TRUST_GROUP_WRITABLE_ROOTS": "1"},
+        )
+        default_bundle = self.root / "default-bundle"
+        default_bundle.mkdir(mode=0o700)
+        default_scope = mock.Mock()
+        default_scope.run.return_value = subprocess.CompletedProcess([str(installer)], 0, "", "")
+        self.deploy.run_installer_actions(
+            default_scope,
+            component,
+            destination,
+            self.root / "image.sif",
+            "a" * 64,
+            "managed.sif",
+            "b" * 40,
+            mock.Mock(bundle=default_bundle),
+        )
+        default_scope.run.assert_called_once_with([str(installer)], extra_env=None)
+
+    def test_complete_host_tool_recovery_receives_root_trust(self):
+        bundle = self.root / "recovery-bundle"
+        bundle.mkdir(mode=0o700)
+        destination = self.root / "msk"
+        destination.mkdir(mode=0o700)
+        installer = destination / "installer"
+        installer.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+        installer.chmod(0o700)
+        component = {
+            "name": "msk_containers",
+            "destination": {"root": "xdg_data_home", "path": "mkchad/components/msk_containers"},
+            "actions": [{"id": "host-tools-install", "path": "installer", "args": []}],
+        }
+        scope = mock.Mock()
+        scope.run.return_value = subprocess.CompletedProcess([], 0, "", "")
+        with self.deploy._trusted_group_writable_roots([self.root]), mock.patch.object(
+            self.deploy, "resolve_named_destination", return_value=destination
+        ), mock.patch.object(self.deploy, "verify_host_tools"):
+            self.deploy.recover_host_tools({}, "complete", component, bundle, {"home": self.root}, scope)
+        self.assertEqual(scope.run.call_args.kwargs["extra_env"], {"MKCHAD_TRUST_GROUP_WRITABLE_ROOTS": "1"})
 
     def test_repository_identity_and_destination_are_constrained(self):
         self.assertEqual(self.deploy.canonical_github_repository("git@github.com:krafczyk/mkchad.git"), "github.com/krafczyk/mkchad")
@@ -568,10 +744,54 @@ class DeploymentValidationTests(unittest.TestCase):
         deployment_id = "123e4567-e89b-12d3-a456-426614174000"
         state = self.root / "state"
         with mock.patch.object(self.deploy, "spawn_supervisor", return_value=0) as supervisor:
-            self.assertEqual(self.deploy.main(["recover", "--deployment-id", deployment_id, "--mode", "restore", "--state-root", str(state), "--confirm-processes-quiesced"]), 0)
+            self.assertEqual(
+                self.deploy.main(
+                    [
+                        "recover",
+                        "--deployment-id",
+                        deployment_id,
+                        "--mode",
+                        "restore",
+                        "--state-root",
+                        str(state),
+                        "--confirm-processes-quiesced",
+                        "--trust-group-writable-roots",
+                    ]
+                ),
+                0,
+            )
         command = supervisor.call_args.args[0]
         self.assertIn("recover-supervise", command)
         self.assertIn("--confirm-processes-quiesced", command)
+        self.assertIn("--trust-group-writable-roots", command)
+
+    def test_recovery_supervisor_applies_group_writable_root_trust(self):
+        deployment_id = "123e4567-e89b-12d3-a456-426614174000"
+        state = self.root / "state"
+        roots = {"home": pathlib.Path("/managed/home"), "xdg_state_home": pathlib.Path("/managed/home/.local/state")}
+        observed = []
+
+        def record_trust(*_args):
+            observed.append(self.deploy._TRUSTED_GROUP_WRITABLE_ROOTS.get())
+            return {"state": "recovered_restore"}
+
+        with mock.patch.object(self.deploy, "_roots", return_value=roots), mock.patch.object(
+            self.deploy, "recover", side_effect=record_trust
+        ), mock.patch("builtins.print"):
+            result = self.deploy.main(
+                [
+                    "recover-supervise",
+                    "--deployment-id",
+                    deployment_id,
+                    "--mode",
+                    "restore",
+                    "--state-root",
+                    str(state),
+                    "--trust-group-writable-roots",
+                ]
+            )
+        self.assertEqual(result, 0)
+        self.assertEqual(observed, [frozenset(roots.values())])
 
     def test_subprocess_diagnostics_and_redaction_do_not_expose_secret_sentinels(self):
         sentinel = "DO-NOT-STORE-THIS"

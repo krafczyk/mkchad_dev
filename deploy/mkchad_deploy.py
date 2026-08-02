@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import configparser
 import contextlib
+import contextvars
 import ctypes
 import errno
 import fcntl
@@ -156,8 +157,30 @@ def fsync_directory(directory: pathlib.Path):
         os.close(fd)
 
 
+_TRUSTED_GROUP_WRITABLE_ROOTS = contextvars.ContextVar("mkchad_trusted_group_writable_roots", default=frozenset())
+
+
+@contextlib.contextmanager
+def _trusted_group_writable_roots(roots):
+    """Temporarily trust group-class writers on an exact set of named roots."""
+    token = _TRUSTED_GROUP_WRITABLE_ROOTS.set(frozenset(roots))
+    try:
+        yield
+    finally:
+        _TRUSTED_GROUP_WRITABLE_ROOTS.reset(token)
+
+
 def _safe_owned_directory(path: pathlib.Path, create: bool = False):
-    """Validate an owned, non-symlink directory and its owned descendants."""
+    """Validate an owned, non-symlink directory and its owned descendants.
+
+    Args:
+        path: Absolute directory to validate.
+        create: Create missing path components as current-user-owned mode 0700.
+
+    Raises:
+        DeploymentError: If the directory path is missing, linked, foreign-owned,
+            world-writable, or otherwise unsafe under the selected trust mode.
+    """
     if create:
         path.mkdir(mode=0o700, parents=True, exist_ok=True)
     if not path.is_absolute():
@@ -172,11 +195,22 @@ def _safe_owned_directory(path: pathlib.Path, create: bool = False):
             raise DeploymentError(f"missing directory: {current}") from exc
         if stat.S_ISLNK(entry.st_mode) or not stat.S_ISDIR(entry.st_mode):
             raise DeploymentError(f"unsafe directory type: {current}")
-        # System ancestors may be root-owned; every deployment-controlled part
-        # must belong to the current user and not admit group writes.
-        if index == len(parts) - 1 or entry.st_uid == os.getuid():
-            if entry.st_uid != os.getuid() or entry.st_mode & 0o022:
+        trusted_root = current in _TRUSTED_GROUP_WRITABLE_ROOTS.get()
+        if entry.st_uid not in {0, os.getuid()}:
+            raise DeploymentError(f"unsafe directory ownership or mode: {current}")
+        protected_shared_ancestor = (
+            index < len(parts) - 1
+            and entry.st_uid == 0
+            and bool(entry.st_mode & stat.S_ISVTX)
+            and bool(entry.st_mode & 0o002)
+        )
+        if entry.st_mode & 0o002:
+            if not protected_shared_ancestor:
                 raise DeploymentError(f"unsafe directory ownership or mode: {current}")
+        if entry.st_mode & 0o020 and not trusted_root and not protected_shared_ancestor:
+            raise DeploymentError(f"unsafe directory ownership or mode: {current}")
+        if index == len(parts) - 1 and entry.st_uid != os.getuid() and not trusted_root:
+            raise DeploymentError(f"unsafe directory ownership or mode: {current}")
 
 
 def _regular_owned(path: pathlib.Path, mode: int | None = None):
@@ -1673,12 +1707,22 @@ def install_or_update_component(destination: pathlib.Path, staged: pathlib.Path,
     return {"name": component["name"], "repository": repository, "destination": str(destination), "previous_revision": None, "revision": commit, "result": "installed"}
 
 
-def run_installer_actions(scope: SessionScope, component: dict, msk_destination: pathlib.Path, staged_image: pathlib.Path, expected_digest: str, expected_target: str, revision: str, journal: DeploymentJournal) -> list[dict]:
+def run_installer_actions(
+    scope: SessionScope,
+    component: dict,
+    msk_destination: pathlib.Path,
+    staged_image: pathlib.Path,
+    expected_digest: str,
+    expected_target: str,
+    revision: str,
+    journal: DeploymentJournal,
+) -> list[dict]:
     """Run the U1 installer-owned public actions from the pinned checkout.
 
     The host-tool check is deliberately separate from apply.  The recovery
     directory belongs to the deployment journal, and image installation receives
-    the staged image plus the exact gitlink-derived source revision.
+    the staged image plus the exact gitlink-derived source revision. Explicit
+    group-write trust is passed only as a fixed Boolean environment value.
     """
     recovery = journal.bundle / "host-tools"
     recovery.mkdir(mode=0o700)
@@ -1698,7 +1742,8 @@ def run_installer_actions(scope: SessionScope, component: dict, msk_destination:
         if action["id"] == "image-install":
             verify_staged_image(staged_image, expected_digest)
             resource = snapshot_image_links(pathlib.Path(os.environ["HOME"]), expected_digest, expected_target, revision, staged_image.name, journal)
-        scope.run(argv)
+        extra_env = _installer_trust_environment() if action["id"] in {"host-tools-check", "host-tools-install"} else None
+        scope.run(argv, extra_env=extra_env)
         if resource is not None:
             resource["state"] = "applied"
             if action["id"] == "host-tools-install":
@@ -1847,7 +1892,10 @@ def recover_host_tools(resource: dict, mode: str, component: dict, bundle: pathl
         recovery_dir = pathlib.Path(tempfile.mkdtemp(prefix="host-tools-complete-", dir=bundle))
         os.chmod(recovery_dir, 0o700)
         action = next(action for action in component["actions"] if action["id"] == "host-tools-install")
-        scope.run([str(msk_destination / action["path"]), "--recovery-dir", str(recovery_dir)])
+        scope.run(
+            [str(msk_destination / action["path"]), "--recovery-dir", str(recovery_dir)],
+            extra_env=_installer_trust_environment(),
+        )
         verify_host_tools(home, resource)
         return {"name": component["name"], "result": "host-tools-complete"}
     target_dir = home / ".local" / "bin"
@@ -2136,7 +2184,19 @@ def _roots() -> dict[str, pathlib.Path]:
     return {"home": home, "xdg_config_home": pathlib.Path(os.environ.get("XDG_CONFIG_HOME", home / ".config")), "xdg_data_home": pathlib.Path(os.environ.get("XDG_DATA_HOME", home / ".local/share")), "xdg_state_home": pathlib.Path(os.environ.get("XDG_STATE_HOME", home / ".local/state"))}
 
 
-def deploy(repo: pathlib.Path, verified_release: pathlib.Path, verified_parent_bundle: pathlib.Path, image: pathlib.Path, state_root: pathlib.Path | None = None, maintenance_quiesced: bool = False) -> dict:
+def _installer_trust_environment() -> dict[str, str] | None:
+    """Return the fixed installer trust environment for a scoped deployment."""
+    return {"MKCHAD_TRUST_GROUP_WRITABLE_ROOTS": "1"} if _TRUSTED_GROUP_WRITABLE_ROOTS.get() else None
+
+
+def deploy(
+    repo: pathlib.Path,
+    verified_release: pathlib.Path,
+    verified_parent_bundle: pathlib.Path,
+    image: pathlib.Path,
+    state_root: pathlib.Path | None = None,
+    maintenance_quiesced: bool = False,
+) -> dict:
     """Deploy a bootstrap-authorized release and return its public receipt.
 
     Args:
@@ -2147,7 +2207,6 @@ def deploy(repo: pathlib.Path, verified_release: pathlib.Path, verified_parent_b
         state_root: Optional private deployment-state override for tests/tools.
         maintenance_quiesced: Operator assertion for the documented unknown
             pre-interlock maintenance path.
-
     Returns:
         The succeeded schema-1 deployment receipt.
 
@@ -2258,10 +2317,22 @@ def deploy(repo: pathlib.Path, verified_release: pathlib.Path, verified_parent_b
                 verify_staged_image(staged_image, artifact["sha256"])
                 msk_component = next(component for component in release["components"] if component["name"] == "msk_containers")
                 expected_image = expected_managed_image_name(image_manifest, gitlinks["msk_containers"]["commit"], artifact["sha256"], artifact["architecture"])
-                actions = run_installer_actions(scope, msk_component, destinations["msk_containers"], staged_image, artifact["sha256"], expected_image, gitlinks["msk_containers"]["commit"], journal)
+                actions = run_installer_actions(
+                    scope,
+                    msk_component,
+                    destinations["msk_containers"],
+                    staged_image,
+                    artifact["sha256"],
+                    expected_image,
+                    gitlinks["msk_containers"]["commit"],
+                    journal,
+                )
                 phase = "verify"
                 host_check = next(action for action in msk_component["actions"] if action["id"] == "host-tools-check")
-                scope.run([str(destinations["msk_containers"] / host_check["path"]), *host_check["args"]])
+                scope.run(
+                    [str(destinations["msk_containers"] / host_check["path"]), *host_check["args"]],
+                    extra_env=_installer_trust_environment(),
+                )
                 installed_image = verify_installed_image(roots["home"], artifact["sha256"])
                 validate_image_runtime(scope, installed_image, artifact, staged["msk_containers"], gitlinks["msk_containers"]["commit"], staged["opencode"], gitlinks["opencode"])
                 for component in release["components"]:
@@ -2295,7 +2366,12 @@ def deploy(repo: pathlib.Path, verified_release: pathlib.Path, verified_parent_b
                     fsync_directory(journal.bundle)
 
 
-def recover(state_root: pathlib.Path, deployment_id: str, mode: str, confirm_processes_quiesced: bool = False) -> dict:
+def recover(
+    state_root: pathlib.Path,
+    deployment_id: str,
+    mode: str,
+    confirm_processes_quiesced: bool = False,
+) -> dict:
     """Classify an authenticated journal for explicit offline complete/restore.
 
     Args:
@@ -2305,7 +2381,6 @@ def recover(state_root: pathlib.Path, deployment_id: str, mode: str, confirm_pro
             ``restore`` accepts only resources still at recorded pre-state.
         confirm_processes_quiesced: Required only for ``in_progress`` records
             after the operator has independently established quiescence.
-
     Returns:
         A durable recovery receipt.
 
@@ -2715,37 +2790,41 @@ def main(argv: list[str] | None = None) -> int:
     """
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     commands = parser.add_subparsers(dest="command", required=True)
-    validate = commands.add_parser("validate-release")
+    validate = commands.add_parser("validate-release", allow_abbrev=False)
     validate.add_argument("--repo", type=pathlib.Path, default=pathlib.Path.cwd())
     validate.add_argument("--release", required=True)
     validate.add_argument("--expected-parent-commit", required=True)
     validate.add_argument("--image", type=pathlib.Path, required=True)
-    deploy_parser = commands.add_parser("deploy")
+    deploy_parser = commands.add_parser("deploy", allow_abbrev=False)
     deploy_parser.add_argument("--repo", type=pathlib.Path, default=pathlib.Path.cwd())
     deploy_parser.add_argument("--verified-release", type=pathlib.Path, required=True)
     deploy_parser.add_argument("--verified-parent-bundle", type=pathlib.Path, required=True)
     deploy_parser.add_argument("--image", type=pathlib.Path, required=True)
     deploy_parser.add_argument("--state-root", type=pathlib.Path)
     deploy_parser.add_argument("--maintenance-quiesced", action="store_true")
+    deploy_parser.add_argument("--trust-group-writable-roots", action="store_true", help=argparse.SUPPRESS)
     deploy_parser.add_argument("--bootstrap-root", type=pathlib.Path, help=argparse.SUPPRESS)
-    supervisor = commands.add_parser("supervise", help=argparse.SUPPRESS)
+    supervisor = commands.add_parser("supervise", help=argparse.SUPPRESS, allow_abbrev=False)
     supervisor.add_argument("--repo", type=pathlib.Path, required=True)
     supervisor.add_argument("--verified-release", type=pathlib.Path, required=True)
     supervisor.add_argument("--verified-parent-bundle", type=pathlib.Path, required=True)
     supervisor.add_argument("--image", type=pathlib.Path, required=True)
     supervisor.add_argument("--state-root", type=pathlib.Path)
     supervisor.add_argument("--maintenance-quiesced", action="store_true")
+    supervisor.add_argument("--trust-group-writable-roots", action="store_true", help=argparse.SUPPRESS)
     supervisor.add_argument("--bootstrap-root", type=pathlib.Path, help=argparse.SUPPRESS)
-    recovery = commands.add_parser("recover")
+    recovery = commands.add_parser("recover", allow_abbrev=False)
     recovery.add_argument("--deployment-id", required=True)
     recovery.add_argument("--mode", required=True, choices=("complete", "restore"))
     recovery.add_argument("--state-root", type=pathlib.Path, required=True)
     recovery.add_argument("--confirm-processes-quiesced", action="store_true")
-    recovery_supervisor = commands.add_parser("recover-supervise", help=argparse.SUPPRESS)
+    recovery.add_argument("--trust-group-writable-roots", action="store_true", help=argparse.SUPPRESS)
+    recovery_supervisor = commands.add_parser("recover-supervise", help=argparse.SUPPRESS, allow_abbrev=False)
     recovery_supervisor.add_argument("--deployment-id", required=True)
     recovery_supervisor.add_argument("--mode", required=True, choices=("complete", "restore"))
     recovery_supervisor.add_argument("--state-root", type=pathlib.Path, required=True)
     recovery_supervisor.add_argument("--confirm-processes-quiesced", action="store_true")
+    recovery_supervisor.add_argument("--trust-group-writable-roots", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     try:
         if args.command == "validate-release":
@@ -2756,21 +2835,53 @@ def main(argv: list[str] | None = None) -> int:
                 command.extend(["--state-root", str(args.state_root)])
             if args.maintenance_quiesced:
                 command.append("--maintenance-quiesced")
+            if args.trust_group_writable_roots:
+                command.append("--trust-group-writable-roots")
             if args.bootstrap_root:
                 command.extend(["--bootstrap-root", str(args.bootstrap_root)])
             return spawn_supervisor(command)
         elif args.command == "supervise":
             try:
-                print(json.dumps(deploy(args.repo, args.verified_release, args.verified_parent_bundle, args.image, args.state_root, args.maintenance_quiesced), sort_keys=True))
+                roots = _roots()
+                trusted_roots = roots.values() if args.trust_group_writable_roots else ()
+                with _trusted_group_writable_roots(trusted_roots):
+                    print(
+                        json.dumps(
+                            deploy(
+                                args.repo,
+                                args.verified_release,
+                                args.verified_parent_bundle,
+                                args.image,
+                                args.state_root,
+                                args.maintenance_quiesced,
+                            ),
+                            sort_keys=True,
+                        )
+                    )
             finally:
                 cleanup_bootstrap_root(args.bootstrap_root, args.repo)
         elif args.command == "recover":
             command = [sys.executable, str(pathlib.Path(__file__).resolve()), "recover-supervise", "--deployment-id", args.deployment_id, "--mode", args.mode, "--state-root", str(args.state_root)]
             if args.confirm_processes_quiesced:
                 command.append("--confirm-processes-quiesced")
+            if args.trust_group_writable_roots:
+                command.append("--trust-group-writable-roots")
             return spawn_supervisor(command)
         else:
-            print(json.dumps(recover(args.state_root, args.deployment_id, args.mode, args.confirm_processes_quiesced), sort_keys=True))
+            roots = _roots()
+            trusted_roots = roots.values() if args.trust_group_writable_roots else ()
+            with _trusted_group_writable_roots(trusted_roots):
+                print(
+                    json.dumps(
+                        recover(
+                            args.state_root,
+                            args.deployment_id,
+                            args.mode,
+                            args.confirm_processes_quiesced,
+                        ),
+                        sort_keys=True,
+                    )
+                )
         return 0
     except DeploymentError as exc:
         print("mkchad-deploy: " + redact(str(exc)), file=sys.stderr)

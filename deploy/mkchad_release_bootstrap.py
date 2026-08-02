@@ -41,7 +41,7 @@ class BootstrapError(RuntimeError):
     """Raised when bootstrap authority, installed paths, or recovery state is unsafe."""
 
 
-def _safe_directory(path: pathlib.Path):
+def _safe_directory(path: pathlib.Path, *, trusted_group_writable_roots: frozenset[pathlib.Path] | set[pathlib.Path] = frozenset()):
     """Require an absolute current-user-owned private directory without links."""
     if not path.is_absolute():
         raise BootstrapError("directory must be absolute")
@@ -51,7 +51,7 @@ def _safe_directory(path: pathlib.Path):
         entry = os.lstat(current)
         if stat.S_ISLNK(entry.st_mode) or not stat.S_ISDIR(entry.st_mode):
             raise BootstrapError(f"path contains a symlink or non-directory: {current}")
-        if _unsafe_writable_ancestor(entry):
+        if _unsafe_writable_ancestor(entry, trust_group_writable_ancestors=current in trusted_group_writable_roots):
             raise BootstrapError(f"path is group or world writable: {current}")
     entry = os.lstat(path)
     if entry.st_uid != os.getuid() or stat.S_IMODE(entry.st_mode) != 0o700:
@@ -550,12 +550,19 @@ def _retained_evidence(path: pathlib.Path, bundle: pathlib.Path) -> dict:
     return evidence
 
 
-def authenticated_recovery_deployer(state_root: pathlib.Path, deployment_id: str) -> pathlib.Path:
+def authenticated_recovery_deployer(
+    state_root: pathlib.Path,
+    deployment_id: str,
+    *,
+    trusted_group_writable_roots: frozenset[pathlib.Path] | set[pathlib.Path] = frozenset(),
+) -> pathlib.Path:
     """Validate one canonical recovery record and return its retained deployer.
 
     Args:
         state_root: Current-user-owned mode-``0700`` deployment state directory.
         deployment_id: UUID selecting exactly one canonical record.
+        trusted_group_writable_roots: Exact root- or current-user-owned named
+            roots whose group-class writers the operator trusts.
 
     Returns:
         Path to the digest- and authority-bound retained deployment engine.
@@ -565,7 +572,7 @@ def authenticated_recovery_deployer(state_root: pathlib.Path, deployment_id: str
             recovery state is unsafe. The function performs no network access
             and does not mutate retained evidence.
     """
-    _safe_directory(state_root)
+    _safe_directory(state_root, trusted_group_writable_roots=trusted_group_writable_roots)
     if not DEPLOYMENT_ID.fullmatch(deployment_id):
         raise BootstrapError("invalid deployment UUID")
     record_path = state_root / f"{deployment_id}.json"
@@ -630,7 +637,7 @@ def main(argv: list[str] | None = None) -> int:
     """
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0], allow_abbrev=False)
     subcommands = parser.add_subparsers(dest="command")
-    recover = subcommands.add_parser("recover")
+    recover = subcommands.add_parser("recover", allow_abbrev=False)
     recover.add_argument("--deployment-id", required=True)
     recover.add_argument("--mode", choices=("complete", "restore"), required=True)
     recover.add_argument("--state-root", type=pathlib.Path, required=True)
@@ -645,6 +652,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="trust group-write access on root- or current-user-owned bootstrap ancestors",
     )
+    parser.add_argument(
+        "--trust-group-writable-deployment-roots",
+        action="store_true",
+        help="trust group-write access on root- or current-user-owned deployment and recovery roots",
+    )
     args = parser.parse_args(argv)
     try:
         validate_installed_bootstrap(
@@ -656,13 +668,31 @@ def main(argv: list[str] | None = None) -> int:
                 "mkchad-release-bootstrap: warning: trusting every group-class or ACL writer on root- or current-user-owned bootstrap ancestors",
                 file=sys.stderr,
             )
+        if args.trust_group_writable_deployment_roots:
+            print(
+                "mkchad-release-bootstrap: warning: trusting every group-class or ACL writer on root- or current-user-owned deployment and recovery roots",
+                file=sys.stderr,
+            )
         if args.command == "recover":
             if args.release or args.expected_parent_commit or args.development_commit or args.image or args.remote != DEFAULT_REMOTE:
                 raise BootstrapError("recover accepts only recovery-specific arguments")
-            deployer = authenticated_recovery_deployer(args.state_root, args.deployment_id)
+            home = pathlib.Path(os.environ["HOME"])
+            deployment_roots = {
+                home,
+                pathlib.Path(os.environ.get("XDG_CONFIG_HOME", home / ".config")),
+                pathlib.Path(os.environ.get("XDG_DATA_HOME", home / ".local/share")),
+                pathlib.Path(os.environ.get("XDG_STATE_HOME", home / ".local/state")),
+            }
+            deployer = authenticated_recovery_deployer(
+                args.state_root,
+                args.deployment_id,
+                trusted_group_writable_roots=deployment_roots if args.trust_group_writable_deployment_roots else frozenset(),
+            )
             command = [sys.executable, str(deployer), "recover", "--deployment-id", args.deployment_id, "--mode", args.mode, "--state-root", str(args.state_root)]
             if args.confirm_processes_quiesced:
                 command.append("--confirm-processes-quiesced")
+            if args.trust_group_writable_deployment_roots:
+                command.append("--trust-group-writable-roots")
             return subprocess.run(command, check=False).returncode
         release_form = bool(args.release) or bool(args.expected_parent_commit)
         development_form = bool(args.development_commit)
@@ -684,6 +714,8 @@ def main(argv: list[str] | None = None) -> int:
             parent_bundle = write_parent_bundle(private / "parent", authority, evidence_dir / "parent.bundle")
             evidence_path = write_evidence(evidence_dir, authority, parent_bundle)
             command = [sys.executable, str(candidate), "deploy", "--repo", str(private / "parent"), "--verified-release", str(evidence_path), "--verified-parent-bundle", str(parent_bundle), "--image", str(args.image), "--bootstrap-root", str(private)]
+            if args.trust_group_writable_deployment_roots:
+                command.append("--trust-group-writable-roots")
             process = subprocess.Popen(command, cwd=private / "parent", close_fds=True)
             handed_off = True
             return process.wait()
