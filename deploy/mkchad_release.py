@@ -114,7 +114,7 @@ def _write_stream(stream, log, data: bytes):
     log.flush()
 
 
-def _run(command: list[str], *, cwd: pathlib.Path, log, timeout: float | None = COMMAND_TIMEOUT) -> int:
+def _run(command: list[str], *, cwd: pathlib.Path, log, timeout: float | None = COMMAND_TIMEOUT, stderr_capture: list[str] | None = None) -> int:
     """Run one command while preserving stdout/stderr channels in the log."""
     try:
         process = subprocess.Popen(
@@ -147,6 +147,10 @@ def _run(command: list[str], *, cwd: pathlib.Path, log, timeout: float | None = 
                     selector.unregister(key.fileobj)
                     continue
                 _write_stream(key.data, log, data)
+                if stderr_capture is not None and key.data is sys.stderr:
+                    stderr_capture.append(_redact(data.decode("utf-8", errors="replace")))
+                    if sum(map(len, stderr_capture)) > 8192:
+                        stderr_capture[:] = ["".join(stderr_capture)[-4096:]]
         return process.wait() if deadline is None else process.wait(timeout=max(0.1, deadline - time.monotonic()))
     except KeyboardInterrupt:
         with contextlib.suppress(ProcessLookupError):
@@ -370,6 +374,7 @@ def main(argv: list[str] | None = None) -> int:
             with log_path.open("x", encoding="utf-8") as log:
                 try:
                     checkout_root, deployer = _checkout_release(args.release, log)
+                    child_diagnostics: list[str] = []
                     child_status = _run(
                         [
                             sys.executable,
@@ -389,11 +394,15 @@ def main(argv: list[str] | None = None) -> int:
                         cwd=deployer.parent.parent,
                         log=log,
                         timeout=None,
+                        stderr_capture=child_diagnostics,
                     )
                     if _matching_child_result(result_path, run_id=run_id, release=args.release, log_path=log_path, child_status=child_status):
                         os.replace(result_path, latest_result)
                         return child_status
                     diagnostic = "release deployer result does not match the admitted run" if result_path.exists() else "release deployer did not publish a matching terminal result"
+                    detail = "".join(child_diagnostics).strip()
+                    if detail:
+                        diagnostic += ": " + detail[-3072:]
                     _publish_result(latest_result, _fallback_result(run_id, args.release, started_at, log_path, diagnostic))
                     return child_status if child_status else 2
                 except ReleaseError as exc:
