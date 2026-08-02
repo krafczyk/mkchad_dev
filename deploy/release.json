@@ -5,7 +5,7 @@
       "name": "msk_containers",
       "disposition": "deployed",
       "repository": "git@github.com:krafczyk/msk_containers",
-      "commit": "7fa16417495bfb2cf1487d7096c76084600ca475",
+      "commit": "d58526db9cb9c9fb18f9f6de2aefdc1226287f59",
       "destination": {
         "root": "xdg_data_home",
         "path": "mkchad/components/msk_containers"
