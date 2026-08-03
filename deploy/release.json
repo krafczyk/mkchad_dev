@@ -5,7 +5,7 @@
       "name": "msk_containers",
       "disposition": "deployed",
       "repository": "git@github.com:krafczyk/msk_containers",
-      "commit": "d58526db9cb9c9fb18f9f6de2aefdc1226287f59",
+      "commit": "ce83c533eb01c799891ee58270ad7f78913bf1eb",
       "destination": {
         "root": "xdg_data_home",
         "path": "mkchad/components/msk_containers"
@@ -79,7 +79,7 @@
       "name": "opencode",
       "disposition": "embedded",
       "repository": "git@github.com:krafczyk/opencode.git",
-      "commit": "a8a797ab717289fe30308b1e3bcc8dfa865beb4a"
+      "commit": "9ff58294d62af73a9b17deb6bbf508072fb89671"
     },
     {
       "name": "opencode.nvim",
@@ -97,7 +97,7 @@
       "name": "compound-engineering",
       "disposition": "configuration-owned",
       "repository": "git@github.com:krafczyk/compound-engineering-plugin.git",
-      "commit": "f07e820a4146963de4e3ae1197c82f6686507e6c"
+      "commit": "241078528a8c1e36f32a6e277a2976f17a1015cb"
     },
     {
       "name": "opencode_sprint_loop",
@@ -110,7 +110,7 @@
     "nvim-image": [
       {
         "architecture": "x86_64",
-        "sha256": "96128373e8042d1544d577d17ceb99b2a0edd716958a4d9254ff70e4bc43f4f3",
+        "sha256": "8adc7ce8fb7a6f91ee9fb38a5cda3b71dbe4d589508192c74123c1fe100b9c03",
         "source_filename_class": "raw-nvim-container"
       }
     ]
