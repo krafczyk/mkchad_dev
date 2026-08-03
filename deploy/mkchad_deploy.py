@@ -343,8 +343,7 @@ def _overlay_container_tools(staged: dict[str, tuple[pathlib.Path, pathlib.Path]
         nested.unlink()
     elif nested.exists():
         shutil.rmtree(nested)
-    _git(["clone", "--no-checkout", str(staged["container_tools"][0]), str(nested)])
-    _git(["-C", str(nested), "checkout", "--detach", components["container_tools"]["commit"]])
+    _git(["-C", str(staged["container_tools"][0]), "worktree", "add", "--detach", str(nested), components["container_tools"]["commit"]])
 
 
 def _stage_release_sources(components: dict[str, dict], staging: pathlib.Path) -> dict[str, tuple[pathlib.Path, pathlib.Path]]:
@@ -375,13 +374,14 @@ def _developer_components(commits: dict[str, str]) -> dict[str, dict]:
 def _workspace_status(path: pathlib.Path) -> list[tuple[str, str]]:
     """Return porcelain-v1 status records while preserving unusual path bytes."""
     raw = _git(["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=none"], path).stdout
-    records = raw.split("\0")
     status = []
-    while records and records[0]:
-        record = records.pop(0)
+    records = iter(raw.split("\0"))
+    for record in records:
+        if not record:
+            break
         code, name = record[:2], record[3:]
         if code[0] in "RC" or code[1] in "RC":
-            records.pop(0)
+            next(records, None)
             status.append((code, ""))
         else:
             status.append((code, name))
@@ -425,7 +425,6 @@ def admit_developer_workspace(workspace: pathlib.Path) -> dict:
     }
     parent_head = _git(["rev-parse", "--verify", "HEAD^{commit}"], workspace, check=False).stdout.strip()
     return {
-        "workspace": workspace,
         "parent": {"path": str(workspace), "revision": parent_head if SHA1.fullmatch(parent_head) else None, "dirty": bool(_workspace_status(workspace))},
         "sources": {"msk_containers": msk, "container_tools": tools, "mkchad": mkchad},
         "commits": commits,
@@ -467,6 +466,11 @@ def _validate_actions(component: dict, checkout: pathlib.Path):
             raise DeploymentError(f"action does not match its pinned blob: {action['id']}")
 
 
+def _stat_identity(entry: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    """Return the file identity fields used for stable observation."""
+    return entry.st_dev, entry.st_ino, entry.st_mode, entry.st_size, entry.st_mtime_ns, entry.st_ctime_ns
+
+
 def _stable_regular_digest(path: pathlib.Path, label: str) -> str:
     """Hash one non-symbolic regular file while rejecting identity changes."""
     try:
@@ -486,8 +490,7 @@ def _stable_regular_digest(path: pathlib.Path, label: str) -> str:
                 digest.update(block)
         after = os.fstat(descriptor)
         final = os.lstat(path)
-        identity = lambda entry: (entry.st_dev, entry.st_ino, entry.st_mode, entry.st_size, entry.st_mtime_ns, entry.st_ctime_ns)
-        if identity(before) != identity(opened) or identity(before) != identity(after) or identity(before) != identity(final):
+        if _stat_identity(before) != _stat_identity(opened) or _stat_identity(before) != _stat_identity(after) or _stat_identity(before) != _stat_identity(final):
             raise DeploymentError(f"{label} changed while hashing")
         return digest.hexdigest()
     except OSError as exc:
@@ -653,8 +656,7 @@ def _active_image_observation(home: pathlib.Path) -> dict:
             raise OSError
         digest = _stable_regular_digest(candidate, "active image")
         selector_after = os.lstat(selector)
-        selector_identity = lambda entry: (entry.st_dev, entry.st_ino, entry.st_mode, entry.st_size, entry.st_mtime_ns, entry.st_ctime_ns)
-        if selector_identity(selector_before) != selector_identity(selector_after) or os.readlink(selector) != target_value:
+        if _stat_identity(selector_before) != _stat_identity(selector_after) or os.readlink(selector) != target_value:
             raise OSError
         return {"state": "valid", "digest": digest}
     except (OSError, DeploymentError):
@@ -735,20 +737,29 @@ def _publish(path: pathlib.Path, document: dict, *, validate=True):
     os.replace(temporary, path)
 
 
-def _execute_components(deployed: dict[str, dict], artifact: dict, image: pathlib.Path | None, *, developer: bool, log_path: pathlib.Path, result_path: pathlib.Path, run_id: str, replace_partial: bool, stage_sources, recheck_sources, result_builder, validate_result: bool) -> int:
+def _execute_components(deployed: dict[str, dict], artifact: dict, image: pathlib.Path | None, *, developer: bool, log_path: pathlib.Path, result_path: pathlib.Path, run_id: str, replace_partial: bool, stage_sources, recheck_sources, result_builder) -> int:
     """Run the shared target procedure from already-selected component sources.
 
     Source selection differs between release and developer modes; destination
     validation, lifecycle checks, apply order, and failure handling do not.
     """
     started_at, roots, current, phase, failure_step = _timestamp(), _roots(), None, "preflight", "preflight"
-    is_image_action = lambda action: any(isinstance(argument, dict) and argument.get("token") == "staged_image" for argument in action["args"])
-    actions = [
-        {"component": component["name"], "id": action["id"], "phase": action["phase"], "status": "pending"}
+    action_specs = {
+        (component["name"], action["id"]): action
         for component in deployed.values()
         for action in component["actions"]
-        if image is not None or not is_image_action(action)
+    }
+    image_action_keys = {
+        key
+        for key, action in action_specs.items()
+        if any(isinstance(argument, dict) and argument.get("token") == "staged_image" for argument in action["args"])
+    }
+    actions = [
+        {"component": key[0], "id": key[1], "phase": action["phase"], "status": "pending"}
+        for key, action in action_specs.items()
+        if image is not None or key not in image_action_keys
     ]
+    action_results = {(item["component"], item["id"]): item for item in actions}
     image_info = {"choice": "omitted" if image is None else "install", "supplied_sha256": None, "active_sha256": None, "decision": "preserved" if image is None else "pending"}
     staging = pathlib.Path(tempfile.mkdtemp(prefix="mkchad-deploy-"))
     try:
@@ -815,14 +826,13 @@ def _execute_components(deployed: dict[str, dict], artifact: dict, image: pathli
                 _runtime_image(staged_image, artifact["architecture"])
             if image_info["choice"] == "reused":
                 for item in actions:
-                    component = deployed[item["component"]]
-                    action = next(value for value in component["actions"] if value["id"] == item["id"])
-                    if is_image_action(action):
+                    if (item["component"], item["id"]) in image_action_keys:
                         item["status"] = "skipped-compliant"
             for component in deployed.values():
                 for action in component["actions"]:
-                    if action["phase"] == "preflight" and (not is_image_action(action) or image_info["choice"] == "install"):
-                        current = next(item for item in actions if item["component"] == component["name"] and item["id"] == action["id"])
+                    key = component["name"], action["id"]
+                    if action["phase"] == "preflight" and (key not in image_action_keys or image_info["choice"] == "install"):
+                        current = action_results[key]
                         _run_action(action, component, staged_image, recovery, staged[component["name"]][1])
                         current["status"] = "succeeded"
                         current = None
@@ -859,11 +869,14 @@ def _execute_components(deployed: dict[str, dict], artifact: dict, image: pathli
                             shutil.rmtree(temporary)
             for item in actions:
                 if item["phase"] == "apply":
+                    key = item["component"], item["id"]
                     component = deployed[item["component"]]
-                    action = next(value for value in component["actions"] if value["id"] == item["id"])
-                    if is_image_action(action) and image_info["choice"] != "install":
+                    action = action_specs[key]
+                    if item["status"] == "skipped-compliant":
+                        continue
+                    if key in image_action_keys and image_info["choice"] != "install":
                         item["status"] = "skipped-compliant"
-                    elif not is_image_action(action) and host_mismatch is None:
+                    elif key not in image_action_keys and host_mismatch is None:
                         item["status"] = "skipped-compliant"
                     else:
                         current = item
@@ -877,7 +890,7 @@ def _execute_components(deployed: dict[str, dict], artifact: dict, image: pathli
                     current = item
                     failure_step = f"{item['component']}:{item['id']}"
                     component = deployed[item["component"]]
-                    action = next(value for value in component["actions"] if value["id"] == item["id"])
+                    action = action_specs[(item["component"], item["id"])]
                     _run_action(action, component, staged_image, recovery, plans[item["component"]][0])
                     item["status"] = "succeeded"
                     current = None
@@ -898,15 +911,15 @@ def _execute_components(deployed: dict[str, dict], artifact: dict, image: pathli
                     failure_step = "caller-image-consumption"
                     _consume_caller_image(image, roots, artifact["sha256"])
             diagnostic = "developer deployment verified" if developer else "deployment verified; configuration is pending"
-            _publish(result_path, result_builder(roots, actions, "succeeded", phase, None, diagnostic, started_at, image_info), validate=validate_result)
+            _publish(result_path, result_builder(roots, actions, "succeeded", phase, None, diagnostic, started_at, image_info), validate=not developer)
             return 0
     except KeyboardInterrupt:
-        _publish(result_path, result_builder(roots, actions, "interrupted", phase, f"{current['component']}:{current['id']}" if current else failure_step, "deployment interrupted; repair or inspect and rerun", started_at, image_info), validate=validate_result)
+        _publish(result_path, result_builder(roots, actions, "interrupted", phase, f"{current['component']}:{current['id']}" if current else failure_step, "deployment interrupted; repair or inspect and rerun", started_at, image_info), validate=not developer)
         return 2
     except (DeploymentError, OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
         if current is not None:
             current["status"] = "failed"
-        _publish(result_path, result_builder(roots, actions, "failed", phase, f"{current['component']}:{current['id']}" if current else failure_step, str(exc), started_at, image_info), validate=validate_result)
+        _publish(result_path, result_builder(roots, actions, "failed", phase, f"{current['component']}:{current['id']}" if current else failure_step, str(exc), started_at, image_info), validate=not developer)
         print("mkchad-deploy: " + REDACT.sub(r"\1=<redacted>", str(exc)), file=sys.stderr)
         return 2
     finally:
@@ -924,7 +937,7 @@ def execute_deployment(repo: pathlib.Path, image: pathlib.Path, *, release_tag: 
     deployed = {item["name"]: dict(item) for item in manifest["components"] if item["disposition"] == "deployed"}
     return _execute_components(
         deployed, artifact, image, developer=False, log_path=log_path, result_path=result_path, run_id=run_id, replace_partial=replace_partial,
-        stage_sources=_stage_release_sources, recheck_sources=lambda: None, validate_result=True,
+        stage_sources=_stage_release_sources, recheck_sources=lambda: None,
         result_builder=lambda roots, actions, outcome, phase, failed_step, diagnostic, started_at, image_info: _result(manifest, roots, artifact, run_id, release_tag, started_at, log_path, actions, outcome, phase, failed_step, diagnostic, image_info["active_sha256"]),
     )
 
@@ -946,7 +959,7 @@ def execute_developer_deployment(workspace: pathlib.Path, image: pathlib.Path | 
     deployed = _developer_components(admission["commits"])
     return _execute_components(
         deployed, artifact, image, developer=True, log_path=log_path, result_path=result_path, run_id=run_id, replace_partial=replace_partial,
-        stage_sources=lambda _components, staging: stage_developer_sources(admission, staging), recheck_sources=lambda: recheck_developer_workspace(admission), validate_result=False,
+        stage_sources=lambda _components, staging: stage_developer_sources(admission, staging), recheck_sources=lambda: recheck_developer_workspace(admission),
         result_builder=lambda _roots, actions, outcome, phase, failed_step, diagnostic, started, image_info: developer_result(admission, actions=actions, artifact=artifact, image=image_info, run_id=run_id, started_at=started, log_path=log_path, outcome=outcome, phase=phase, failed_step=failed_step, diagnostic=diagnostic),
     )
 
