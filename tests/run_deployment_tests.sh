@@ -19,8 +19,8 @@ chmod 700 "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$XDG_RU
 export PATH="$canonical/bin:$PATH"
 export NVIM_CONTAINER_DIR="$HOME/containers"
 
-python3 -m py_compile deploy/mkchad_release.py deploy/mkchad_deploy.py
-python3 -m unittest -v tests.test_mkchad_release tests.test_mkchad_deploy
+python3 -m py_compile deploy/mkchad_release.py deploy/mkchad_develop.py deploy/mkchad_deploy.py
+python3 -m unittest -v tests.test_mkchad_release tests.test_mkchad_develop tests.test_mkchad_deploy
 
 cat > "$canonical/bin/apptainer" <<'SH'
 #!/usr/bin/env sh

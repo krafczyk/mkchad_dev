@@ -42,6 +42,18 @@ PHASES = ("preflight", "apply", "verify")
 TOKENS = frozenset({"recovery_dir", "staged_image", "component_revision"})
 ARCHITECTURES = frozenset({"x86_64", "aarch64", "ppc64le"})
 REDACT = re.compile(r"(?i)\b([A-Za-z0-9_-]*(?:password|token|secret|api[_-]?key)[A-Za-z0-9_-]*)=[^\s]+")
+DEVELOPER_REPOSITORIES = {
+    "msk_containers": "git@github.com:krafczyk/msk_containers",
+    "container_tools": "git@github.com:krafczyk/container_tools",
+    "mkchad": "git@github.com:krafczyk/mkchad",
+}
+DEVELOPER_ACTIONS = [
+    {"id": "host-tools-preflight", "phase": "preflight", "path": "bin/install_nvim.sh", "args": ["--check", "--recovery-dir", {"token": "recovery_dir"}]},
+    {"id": "image-install-preflight", "phase": "preflight", "path": "nvim/bin/install_nvim_container", "args": ["--dry-run", "--source-revision", {"token": "component_revision"}, {"token": "staged_image"}]},
+    {"id": "host-tools-install", "phase": "apply", "path": "bin/install_nvim.sh", "args": ["--recovery-dir", {"token": "recovery_dir"}]},
+    {"id": "image-install", "phase": "apply", "path": "nvim/bin/install_nvim_container", "args": ["--source-revision", {"token": "component_revision"}, {"token": "staged_image"}]},
+    {"id": "host-tools-verify", "phase": "verify", "path": "bin/install_nvim.sh", "args": ["--check"]},
+]
 
 
 class DeploymentError(RuntimeError):
@@ -313,15 +325,130 @@ def _destination(roots: dict[str, pathlib.Path], component: dict) -> pathlib.Pat
     return roots[component["destination"]["root"]].joinpath(*pathlib.PurePosixPath(component["destination"]["path"]).parts)
 
 
-def _stage(component: dict, staging: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
-    """Fetch one manifest-pinned deployed component into disposable staging."""
+def _stage(component: dict, staging: pathlib.Path, source: pathlib.Path | None = None) -> tuple[pathlib.Path, pathlib.Path]:
+    """Fetch one selected component into disposable staging from its declared source."""
     bare, checkout = staging / f"{component['name']}.git", staging / component["name"]
     _git(["init", "--bare", str(bare)])
-    _git(["-C", str(bare), "fetch", "--no-tags", component["repository"], component["commit"]])
+    _git(["-C", str(bare), "fetch", "--no-tags", str(source or component["repository"]), component["commit"]])
     if _git(["-C", str(bare), "cat-file", "-e", component["commit"] + "^{commit}"], check=False).returncode:
         raise DeploymentError(f"staged component commit is unavailable: {component['name']}")
     _git(["-C", str(bare), "worktree", "add", "--detach", str(checkout), component["commit"]])
     return bare, checkout
+
+
+def _overlay_container_tools(staged: dict[str, tuple[pathlib.Path, pathlib.Path]], components: dict[str, dict]):
+    """Replace the staged msk nested checkout with the independent tools snapshot."""
+    nested = staged["msk_containers"][1] / "container_tools"
+    if nested.is_symlink():
+        nested.unlink()
+    elif nested.exists():
+        shutil.rmtree(nested)
+    _git(["clone", "--no-checkout", str(staged["container_tools"][0]), str(nested)])
+    _git(["-C", str(nested), "checkout", "--detach", components["container_tools"]["commit"]])
+
+
+def _stage_release_sources(components: dict[str, dict], staging: pathlib.Path) -> dict[str, tuple[pathlib.Path, pathlib.Path]]:
+    """Stage manifest-pinned components from their release repositories."""
+    staged = {name: _stage(component, staging) for name, component in components.items()}
+    _overlay_container_tools(staged, components)
+    return staged
+
+
+def _developer_components(commits: dict[str, str]) -> dict[str, dict]:
+    """Build the fixed developer deployment profile for selected local commits."""
+    return {
+        "msk_containers": {
+            "name": "msk_containers", "disposition": "deployed", "repository": DEVELOPER_REPOSITORIES["msk_containers"], "commit": commits["msk_containers"],
+            "destination": {"root": "xdg_data_home", "path": "mkchad/components/msk_containers"}, "actions": [dict(action) for action in DEVELOPER_ACTIONS],
+        },
+        "container_tools": {
+            "name": "container_tools", "disposition": "deployed", "repository": DEVELOPER_REPOSITORIES["container_tools"], "commit": commits["container_tools"],
+            "destination": {"root": "xdg_data_home", "path": "mkchad/components/msk_containers/container_tools"}, "actions": [],
+        },
+        "mkchad": {
+            "name": "mkchad", "disposition": "deployed", "repository": DEVELOPER_REPOSITORIES["mkchad"], "commit": commits["mkchad"],
+            "destination": {"root": "xdg_config_home", "path": "mkchad"}, "actions": [], "preserved_paths": ["opencode-server.json", "lazy-lock.json"],
+        },
+    }
+
+
+def _workspace_status(path: pathlib.Path) -> list[tuple[str, str]]:
+    """Return porcelain-v1 status records while preserving unusual path bytes."""
+    raw = _git(["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=none"], path).stdout
+    records = raw.split("\0")
+    status = []
+    while records and records[0]:
+        record = records.pop(0)
+        code, name = record[:2], record[3:]
+        if code[0] in "RC" or code[1] in "RC":
+            records.pop(0)
+            status.append((code, ""))
+        else:
+            status.append((code, name))
+    return status
+
+
+def _developer_child(path: pathlib.Path, name: str, *, allow_nested: bool = False) -> str:
+    """Require one expected non-symbolic child checkout to be clean at a commit."""
+    if path.is_symlink() or not path.is_dir():
+        raise DeploymentError(f"expected child is not a directory: {name}")
+    try:
+        top = pathlib.Path(_git(["rev-parse", "--show-toplevel"], path).stdout.strip()).resolve(strict=True)
+    except (DeploymentError, OSError) as exc:
+        raise DeploymentError(f"expected child is not a Git top level: {name}") from exc
+    if top != path.resolve(strict=True):
+        raise DeploymentError(f"expected child is not a Git top level: {name}")
+    for code, changed in _workspace_status(path):
+        nested_change = allow_nested and changed.rstrip("/") == "container_tools" and "U" not in code
+        if not nested_change:
+            raise DeploymentError(f"developer child has local work: {name}:{changed or '<rename>'}")
+    commit = _git(["rev-parse", "--verify", "HEAD^{commit}"], path, check=False)
+    if commit.returncode or not SHA1.fullmatch(commit.stdout.strip()):
+        raise DeploymentError(f"developer child HEAD is not a commit: {name}")
+    return commit.stdout.strip()
+
+
+def admit_developer_workspace(workspace: pathlib.Path) -> dict:
+    """Validate the canonical developer workspace and select its three clean child HEADs."""
+    try:
+        workspace = workspace.resolve(strict=True)
+        top = pathlib.Path(_git(["rev-parse", "--show-toplevel"], workspace).stdout.strip()).resolve(strict=True)
+    except (DeploymentError, OSError) as exc:
+        raise DeploymentError("current directory is not the parent Git top level") from exc
+    if workspace != top:
+        raise DeploymentError("current directory is not the parent Git top level")
+    msk, tools, mkchad = workspace / "msk_containers", workspace / "msk_containers" / "container_tools", workspace / "mkchad"
+    commits = {
+        "msk_containers": _developer_child(msk, "msk_containers", allow_nested=True),
+        "container_tools": _developer_child(tools, "container_tools"),
+        "mkchad": _developer_child(mkchad, "mkchad"),
+    }
+    parent_head = _git(["rev-parse", "--verify", "HEAD^{commit}"], workspace, check=False).stdout.strip()
+    return {
+        "workspace": workspace,
+        "parent": {"path": str(workspace), "revision": parent_head if SHA1.fullmatch(parent_head) else None, "dirty": bool(_workspace_status(workspace))},
+        "sources": {"msk_containers": msk, "container_tools": tools, "mkchad": mkchad},
+        "commits": commits,
+    }
+
+
+def recheck_developer_workspace(admission: dict):
+    """Refuse target mutation when any source changed after local staging began."""
+    for name, source in admission["sources"].items():
+        try:
+            commit = _developer_child(source, name, allow_nested=name == "msk_containers")
+        except DeploymentError as exc:
+            raise DeploymentError(f"developer source changed while staging: {name}") from exc
+        if commit != admission["commits"][name]:
+            raise DeploymentError(f"developer source changed while staging: {name}")
+
+
+def stage_developer_sources(admission: dict, staging: pathlib.Path) -> dict[str, tuple[pathlib.Path, pathlib.Path]]:
+    """Stage each admitted local commit and overlay the independent nested checkout."""
+    components = _developer_components(admission["commits"])
+    staged = {name: _stage(component, staging, admission["sources"][name]) for name, component in components.items()}
+    _overlay_container_tools(staged, components)
+    return staged
 
 
 def _validate_actions(component: dict, checkout: pathlib.Path):
@@ -511,65 +638,58 @@ def _result(release: dict, roots: dict[str, pathlib.Path], artifact: dict, run_i
     return {"schema": 1, "run_id": run_id, "release": tag, "started_at": started_at, "completed_at": _timestamp(), "outcome": outcome, "phase": phase, "components": components, "artifact": {"architecture": artifact["architecture"], "expected_sha256": artifact["sha256"], "observed_sha256": observed_image}, "actions": actions, "configuration_handoff": {"state": "configuration-pending", "contract_version": 1, "guidance": release["configuration"]["guidance"], "components": [{"name": item["name"], "repository": item["repository"], "commit": item["commit"]} for item in release["components"] if item["disposition"] == "configuration-owned"]}, "failed_step": failed_step, "diagnostic": REDACT.sub(r"\1=<redacted>", diagnostic)[:4096], "log_path": str(log_path)}
 
 
+def developer_result(admission: dict, *, actions: list[dict], artifact: dict, run_id: str, started_at: str, log_path: pathlib.Path, outcome: str, phase: str, failed_step: str | None, diagnostic: str) -> dict:
+    """Build the mode-tagged developer result from local-workspace evidence.
+
+    The developer result intentionally has no release schema: it records only the
+    selected local components and the observations needed to repair a local run.
+    """
+    roots, profile, observed_image = _roots(), _developer_components(admission["commits"]), None
+    with contextlib.suppress(OSError):
+        observed_image = _active_image_digest(roots["home"])
+    components = []
+    for name in ("msk_containers", "container_tools", "mkchad"):
+        observed = None
+        with contextlib.suppress(Exception):
+            observed = _git(["rev-parse", "HEAD"], _destination(roots, profile[name])).stdout.strip()
+        components.append({"name": name, "requested_commit": admission["commits"][name], "observed_commit": observed})
+    return {
+        "mode": "developer", "run_id": run_id, "workspace": admission["parent"], "started_at": started_at, "completed_at": _timestamp(),
+        "outcome": outcome, "phase": phase, "components": components,
+        "artifact": {"architecture": artifact["architecture"], "requested_sha256": artifact["sha256"], "observed_sha256": observed_image},
+        "actions": actions, "failed_step": failed_step, "diagnostic": REDACT.sub(r"\1=<redacted>", diagnostic)[:4096], "log_path": str(log_path),
+    }
+
+
 def _timestamp() -> str:
     """Return a result-schema UTC timestamp."""
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _publish(path: pathlib.Path, document: dict):
+def _publish(path: pathlib.Path, document: dict, *, validate=True):
     """Atomically replace the launcher-owned result path for this admitted run."""
-    validate_result_v1_document(document)
+    if validate:
+        validate_result_v1_document(document)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}-{uuid.uuid4().hex}")
     temporary.write_text(json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
     os.replace(temporary, path)
 
 
-def execute_deployment(repo: pathlib.Path, image: pathlib.Path, *, release_tag: str, log_path: pathlib.Path, result_path: pathlib.Path, run_id: str, replace_partial: bool = False) -> int:
-    """Preflight, apply, verify, and report one schema-2 release deployment.
+def _execute_components(deployed: dict[str, dict], artifact: dict, image: pathlib.Path, *, log_path: pathlib.Path, result_path: pathlib.Path, run_id: str, replace_partial: bool, stage_sources, recheck_sources, result_builder, validate_result: bool) -> int:
+    """Run the shared target procedure from already-selected component sources.
 
-    Args:
-        repo: Release checkout containing the authoritative manifest.
-        image: Caller-supplied raw SIF artifact.
-        release_tag: Exact launcher-selected release tag.
-        log_path: Launcher-owned absolute run-log path.
-        result_path: Launcher-owned path for atomic terminal-result publication.
-        run_id: Launcher-generated UUID binding the result to this invocation.
-        replace_partial: Whether the operator asserts that a legacy partial
-            target has no active managed service and may be replaced.
-
-    Returns:
-        Zero after verified success, or two after a published failure or
-        interruption.
-
-    Raises:
-        DeploymentError: If launcher handoff metadata is malformed before a run
-            can be admitted.
-
-    Side effects:
-        Fetches temporary repositories, runs bounded component actions, updates
-        clean final checkouts and installer outputs, and atomically publishes a
-        terminal result. Earlier successful changes remain after later failure.
+    Source selection differs between release and developer modes; destination
+    validation, lifecycle checks, apply order, and failure handling do not.
     """
-    if not TAG.fullmatch(release_tag) or ".." in release_tag or not UUID.fullmatch(run_id):
-        raise DeploymentError("invalid launcher handoff")
     started_at, roots, current, phase, failure_step = _timestamp(), _roots(), None, "preflight", "preflight"
-    manifest = validate_release_v2_document(_load(repo / "deploy" / "release.json", "release manifest"))
-    artifact = next((item for item in manifest["artifacts"]["nvim-image"] if item["architecture"] == {"amd64": "x86_64", "arm64": "aarch64"}.get(os.uname().machine.lower(), os.uname().machine.lower())), None)
-    if artifact is None:
-        raise DeploymentError("release has no image for this architecture")
-    actions = [{"component": component["name"], "id": action["id"], "phase": action["phase"], "status": "pending"} for component in manifest["components"] if component["disposition"] == "deployed" for action in component["actions"]]
+    actions = [{"component": component["name"], "id": action["id"], "phase": action["phase"], "status": "pending"} for component in deployed.values() for action in component["actions"]]
     staging = pathlib.Path(tempfile.mkdtemp(prefix="mkchad-deploy-"))
     try:
-        deployed = {item["name"]: dict(item) for item in manifest["components"] if item["disposition"] == "deployed"}
-        staged = {name: _stage(component, staging) for name, component in deployed.items()}
-        nested = staged["msk_containers"][1] / "container_tools"
-        if nested.exists():
-            shutil.rmtree(nested)
-        _git(["clone", "--no-checkout", str(staged["container_tools"][0]), str(nested)])
-        _git(["-C", str(nested), "checkout", "--detach", deployed["container_tools"]["commit"]])
+        staged = stage_sources(deployed, staging)
         for name, component in deployed.items():
             _validate_actions(component, staged[name][1])
+        recheck_sources()
         staged_image = _stage_image(image, staging, artifact)
         _runtime_image(staged_image, artifact["architecture"])
         plans = {
@@ -671,7 +791,7 @@ def execute_deployment(repo: pathlib.Path, image: pathlib.Path, *, release_tag: 
             for name, component in deployed.items():
                 failure_step = f"checkout-verification:{name}"
                 if _existing(plans[name][0], component, staged[name][1])["head"] != component["commit"]:
-                    raise DeploymentError(f"deployed checkout is not at its manifest commit: {name}")
+                    raise DeploymentError(f"deployed checkout is not at its selected commit: {name}")
             failure_step = "host-tool-verification"
             mismatch = _host_tool_mismatch(plans["msk_containers"][0], roots["home"])
             if mismatch is not None:
@@ -681,19 +801,59 @@ def execute_deployment(repo: pathlib.Path, image: pathlib.Path, *, release_tag: 
                 raise DeploymentError("installed image digest does not match the release artifact")
             failure_step = "caller-image-consumption"
             _consume_caller_image(image, roots, artifact["sha256"])
-            _publish(result_path, _result(manifest, roots, artifact, run_id, release_tag, started_at, log_path, actions, "succeeded", phase, None, "deployment verified; configuration is pending"))
+            _publish(result_path, result_builder(roots, actions, "succeeded", phase, None, "deployment verified; configuration is pending", started_at), validate=validate_result)
             return 0
     except KeyboardInterrupt:
-        _publish(result_path, _result(manifest, roots, artifact, run_id, release_tag, started_at, log_path, actions, "interrupted", phase, f"{current['component']}:{current['id']}" if current else failure_step, "deployment interrupted; repair or inspect and rerun"))
+        _publish(result_path, result_builder(roots, actions, "interrupted", phase, f"{current['component']}:{current['id']}" if current else failure_step, "deployment interrupted; repair or inspect and rerun", started_at), validate=validate_result)
         return 2
     except (DeploymentError, OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
         if current is not None:
             current["status"] = "failed"
-        _publish(result_path, _result(manifest, roots, artifact, run_id, release_tag, started_at, log_path, actions, "failed", phase, f"{current['component']}:{current['id']}" if current else failure_step, str(exc)))
+        _publish(result_path, result_builder(roots, actions, "failed", phase, f"{current['component']}:{current['id']}" if current else failure_step, str(exc), started_at), validate=validate_result)
         print("mkchad-deploy: " + REDACT.sub(r"\1=<redacted>", str(exc)), file=sys.stderr)
         return 2
     finally:
         shutil.rmtree(staging, ignore_errors=True)
+
+
+def execute_deployment(repo: pathlib.Path, image: pathlib.Path, *, release_tag: str, log_path: pathlib.Path, result_path: pathlib.Path, run_id: str, replace_partial: bool = False) -> int:
+    """Preflight, apply, verify, and report one manifest-authorized release deployment."""
+    if not TAG.fullmatch(release_tag) or ".." in release_tag or not UUID.fullmatch(run_id):
+        raise DeploymentError("invalid launcher handoff")
+    manifest = validate_release_v2_document(_load(repo / "deploy" / "release.json", "release manifest"))
+    artifact = next((item for item in manifest["artifacts"]["nvim-image"] if item["architecture"] == {"amd64": "x86_64", "arm64": "aarch64"}.get(os.uname().machine.lower(), os.uname().machine.lower())), None)
+    if artifact is None:
+        raise DeploymentError("release has no image for this architecture")
+    deployed = {item["name"]: dict(item) for item in manifest["components"] if item["disposition"] == "deployed"}
+    return _execute_components(
+        deployed, artifact, image, log_path=log_path, result_path=result_path, run_id=run_id, replace_partial=replace_partial,
+        stage_sources=_stage_release_sources, recheck_sources=lambda: None, validate_result=True,
+        result_builder=lambda roots, actions, outcome, phase, failed_step, diagnostic, started_at: _result(manifest, roots, artifact, run_id, release_tag, started_at, log_path, actions, outcome, phase, failed_step, diagnostic),
+    )
+
+
+def execute_developer_deployment(workspace: pathlib.Path, image: pathlib.Path, *, log_path: pathlib.Path, result_path: pathlib.Path, run_id: str, replace_partial: bool = False) -> int:
+    """Deploy clean local child commits through the regular target procedure.
+
+    Local source commits are admitted and staged without consulting origins or
+    release metadata. The caller image remains required until the optional-image
+    developer flow is introduced separately.
+    """
+    if not UUID.fullmatch(run_id):
+        raise DeploymentError("invalid developer handoff")
+    admission = admit_developer_workspace(workspace)
+    architecture = {"amd64": "x86_64", "arm64": "aarch64"}.get(os.uname().machine.lower(), os.uname().machine.lower())
+    if architecture not in ARCHITECTURES:
+        raise DeploymentError("developer deployment has no image for this architecture")
+    if not image.is_file() or image.is_symlink():
+        raise DeploymentError("caller image is not a regular file")
+    artifact = {"architecture": architecture, "sha256": _digest(image)}
+    deployed = _developer_components(admission["commits"])
+    return _execute_components(
+        deployed, artifact, image, log_path=log_path, result_path=result_path, run_id=run_id, replace_partial=replace_partial,
+        stage_sources=lambda _components, staging: stage_developer_sources(admission, staging), recheck_sources=lambda: recheck_developer_workspace(admission), validate_result=False,
+        result_builder=lambda _roots, actions, outcome, phase, failed_step, diagnostic, started: developer_result(admission, actions=actions, artifact=artifact, run_id=run_id, started_at=started, log_path=log_path, outcome=outcome, phase=phase, failed_step=failed_step, diagnostic=diagnostic),
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -717,9 +877,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--result-path", type=pathlib.Path, required=True)
     parser.add_argument("--run-id", required=True)
     args = parser.parse_args(argv)
-    if args.deploy != "deploy":
-        parser.error("only the deploy handoff is supported")
     try:
+        if args.deploy != "deploy":
+            parser.error("only the deploy handoff is supported")
         return execute_deployment(pathlib.Path.cwd(), args.image, release_tag=args.release, log_path=args.log_path, result_path=args.result_path, run_id=args.run_id, replace_partial=args.replace_partial)
     except DeploymentError as exc:
         print("mkchad-deploy: " + str(exc), file=sys.stderr)
