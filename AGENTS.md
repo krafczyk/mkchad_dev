@@ -123,8 +123,9 @@ concurrent startup, credential transport, bounded subprocesses, and recovery.
 
 ## Release Deployment Exception
 
-`mkchad-release` supports one trusted operator on a trusted host. For this
-release-deployment command only, malicious same-user writers, hostile local
+`mkchad-release` and the explicit repository-root developer command
+`./deploy/mkchad_develop.py` support one trusted operator on a trusted host.
+For these deployment commands only, malicious same-user writers, hostile local
 repository substitution, remote compromise, and adversarial filesystem races
 are outside the supported threat model. This exception does not change runtime
 server, credential, or cross-user network boundaries.

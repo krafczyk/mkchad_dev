@@ -157,7 +157,115 @@ value = json.loads(pathlib.Path(sys.argv[1]).read_text())
 assert value["release"] == "v2-fixture-update"
 assert value["outcome"] == "succeeded"
 assert value["diagnostic"] == "deployment verified; configuration is pending"
-assert [action["status"] for action in value["actions"]] == ["succeeded", "succeeded", "skipped-compliant", "skipped-compliant", "succeeded"]
+assert [action["status"] for action in value["actions"]] == ["succeeded", "skipped-compliant", "skipped-compliant", "skipped-compliant", "succeeded"]
 PY
 if python3 deploy/mkchad_deploy.py recover --deployment-id 123e4567-e89b-12d3-a456-426614174000; then exit 1; fi
 if python3 deploy/mkchad_release.py --release v2-fixture --image "$image" --expected-parent-commit "$(printf a%.0s {1..40})"; then exit 1; fi
+
+developer="$canonical/developer-tree"
+workspace="$developer/workspace"
+mkdir -p "$developer" "$workspace/deploy"
+git clone -q "$canonical/components/container_tools" "$developer/tools-source"
+git clone -q "$canonical/components/msk_containers" "$developer/msk-source"
+git -C "$developer/msk-source" -c protocol.file.allow=always submodule add -q "$developer/tools-source" container_tools
+git -C "$developer/msk-source" -c user.name=test -c user.email=test@example.invalid commit -q -m nested-tools
+git clone -q "$canonical/components/mkchad" "$developer/mkchad-source"
+cp deploy/mkchad_develop.py deploy/mkchad_deploy.py deploy/mkchad_release.py "$workspace/deploy/"
+chmod 755 "$workspace/deploy/mkchad_develop.py" "$workspace/deploy/mkchad_deploy.py" "$workspace/deploy/mkchad_release.py"
+git init -q "$workspace"
+git -C "$workspace" -c protocol.file.allow=always submodule add -q "$developer/msk-source" msk_containers
+git -C "$workspace" -c protocol.file.allow=always submodule add -q "$developer/mkchad-source" mkchad
+git -C "$workspace" -c protocol.file.allow=always submodule update -q --init --recursive
+git -C "$workspace" add .
+git -C "$workspace" -c user.name=test -c user.email=test@example.invalid commit -q -m workspace
+
+tools="$workspace/msk_containers/container_tools"
+printf '%s\n' local-tools-one >> "$tools/tool.sh"
+git -C "$tools" add tool.sh
+git -C "$tools" -c user.name=test -c user.email=test@example.invalid commit -q -m local-tools-one
+git -C "$workspace/msk_containers" add container_tools
+git -C "$workspace/msk_containers" -c user.name=test -c user.email=test@example.invalid commit -q -m local-msk
+printf '%s\n' local-tools-two >> "$tools/tool.sh"
+git -C "$tools" add tool.sh
+git -C "$tools" -c user.name=test -c user.email=test@example.invalid commit -q -m local-tools-two
+printf '%s\n' 'return { developer = true }' >> "$workspace/mkchad/init.lua"
+git -C "$workspace/mkchad" add init.lua
+git -C "$workspace/mkchad" -c user.name=test -c user.email=test@example.invalid commit -q -m local-mkchad
+for child in "$workspace/msk_containers" "$tools" "$workspace/mkchad"; do
+  git -C "$child" remote remove origin
+done
+printf '%s\n' parent-dirty > "$workspace/parent-untracked"
+msk_commit=$(git -C "$workspace/msk_containers" rev-parse HEAD)
+tools_commit=$(git -C "$tools" rev-parse HEAD)
+mkchad_commit=$(git -C "$workspace/mkchad" rev-parse HEAD)
+
+developer_home="$developer/home"
+developer_config="$developer/config"
+developer_data="$developer/data"
+developer_state="$developer/state"
+developer_runtime="$developer/runtime"
+developer_tmp="$developer/tmp"
+mkdir -p "$developer_home/containers" "$developer_config" "$developer_data" "$developer_state" "$developer_runtime" "$developer_tmp"
+chmod 700 "$developer_home" "$developer_config" "$developer_data" "$developer_state" "$developer_runtime" "$developer_tmp"
+printf active-image > "$developer_home/containers/active.sif"
+ln -s active.sif "$developer_home/containers/neovim.sif"
+active_target=$(readlink "$developer_home/containers/neovim.sif")
+active_digest=$(sha256sum "$developer_home/containers/active.sif" | cut -d' ' -f1)
+
+run_developer() {
+  (
+    cd "$workspace"
+    env HOME="$developer_home" XDG_CONFIG_HOME="$developer_config" XDG_DATA_HOME="$developer_data" XDG_STATE_HOME="$developer_state" XDG_RUNTIME_DIR="$developer_runtime" TMPDIR="$developer_tmp" NVIM_CONTAINER_DIR="$developer_home/containers" ./deploy/mkchad_develop.py "$@"
+  )
+}
+
+run_developer --replace-partial
+python3 - "$developer_state/mkchad/deploy/latest-result.json" "$msk_commit" "$tools_commit" "$mkchad_commit" <<'PY'
+import json
+import pathlib
+import sys
+
+result = json.loads(pathlib.Path(sys.argv[1]).read_text())
+assert result["mode"] == "developer"
+assert result["outcome"] == "succeeded"
+assert result["diagnostic"] == "developer deployment verified"
+assert result["workspace"]["dirty"] is True
+assert result["image"]["choice"] == "omitted"
+assert all("image" not in action["id"] for action in result["actions"])
+assert {item["name"]: item["observed_commit"] for item in result["components"]} == dict(zip(("msk_containers", "container_tools", "mkchad"), sys.argv[2:]))
+PY
+test "$(git -C "$developer_data/mkchad/components/msk_containers" rev-parse HEAD)" = "$msk_commit"
+test "$(git -C "$developer_data/mkchad/components/msk_containers/container_tools" rev-parse HEAD)" = "$tools_commit"
+test "$(git -C "$developer_config/mkchad" rev-parse HEAD)" = "$mkchad_commit"
+test "$(readlink "$developer_home/containers/neovim.sif")" = "$active_target"
+test "$(sha256sum "$developer_home/containers/active.sif" | cut -d' ' -f1)" = "$active_digest"
+
+same_image="$developer/caller-same.sif"
+cp "$developer_home/containers/active.sif" "$same_image"
+run_developer --image "$same_image"
+python3 - "$developer_state/mkchad/deploy/latest-result.json" <<'PY'
+import json
+import pathlib
+result = json.loads(pathlib.Path(__import__("sys").argv[1]).read_text())
+assert result["image"]["choice"] == "reused"
+assert {action["id"]: action["status"] for action in result["actions"] if "image" in action["id"]} == {"image-install-preflight": "skipped-compliant", "image-install": "skipped-compliant"}
+PY
+test -f "$same_image"
+test "$(readlink "$developer_home/containers/neovim.sif")" = "$active_target"
+test "$(sha256sum "$developer_home/containers/active.sif" | cut -d' ' -f1)" = "$active_digest"
+
+changed_image="$developer/caller-changed.sif"
+printf changed-image > "$changed_image"
+changed_digest=$(sha256sum "$changed_image" | cut -d' ' -f1)
+run_developer --image "$changed_image"
+python3 - "$developer_state/mkchad/deploy/latest-result.json" <<'PY'
+import json
+import pathlib
+result = json.loads(pathlib.Path(__import__("sys").argv[1]).read_text())
+assert result["image"]["choice"] == "install"
+assert {action["id"]: action["status"] for action in result["actions"] if "image" in action["id"]} == {"image-install-preflight": "succeeded", "image-install": "succeeded"}
+PY
+test -f "$changed_image"
+test "$(sha256sum "$changed_image" | cut -d' ' -f1)" = "$changed_digest"
+test "$(sha256sum "$developer_home/containers/neovim_fixture.sif" | cut -d' ' -f1)" = "$changed_digest"
+test "$(sha256sum "$developer_home/containers/$(readlink "$developer_home/containers/neovim.sif")" | cut -d' ' -f1)" = "$changed_digest"

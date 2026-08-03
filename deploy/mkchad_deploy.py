@@ -897,7 +897,8 @@ def _execute_components(deployed: dict[str, dict], artifact: dict, image: pathli
                 if not developer:
                     failure_step = "caller-image-consumption"
                     _consume_caller_image(image, roots, artifact["sha256"])
-            _publish(result_path, result_builder(roots, actions, "succeeded", phase, None, "deployment verified; configuration is pending", started_at, image_info), validate=validate_result)
+            diagnostic = "developer deployment verified" if developer else "deployment verified; configuration is pending"
+            _publish(result_path, result_builder(roots, actions, "succeeded", phase, None, diagnostic, started_at, image_info), validate=validate_result)
             return 0
     except KeyboardInterrupt:
         _publish(result_path, result_builder(roots, actions, "interrupted", phase, f"{current['component']}:{current['id']}" if current else failure_step, "deployment interrupted; repair or inspect and rerun", started_at, image_info), validate=validate_result)

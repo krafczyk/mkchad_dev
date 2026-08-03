@@ -194,6 +194,7 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         result = json.loads(result_path.read_text(encoding="utf-8"))
         self.assertEqual(result["mode"], "developer")
         self.assertEqual(result["outcome"], "succeeded")
+        self.assertEqual(result["diagnostic"], "developer deployment verified")
         destination = self.root / "config" / "mkchad"
         self.assertEqual(self._commit_value(destination), self._commit_value(self.mkchad))
         self.assertTrue(image.is_file())
