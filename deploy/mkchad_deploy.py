@@ -606,7 +606,7 @@ def _installer_sources(msk_checkout: pathlib.Path) -> list[pathlib.Path]:
     paths = set((msk_checkout / "container_tools").glob("*.sh"))
     bin_dir = msk_checkout / "nvim" / "bin"
     paths.update(bin_dir.glob("*.sh"))
-    paths.update(path for path in (bin_dir / name for name in ("nvim", "nvim_shell", "nvim_clear_data", "mkchad", "mkchad-container-bootstrap", "mkchad-status-host-evidence", "mkchad-opencode-server-image", "mkchad-opencode-server", "install_nvim_container")) if path.is_file())
+    paths.update(path for path in (bin_dir / name for name in ("nvim", "nvim_shell", "nvim_clear_data", "nvim_clear_npm_global", "mkchad", "mkchad-container-bootstrap", "mkchad-status-host-evidence", "mkchad-opencode-server-image", "mkchad-opencode-server", "install_nvim_container")) if path.is_file())
     return sorted(paths, key=lambda path: path.name)
 
 

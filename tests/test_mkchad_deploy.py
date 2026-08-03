@@ -185,10 +185,11 @@ class DeploymentExecutionTests(unittest.TestCase):
                 "bin/install_nvim.sh": "#!/bin/sh\nset -eu\nif [ \"${1:-}\" = --check ]; then\n  { [ \"$#\" -eq 1 ] || { [ \"$#\" -eq 3 ] && [ \"$2\" = --recovery-dir ] && [ -d \"$3\" ]; }; } || exit 2\n  exit \"${HOST_PREFLIGHT_STATUS:-0}\"\nfi\n[ \"$#\" -eq 2 ] && [ \"$1\" = --recovery-dir ] && [ -d \"$2\" ] || exit 2\nmkdir -p \"$HOME/.local/bin\"\ncp container_tools/*.sh nvim/bin/* \"$HOME/.local/bin/\"\nchmod 755 \"$HOME/.local/bin\"/*\n",
                 "nvim/bin/nvim": "#!/bin/sh\nexit 0\n",
                 "nvim/bin/nvim_library.sh": "#!/bin/sh\nreturn 0\n",
+                "nvim/bin/nvim_clear_npm_global": "#!/bin/sh\nexit 0\n",
                 "nvim/bin/mkchad-opencode-server": "#!/bin/sh\nprintf '{\"schema\":1,\"ok\":true,\"command\":\"status\",\"status\":\"%s\"}\\n' \"${LIFECYCLE_STATUS:-inactive}\"\n",
                 "nvim/bin/install_nvim_container": "#!/bin/sh\nset -eu\ndry_run=0\nif [ \"${1:-}\" = --dry-run ]; then dry_run=1; shift; fi\n[ \"$#\" -eq 3 ] && [ \"$1\" = --source-revision ] && [ \"${#2}\" -eq 40 ] && [ \"${3##*/}\" = nvim_container_x86.sif ] || exit 2\n[ \"$dry_run\" -eq 0 ] || exit \"${IMAGE_PREFLIGHT_STATUS:-0}\"\n[ \"${IMAGE_INSTALL_STATUS:-0}\" = 0 ] || exit \"$IMAGE_INSTALL_STATUS\"\nmkdir -p \"$NVIM_CONTAINER_DIR\"\ncp \"$3\" \"$NVIM_CONTAINER_DIR/neovim_fixture.sif\"\nln -sfn neovim_fixture.sif \"$NVIM_CONTAINER_DIR/neovim.sif\"\n",
             },
-            {"bin/install_nvim.sh", "nvim/bin/nvim", "nvim/bin/nvim_library.sh", "nvim/bin/mkchad-opencode-server", "nvim/bin/install_nvim_container"},
+            {"bin/install_nvim.sh", "nvim/bin/nvim", "nvim/bin/nvim_library.sh", "nvim/bin/nvim_clear_npm_global", "nvim/bin/mkchad-opencode-server", "nvim/bin/install_nvim_container"},
         )
         old_mkchad = self._repo("mkchad", {".gitignore": "opencode-server.json\n", "init.lua": "return {}\n"})
         mkchad_source = self.root / "sources" / "mkchad"
@@ -234,6 +235,7 @@ class DeploymentExecutionTests(unittest.TestCase):
         installed_image = self.home / "containers" / os.readlink(self.home / "containers" / "neovim.sif")
         self.assertEqual(hashlib.sha256(installed_image.read_bytes()).hexdigest(), self.manifest["artifacts"]["nvim-image"][0]["sha256"])
         self.assertEqual((self.home / ".local" / "bin" / "nvim_library.sh").stat().st_mode & 0o777, 0o755)
+        self.assertTrue((self.home / ".local" / "bin" / "nvim_clear_npm_global").is_file())
         preserved = {"opencode-server.json": "private\n", "lazy-lock.json": "{}\n"}
         for name, contents in preserved.items():
             (self._destination("mkchad") / name).write_text(contents, encoding="ascii")
