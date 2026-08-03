@@ -356,6 +356,21 @@ class DeploymentExecutionTests(unittest.TestCase):
         os.environ.pop("IMAGE_INSTALL_STATUS")
         self.assertEqual(self._execute("223e4567-e89b-12d3-a456-426614174000"), 0)
 
+    def test_failure_result_refreshes_the_active_image_digest_after_mutation(self):
+        digest = self.manifest["artifacts"]["nvim-image"][0]["sha256"]
+        with mock.patch.object(self.deploy, "_host_tool_mismatch", side_effect=[None, "nvim"]):
+            self.assertEqual(self._execute(), 2)
+
+        self.assertEqual(self._result()["artifact"]["observed_sha256"], digest)
+
+    def test_interrupted_result_refreshes_the_active_image_digest_after_mutation(self):
+        digest = self.manifest["artifacts"]["nvim-image"][0]["sha256"]
+        with mock.patch.object(self.deploy, "_host_tool_mismatch", side_effect=[None, KeyboardInterrupt()]):
+            self.assertEqual(self._execute(), 2)
+
+        self.assertEqual(self._result()["outcome"], "interrupted")
+        self.assertEqual(self._result()["artifact"]["observed_sha256"], digest)
+
     def test_preflight_refuses_unavailable_inputs_partial_targets_and_lock_contention(self):
         msk_component = next(component for component in self.manifest["components"] if component["name"] == "msk_containers")
         valid_commit = msk_component["commit"]

@@ -146,12 +146,33 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         with self.assertRaisesRegex(self.deploy.DeploymentError, "local work"):
             self.deploy.admit_developer_workspace(self.workspace)
 
+    def test_unmerged_nested_gitlink_is_not_treated_as_an_independent_head(self):
+        for code in ("AA", "DD"):
+            with self.subTest(code=code), mock.patch.object(
+                self.deploy,
+                "_workspace_status",
+                side_effect=lambda path, code=code: [(code, "container_tools")] if path == self.msk else [],
+            ):
+                with self.assertRaisesRegex(self.deploy.DeploymentError, "local work"):
+                    self.deploy.admit_developer_workspace(self.workspace)
+
     def test_source_changes_after_snapshot_recheck_are_rejected(self):
         admission = self.deploy.admit_developer_workspace(self.workspace)
         staging = pathlib.Path(tempfile.mkdtemp(prefix="mkchad-develop-stage-", dir="/tmp/mkchad-v1"))
         self.addCleanup(shutil.rmtree, staging, True)
         self.deploy.stage_developer_sources(admission, staging)
         (self.mkchad / "init.lua").write_text("changed\n", encoding="ascii")
+        with self.assertRaisesRegex(self.deploy.DeploymentError, "source changed while staging"):
+            self.deploy.recheck_developer_workspace(admission)
+
+    def test_clean_head_advancement_after_snapshot_recheck_is_rejected(self):
+        admission = self.deploy.admit_developer_workspace(self.workspace)
+        staging = pathlib.Path(tempfile.mkdtemp(prefix="mkchad-develop-stage-", dir="/tmp/mkchad-v1"))
+        self.addCleanup(shutil.rmtree, staging, True)
+        self.deploy.stage_developer_sources(admission, staging)
+        (self.mkchad / "init.lua").write_text("return { advanced = true }\n", encoding="ascii")
+        self._commit(self.mkchad, "advance clean head")
+
         with self.assertRaisesRegex(self.deploy.DeploymentError, "source changed while staging"):
             self.deploy.recheck_developer_workspace(admission)
 
@@ -240,14 +261,15 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         self.assertTrue((container_dir / "neovim.sif").is_symlink())
 
     def test_matching_developer_image_skips_image_work_and_preserves_caller(self):
-        image = self.root / "image.sif"
-        image.write_bytes(b"developer image")
         home = self.root / "home"
         container_dir = home / "containers"
         container_dir.mkdir(parents=True)
-        active = container_dir / "active.sif"
-        active.write_bytes(image.read_bytes())
-        (container_dir / "neovim.sif").symlink_to(active.name)
+        image_bytes = b"developer image"
+        digest = hashlib.sha256(image_bytes).hexdigest()
+        architecture = {"amd64": "x86_64", "arm64": "aarch64"}.get(os.uname().machine.lower(), os.uname().machine.lower())
+        image = container_dir / f"neovim_1.2.3_gabcdef0_{digest}_{architecture}.sif"
+        image.write_bytes(image_bytes)
+        (container_dir / "neovim.sif").symlink_to(image.name)
         environment = {
             "HOME": str(home), "XDG_CONFIG_HOME": str(self.root / "config"), "XDG_DATA_HOME": str(self.root / "data"),
             "XDG_STATE_HOME": str(self.root / "state"), "NVIM_CONTAINER_DIR": str(container_dir),
@@ -263,6 +285,28 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         self.assertTrue(image.is_file())
         self.assertEqual(sorted(path.name for path in container_dir.iterdir()), topology)
         self.assertFalse(any(call.args[0]["id"].startswith("image-") for call in action.call_args_list))
+
+    def test_install_rejects_a_developer_caller_the_installer_can_prune(self):
+        home = self.root / "home"
+        container_dir = home / "containers"
+        container_dir.mkdir(parents=True)
+        image_bytes = b"developer image"
+        digest = hashlib.sha256(image_bytes).hexdigest()
+        architecture = {"amd64": "x86_64", "arm64": "aarch64"}.get(os.uname().machine.lower(), os.uname().machine.lower())
+        image = container_dir / f"neovim_1.2.3_gabcdef0_{digest}_{architecture}.sif"
+        image.write_bytes(image_bytes)
+        environment = {
+            "HOME": str(home), "XDG_CONFIG_HOME": str(self.root / "config"), "XDG_DATA_HOME": str(self.root / "data"),
+            "XDG_STATE_HOME": str(self.root / "state"), "NVIM_CONTAINER_DIR": str(container_dir),
+        }
+        result_path = self.root / "developer-result.json"
+
+        with mock.patch.dict(os.environ, environment, clear=False), mock.patch.object(self.deploy, "_run_action") as action:
+            self.assertEqual(self.deploy.execute_developer_deployment(self.workspace, image, log_path=self.root / "developer.log", result_path=result_path, run_id="123e4567-e89b-12d3-a456-426614174000"), 2)
+
+        self.assertTrue(image.is_file())
+        action.assert_not_called()
+        self.assertIn("could prune the developer caller image", json.loads(result_path.read_text(encoding="utf-8"))["diagnostic"])
 
     def test_supplied_image_rejects_an_unsafe_active_selector_before_target_mutation(self):
         image = self.root / "image.sif"
@@ -309,6 +353,37 @@ class DeveloperWorkspaceTests(unittest.TestCase):
             self.assertEqual(command.main([]), 2)
 
         self.assertIsNone(execute.call_args.args[1])
+
+    def test_public_command_publishes_a_field_complete_fallback_for_os_errors(self):
+        command = load_developer_command()
+        state = self.root / "state"
+
+        with mock.patch.dict(os.environ, {"HOME": str(self.root / "home"), "XDG_STATE_HOME": str(state)}, clear=False), mock.patch.object(
+            command.deploy, "execute_developer_deployment", side_effect=OSError("preflight unavailable")
+        ):
+            self.assertEqual(command.main([]), 2)
+
+        result = json.loads((state / "mkchad" / "deploy" / "latest-result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["mode"], "developer")
+        self.assertEqual(result["outcome"], "failed")
+        self.assertEqual(result["phase"], "preflight")
+        self.assertEqual(result["failed_step"], "developer-admission")
+        self.assertEqual(result["image"], {"choice": "omitted", "supplied_sha256": None, "active_sha256": None, "decision": "preserved"})
+        self.assertIn("preflight unavailable", result["diagnostic"])
+
+    def test_public_command_publishes_an_interrupted_fallback(self):
+        command = load_developer_command()
+        state = self.root / "state"
+
+        with mock.patch.dict(os.environ, {"HOME": str(self.root / "home"), "XDG_STATE_HOME": str(state)}, clear=False), mock.patch.object(
+            command.deploy, "execute_developer_deployment", side_effect=KeyboardInterrupt
+        ):
+            self.assertEqual(command.main([]), 2)
+
+        result = json.loads((state / "mkchad" / "deploy" / "latest-result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["outcome"], "interrupted")
+        self.assertEqual(result["failed_step"], "developer-admission")
+        self.assertIn("interrupted", result["diagnostic"])
 
 
 if __name__ == "__main__":

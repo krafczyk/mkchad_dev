@@ -42,6 +42,7 @@ PHASES = ("preflight", "apply", "verify")
 TOKENS = frozenset({"recovery_dir", "staged_image", "component_revision"})
 ARCHITECTURES = frozenset({"x86_64", "aarch64", "ppc64le"})
 REDACT = re.compile(r"(?i)\b([A-Za-z0-9_-]*(?:password|token|secret|api[_-]?key)[A-Za-z0-9_-]*)=[^\s]+")
+MANAGED_IMAGE = re.compile(r"neovim_[0-9]+\.[0-9]+\.[0-9]+_g[0-9a-fA-F]{7,40}_[0-9a-fA-F]{8,64}_(?:x86|x86_64|aarch64|ppc64le)\.sif")
 DEVELOPER_REPOSITORIES = {
     "msk_containers": "git@github.com:krafczyk/msk_containers",
     "container_tools": "git@github.com:krafczyk/container_tools",
@@ -399,7 +400,7 @@ def _developer_child(path: pathlib.Path, name: str, *, allow_nested: bool = Fals
     if top != path.resolve(strict=True):
         raise DeploymentError(f"expected child is not a Git top level: {name}")
     for code, changed in _workspace_status(path):
-        nested_change = allow_nested and changed.rstrip("/") == "container_tools" and "U" not in code
+        nested_change = allow_nested and changed.rstrip("/") == "container_tools" and code == " M"
         if not nested_change:
             raise DeploymentError(f"developer child has local work: {name}:{changed or '<rename>'}")
     commit = _git(["rev-parse", "--verify", "HEAD^{commit}"], path, check=False)
@@ -791,6 +792,10 @@ def _execute_components(deployed: dict[str, dict], artifact: dict, image: pathli
                     image_info.update(choice="reused", decision="reused-active")
                 else:
                     image_info["decision"] = "install"
+            if developer and image is not None and image_info["choice"] == "install":
+                container_dir = pathlib.Path(os.environ.get("NVIM_CONTAINER_DIR", roots["home"] / "containers"))
+                if container_dir.exists() and pathlib.Path(os.path.abspath(image)).parent.resolve(strict=True) == container_dir.resolve(strict=True) and MANAGED_IMAGE.fullmatch(image.name):
+                    raise DeploymentError("the image installer could prune the developer caller image; move it outside NVIM_CONTAINER_DIR or activate the identical image first")
             lifecycle = roots["home"] / ".local" / "bin" / "mkchad-opencode-server"
             active = False
             if lifecycle.exists():
@@ -914,11 +919,13 @@ def _execute_components(deployed: dict[str, dict], artifact: dict, image: pathli
             _publish(result_path, result_builder(roots, actions, "succeeded", phase, None, diagnostic, started_at, image_info), validate=not developer)
             return 0
     except KeyboardInterrupt:
+        image_info["active_sha256"] = _active_image_observation(roots["home"])["digest"]
         _publish(result_path, result_builder(roots, actions, "interrupted", phase, f"{current['component']}:{current['id']}" if current else failure_step, "deployment interrupted; repair or inspect and rerun", started_at, image_info), validate=not developer)
         return 2
     except (DeploymentError, OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
         if current is not None:
             current["status"] = "failed"
+        image_info["active_sha256"] = _active_image_observation(roots["home"])["digest"]
         _publish(result_path, result_builder(roots, actions, "failed", phase, f"{current['component']}:{current['id']}" if current else failure_step, str(exc), started_at, image_info), validate=not developer)
         print("mkchad-deploy: " + REDACT.sub(r"\1=<redacted>", str(exc)), file=sys.stderr)
         return 2

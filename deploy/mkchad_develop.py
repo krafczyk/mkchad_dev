@@ -86,9 +86,14 @@ def main(argv: list[str] | None = None) -> int:
                         return status
                     release._publish_result(latest_result, _fallback_result(workspace, run_id, started_at, log_path, "developer deployer did not publish a matching terminal result", args.image))
                     return status if status else 2
-                except deploy.DeploymentError as exc:
+                except (deploy.DeploymentError, OSError) as exc:
                     release._write_stream(sys.stderr, log, ("mkchad-develop: " + str(exc) + "\n").encode())
                     release._publish_result(latest_result, _fallback_result(workspace, run_id, started_at, log_path, str(exc), args.image))
+                    return 2
+                except KeyboardInterrupt:
+                    result = _fallback_result(workspace, run_id, started_at, log_path, "developer deployment interrupted", args.image)
+                    result["outcome"] = "interrupted"
+                    release._publish_result(latest_result, result)
                     return 2
                 finally:
                     result_path.unlink(missing_ok=True)
