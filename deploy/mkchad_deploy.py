@@ -560,8 +560,12 @@ def _run_action(action: dict, component: dict, image: pathlib.Path, recovery: pa
     """Run one fixed action argv from its pinned checkout with a finite timeout."""
     values = {"recovery_dir": str(recovery), "staged_image": str(image), "component_revision": component["commit"]}
     argv = [str(checkout / action["path"]), *(item if isinstance(item, str) else values[item["token"]] for item in action["args"])]
+    environment = os.environ.copy()
+    environment.pop("MKCHAD_TRUST_GROUP_WRITABLE_ROOTS", None)
+    if action["id"] in {"host-tools-preflight", "host-tools-install", "host-tools-verify"}:
+        environment["MKCHAD_TRUST_GROUP_WRITABLE_ROOTS"] = "1"
     try:
-        process = subprocess.Popen(argv, cwd=checkout, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True, close_fds=True)
+        process = subprocess.Popen(argv, cwd=checkout, env=environment, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True, close_fds=True)
     except OSError as exc:
         raise DeploymentError(f"action could not start: {component['name']}:{action['id']}") from exc
     assert process.stdout is not None and process.stderr is not None
