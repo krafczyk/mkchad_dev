@@ -247,7 +247,86 @@ class DeploymentExecutionTests(unittest.TestCase):
         self.assertEqual({name: (self._destination("mkchad") / name).read_text(encoding="ascii") for name in preserved}, preserved)
         os.environ["LIFECYCLE_STATUS"] = "healthy"
         self.assertEqual(self._execute("323e4567-e89b-12d3-a456-426614174000"), 0)
-        self.assertEqual([action["status"] for action in self._result()["actions"]], ["succeeded", "succeeded", "skipped-compliant", "skipped-compliant", "succeeded"])
+        self.assertEqual([action["status"] for action in self._result()["actions"]], ["succeeded", "skipped-compliant", "skipped-compliant", "skipped-compliant", "succeeded"])
+
+    def test_same_active_digest_skips_all_image_work(self):
+        self.assertEqual(self._execute(), 0)
+        container_dir = self.home / "containers"
+        topology = sorted((path.name, path.is_symlink(), path.read_bytes() if path.is_file() and not path.is_symlink() else path.readlink() if path.is_symlink() else None) for path in container_dir.iterdir())
+
+        with mock.patch.object(self.deploy, "_stage_image", side_effect=AssertionError("image must not be staged")), mock.patch.object(
+            self.deploy, "_runtime_image", side_effect=AssertionError("image must not be inspected")
+        ), mock.patch.object(self.deploy, "_consume_caller_image", side_effect=AssertionError("caller image must not be consumed")), mock.patch.object(
+            self.deploy, "_active_image_digest", side_effect=AssertionError("image must not be verified")
+        ), mock.patch.object(
+            self.deploy, "_run_action", wraps=self.deploy._run_action
+        ) as action:
+            self.assertEqual(self._execute("223e4567-e89b-12d3-a456-426614174000"), 0)
+
+        self.assertFalse(any(call.args[0]["id"].startswith("image-") for call in action.call_args_list))
+        self.assertEqual(
+            sorted((path.name, path.is_symlink(), path.read_bytes() if path.is_file() and not path.is_symlink() else path.readlink() if path.is_symlink() else None) for path in container_dir.iterdir()),
+            topology,
+        )
+
+    def test_active_image_observation_rejects_unsafe_selectors(self):
+        container_dir = self.home / "containers"
+        container_dir.mkdir()
+        target = container_dir / "image.sif"
+        target.write_bytes(b"active")
+        selector = container_dir / "neovim.sif"
+
+        for target_value in ("/outside.sif", "../outside.sif", "missing.sif"):
+            with self.subTest(target=target_value):
+                selector.unlink(missing_ok=True)
+                selector.symlink_to(target_value)
+                self.assertEqual(self.deploy._active_image_observation(self.home)["state"], "unsafe")
+
+        selector.unlink(missing_ok=True)
+        selector.symlink_to(target.name)
+        self.assertEqual(self.deploy._active_image_observation(self.home)["digest"], hashlib.sha256(b"active").hexdigest())
+        with mock.patch.object(self.deploy, "_stable_regular_digest", side_effect=self.deploy.DeploymentError("changed")):
+            self.assertEqual(self.deploy._active_image_observation(self.home)["state"], "unsafe")
+        selector.unlink()
+        selector.write_bytes(b"not a selector")
+        self.assertEqual(self.deploy._active_image_observation(self.home)["state"], "unsafe")
+        selector.unlink()
+        nested = container_dir / "nested"
+        nested.symlink_to(self.root)
+        selector.symlink_to("nested/outside.sif")
+        self.assertEqual(self.deploy._active_image_observation(self.home)["state"], "unsafe")
+        selector.unlink()
+        selector.symlink_to(target.name)
+        target.unlink()
+        target.mkdir()
+        self.assertEqual(self.deploy._active_image_observation(self.home)["state"], "unsafe")
+
+    def test_previous_only_image_match_still_installs(self):
+        self.assertEqual(self._execute(), 0)
+        container_dir = self.home / "containers"
+        active = container_dir / os.readlink(container_dir / "neovim.sif")
+        active.write_bytes(b"different active image")
+        (container_dir / "neovim.previous.sif").write_bytes(self.image.read_bytes())
+
+        with mock.patch.object(self.deploy, "_stage_image", wraps=self.deploy._stage_image) as stage:
+            self.assertEqual(self._execute("223e4567-e89b-12d3-a456-426614174000"), 0)
+
+        stage.assert_called_once()
+
+    def test_active_service_requires_no_checkout_host_or_image_mutation(self):
+        self.assertEqual(self._execute(), 0)
+        os.environ["LIFECYCLE_STATUS"] = "healthy"
+        host_tool = self.home / ".local" / "bin" / "nvim"
+        host_tool.chmod(0o700)
+
+        with mock.patch.object(self.deploy, "_stage_image", side_effect=AssertionError("matching image must be reused")):
+            self.assertEqual(self._execute("223e4567-e89b-12d3-a456-426614174000"), 2)
+        self.assertIn("managed service is active", self._result()["diagnostic"])
+
+        os.environ["LIFECYCLE_STATUS"] = "inactive"
+        with mock.patch.object(self.deploy, "_stage_image", side_effect=AssertionError("matching image must be reused")):
+            self.assertEqual(self._execute("323e4567-e89b-12d3-a456-426614174000"), 0)
+        self.assertEqual(host_tool.stat().st_mode & 0o777, 0o755)
 
     def test_dirty_wrong_image_and_preflight_failure_do_not_mutate(self):
         wrong = self.manifest["artifacts"]["nvim-image"][0]["sha256"]

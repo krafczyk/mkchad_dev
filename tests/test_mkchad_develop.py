@@ -161,6 +161,7 @@ class DeveloperWorkspaceTests(unittest.TestCase):
             admission,
             actions=[],
             artifact={"architecture": "x86_64", "sha256": "a" * 64},
+            image={"choice": "reused", "supplied_sha256": "a" * 64, "active_sha256": "a" * 64, "decision": "reused-active"},
             run_id="123e4567-e89b-12d3-a456-426614174000",
             started_at="2026-08-03T00:00:00Z",
             log_path=pathlib.Path("/tmp/mkchad-v1/develop.log"),
@@ -173,6 +174,7 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         self.assertEqual(result["workspace"], admission["parent"])
         self.assertEqual({item["name"]: item["requested_commit"] for item in result["components"]}, admission["commits"])
         self.assertEqual(result["artifact"]["requested_sha256"], "a" * 64)
+        self.assertEqual(result["image"]["choice"], "reused")
 
     def test_local_snapshots_reach_the_regular_checkout_procedure(self):
         image = self.root / "image.sif"
@@ -187,13 +189,99 @@ class DeveloperWorkspaceTests(unittest.TestCase):
             "XDG_STATE_HOME": str(self.root / "state"), "NVIM_CONTAINER_DIR": str(home / "containers"),
         }
         result_path = self.root / "developer-result.json"
-        with mock.patch.dict(os.environ, environment, clear=False), mock.patch.object(self.deploy, "_runtime_image"), mock.patch.object(self.deploy, "_run_action"), mock.patch.object(self.deploy, "_host_tool_mismatch", return_value=None), mock.patch.object(self.deploy, "_active_image_digest", return_value=hashlib.sha256(image.read_bytes()).hexdigest()), mock.patch.object(self.deploy, "_consume_caller_image"):
+        with mock.patch.dict(os.environ, environment, clear=False), mock.patch.object(self.deploy, "_runtime_image"), mock.patch.object(self.deploy, "_run_action"), mock.patch.object(self.deploy, "_host_tool_mismatch", return_value=None), mock.patch.object(self.deploy, "_active_image_digest", return_value=hashlib.sha256(image.read_bytes()).hexdigest()):
             self.assertEqual(self.deploy.execute_developer_deployment(self.workspace, image, log_path=self.root / "developer.log", result_path=result_path, run_id="123e4567-e89b-12d3-a456-426614174000"), 0)
         result = json.loads(result_path.read_text(encoding="utf-8"))
         self.assertEqual(result["mode"], "developer")
         self.assertEqual(result["outcome"], "succeeded")
         destination = self.root / "config" / "mkchad"
         self.assertEqual(self._commit_value(destination), self._commit_value(self.mkchad))
+        self.assertTrue(image.is_file())
+
+    def test_omitted_image_preserves_active_state_and_skips_image_actions(self):
+        home = self.root / "home"
+        container_dir = home / "containers"
+        container_dir.mkdir(parents=True)
+        (container_dir / "neovim.sif").symlink_to("missing.sif")
+        environment = {
+            "HOME": str(home), "XDG_CONFIG_HOME": str(self.root / "config"), "XDG_DATA_HOME": str(self.root / "data"),
+            "XDG_STATE_HOME": str(self.root / "state"), "NVIM_CONTAINER_DIR": str(container_dir),
+        }
+        result_path = self.root / "developer-result.json"
+        with mock.patch.dict(os.environ, environment, clear=False), mock.patch.object(self.deploy, "_stage_image", side_effect=AssertionError("image staging")), mock.patch.object(
+            self.deploy, "_runtime_image", side_effect=AssertionError("runtime validation")
+        ), mock.patch.object(self.deploy, "_active_image_digest", side_effect=AssertionError("image verification")), mock.patch.object(
+            self.deploy, "_run_action", wraps=self.deploy._run_action
+        ) as action, mock.patch.object(self.deploy, "_host_tool_mismatch", return_value=None):
+            self.assertEqual(self.deploy.execute_developer_deployment(self.workspace, None, log_path=self.root / "developer.log", result_path=result_path, run_id="123e4567-e89b-12d3-a456-426614174000", replace_partial=True), 0)
+
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        self.assertEqual(result["image"], {"choice": "omitted", "supplied_sha256": None, "active_sha256": None, "decision": "preserved"})
+        self.assertEqual([item["id"] for item in result["actions"]], ["host-tools-preflight", "host-tools-install", "host-tools-verify"])
+        self.assertFalse(any(call.args[0]["id"].startswith("image-") for call in action.call_args_list))
+        self.assertTrue((container_dir / "neovim.sif").is_symlink())
+
+    def test_omitted_image_does_not_bypass_missing_lifecycle_partial_target_refusal(self):
+        home = self.root / "home"
+        container_dir = home / "containers"
+        container_dir.mkdir(parents=True)
+        (container_dir / "neovim.sif").symlink_to("missing.sif")
+        environment = {
+            "HOME": str(home), "XDG_CONFIG_HOME": str(self.root / "config"), "XDG_DATA_HOME": str(self.root / "data"),
+            "XDG_STATE_HOME": str(self.root / "state"), "NVIM_CONTAINER_DIR": str(container_dir),
+        }
+        result_path = self.root / "developer-result.json"
+
+        with mock.patch.dict(os.environ, environment, clear=False):
+            self.assertEqual(self.deploy.execute_developer_deployment(self.workspace, None, log_path=self.root / "developer.log", result_path=result_path, run_id="123e4567-e89b-12d3-a456-426614174000"), 2)
+
+        self.assertIn("partial target has no lifecycle command", json.loads(result_path.read_text(encoding="utf-8"))["diagnostic"])
+        self.assertTrue((container_dir / "neovim.sif").is_symlink())
+
+    def test_matching_developer_image_skips_image_work_and_preserves_caller(self):
+        image = self.root / "image.sif"
+        image.write_bytes(b"developer image")
+        home = self.root / "home"
+        container_dir = home / "containers"
+        container_dir.mkdir(parents=True)
+        active = container_dir / "active.sif"
+        active.write_bytes(image.read_bytes())
+        (container_dir / "neovim.sif").symlink_to(active.name)
+        environment = {
+            "HOME": str(home), "XDG_CONFIG_HOME": str(self.root / "config"), "XDG_DATA_HOME": str(self.root / "data"),
+            "XDG_STATE_HOME": str(self.root / "state"), "NVIM_CONTAINER_DIR": str(container_dir),
+        }
+        topology = sorted(path.name for path in container_dir.iterdir())
+        with mock.patch.dict(os.environ, environment, clear=False), mock.patch.object(self.deploy, "_stage_image", side_effect=AssertionError("image staging")), mock.patch.object(
+            self.deploy, "_runtime_image", side_effect=AssertionError("runtime validation")
+        ), mock.patch.object(self.deploy, "_active_image_digest", side_effect=AssertionError("image verification")), mock.patch.object(
+            self.deploy, "_run_action", wraps=self.deploy._run_action
+        ) as action, mock.patch.object(self.deploy, "_host_tool_mismatch", return_value=None):
+            self.assertEqual(self.deploy.execute_developer_deployment(self.workspace, image, log_path=self.root / "developer.log", result_path=self.root / "developer-result.json", run_id="123e4567-e89b-12d3-a456-426614174000", replace_partial=True), 0)
+
+        self.assertTrue(image.is_file())
+        self.assertEqual(sorted(path.name for path in container_dir.iterdir()), topology)
+        self.assertFalse(any(call.args[0]["id"].startswith("image-") for call in action.call_args_list))
+
+    def test_supplied_image_rejects_an_unsafe_active_selector_before_target_mutation(self):
+        image = self.root / "image.sif"
+        image.write_bytes(b"developer image")
+        home = self.root / "home"
+        container_dir = home / "containers"
+        container_dir.mkdir(parents=True)
+        (container_dir / "neovim.sif").symlink_to("../escaping.sif")
+        environment = {
+            "HOME": str(home), "XDG_CONFIG_HOME": str(self.root / "config"), "XDG_DATA_HOME": str(self.root / "data"),
+            "XDG_STATE_HOME": str(self.root / "state"), "NVIM_CONTAINER_DIR": str(container_dir),
+        }
+        result_path = self.root / "developer-result.json"
+
+        with mock.patch.dict(os.environ, environment, clear=False), mock.patch.object(self.deploy, "_stage_image", side_effect=AssertionError("image staging")):
+            self.assertEqual(self.deploy.execute_developer_deployment(self.workspace, image, log_path=self.root / "developer.log", result_path=result_path, run_id="123e4567-e89b-12d3-a456-426614174000"), 2)
+
+        self.assertFalse((self.root / "config" / "mkchad").exists())
+        self.assertTrue(image.is_file())
+        self.assertEqual(json.loads(result_path.read_text(encoding="utf-8"))["image"]["decision"], "blocked-unsafe-active")
 
     def test_public_command_shares_the_release_invocation_lock(self):
         command = load_developer_command()
@@ -209,6 +297,17 @@ class DeveloperWorkspaceTests(unittest.TestCase):
                 self.assertEqual(command.main(["--image", str(image)]), 2)
         self.assertIn("another invocation", terminal.getvalue())
         self.assertFalse((state / "mkchad" / "deploy" / "latest-result.json").exists())
+
+    def test_public_command_accepts_an_omitted_image(self):
+        command = load_developer_command()
+        state = self.root / "state"
+
+        with mock.patch.dict(os.environ, {"HOME": str(self.root / "home"), "XDG_STATE_HOME": str(state)}, clear=False), mock.patch.object(
+            command.deploy, "execute_developer_deployment", return_value=2
+        ) as execute:
+            self.assertEqual(command.main([]), 2)
+
+        self.assertIsNone(execute.call_args.args[1])
 
 
 if __name__ == "__main__":

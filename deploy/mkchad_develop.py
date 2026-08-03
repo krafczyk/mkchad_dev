@@ -35,13 +35,14 @@ class _StreamLog:
         self.log.flush()
 
 
-def _fallback_result(workspace: pathlib.Path, run_id: str, started_at: str, log_path: pathlib.Path, diagnostic: str) -> dict:
+def _fallback_result(workspace: pathlib.Path, run_id: str, started_at: str, log_path: pathlib.Path, diagnostic: str, image: pathlib.Path | None) -> dict:
     """Build a bounded developer failure result before source admission completes."""
     return {
         "mode": "developer", "run_id": run_id,
         "workspace": {"path": str(workspace), "revision": None, "dirty": None},
         "started_at": started_at, "completed_at": release._timestamp(), "outcome": "failed", "phase": "preflight",
         "components": [], "artifact": {"architecture": os.uname().machine, "requested_sha256": None, "observed_sha256": None},
+        "image": {"choice": "omitted" if image is None else "install", "supplied_sha256": None, "active_sha256": None, "decision": "preserved" if image is None else "unavailable"},
         "actions": [], "failed_step": "developer-admission", "diagnostic": release._redact(diagnostic)[:4096], "log_path": str(log_path),
     }
 
@@ -63,7 +64,7 @@ def main(argv: list[str] | None = None) -> int:
     promotes the direct developer result to the shared latest-result path.
     """
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0], allow_abbrev=False)
-    parser.add_argument("--image", type=pathlib.Path, required=True)
+    parser.add_argument("--image", type=pathlib.Path)
     parser.add_argument("--replace-partial", action="store_true")
     args = parser.parse_args(argv)
     state_root = release._state_root()
@@ -79,15 +80,15 @@ def main(argv: list[str] | None = None) -> int:
             latest_result = state_root / "latest-result.json"
             with log_path.open("x", encoding="utf-8") as log, contextlib.redirect_stdout(_StreamLog(sys.stdout, log)), contextlib.redirect_stderr(_StreamLog(sys.stderr, log)):
                 try:
-                    status = deploy.execute_developer_deployment(workspace, args.image.absolute(), log_path=log_path, result_path=result_path, run_id=run_id, replace_partial=args.replace_partial)
+                    status = deploy.execute_developer_deployment(workspace, args.image.absolute() if args.image is not None else None, log_path=log_path, result_path=result_path, run_id=run_id, replace_partial=args.replace_partial)
                     if _matching_result(result_path, run_id, log_path, status):
                         os.replace(result_path, latest_result)
                         return status
-                    release._publish_result(latest_result, _fallback_result(workspace, run_id, started_at, log_path, "developer deployer did not publish a matching terminal result"))
+                    release._publish_result(latest_result, _fallback_result(workspace, run_id, started_at, log_path, "developer deployer did not publish a matching terminal result", args.image))
                     return status if status else 2
                 except deploy.DeploymentError as exc:
                     release._write_stream(sys.stderr, log, ("mkchad-develop: " + str(exc) + "\n").encode())
-                    release._publish_result(latest_result, _fallback_result(workspace, run_id, started_at, log_path, str(exc)))
+                    release._publish_result(latest_result, _fallback_result(workspace, run_id, started_at, log_path, str(exc), args.image))
                     return 2
                 finally:
                     result_path.unlink(missing_ok=True)

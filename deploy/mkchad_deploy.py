@@ -467,20 +467,54 @@ def _validate_actions(component: dict, checkout: pathlib.Path):
             raise DeploymentError(f"action does not match its pinned blob: {action['id']}")
 
 
-def _stage_image(source: pathlib.Path, staging: pathlib.Path, artifact: dict) -> pathlib.Path:
-    """Copy a matching caller image to the installer-required raw-image name."""
+def _stable_regular_digest(path: pathlib.Path, label: str) -> str:
+    """Hash one non-symbolic regular file while rejecting identity changes."""
+    try:
+        before = os.lstat(path)
+        if not stat.S_ISREG(before.st_mode):
+            raise OSError
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError as exc:
+        raise DeploymentError(f"{label} is not a regular file") from exc
+    try:
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino, stat.S_IFMT(opened.st_mode)) != (before.st_dev, before.st_ino, stat.S_IFMT(before.st_mode)):
+            raise DeploymentError(f"{label} changed while hashing")
+        digest = hashlib.sha256()
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+        after = os.fstat(descriptor)
+        final = os.lstat(path)
+        identity = lambda entry: (entry.st_dev, entry.st_ino, entry.st_mode, entry.st_size, entry.st_mtime_ns, entry.st_ctime_ns)
+        if identity(before) != identity(opened) or identity(before) != identity(after) or identity(before) != identity(final):
+            raise DeploymentError(f"{label} changed while hashing")
+        return digest.hexdigest()
+    except OSError as exc:
+        raise DeploymentError(f"{label} is unavailable") from exc
+    finally:
+        os.close(descriptor)
+
+
+def _stage_image(source: pathlib.Path, staging: pathlib.Path, artifact: dict, expected_digest: str) -> pathlib.Path:
+    """Copy a previously admitted caller image to the installer-required raw name."""
     raw_arch = {"x86_64": "x86", "aarch64": "aarch64", "ppc64le": "ppc64le"}[artifact["architecture"]]
     target = staging / f"nvim_container_{raw_arch}.sif"
-    if not source.is_file() or source.is_symlink():
-        raise DeploymentError("caller image is not a regular file")
     digest = hashlib.sha256()
-    with source.open("rb") as input_file, target.open("xb") as output_file:
-        for block in iter(lambda: input_file.read(1024 * 1024), b""):
-            digest.update(block)
-            output_file.write(block)
-    if digest.hexdigest() != artifact["sha256"]:
+    try:
+        descriptor = os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError as exc:
+        raise DeploymentError("caller image is not a regular file") from exc
+    try:
+        with os.fdopen(descriptor, "rb", closefd=False) as input_file, target.open("xb") as output_file:
+            for block in iter(lambda: input_file.read(1024 * 1024), b""):
+                digest.update(block)
+                output_file.write(block)
+    finally:
+        os.close(descriptor)
+    if digest.hexdigest() != expected_digest:
         target.unlink(missing_ok=True)
-        raise DeploymentError("caller image digest does not match the release artifact")
+        raise DeploymentError("caller image changed before staging")
     return target
 
 
@@ -568,27 +602,17 @@ def _installer_sources(msk_checkout: pathlib.Path) -> list[pathlib.Path]:
     return sorted(paths, key=lambda path: path.name)
 
 
-def _managed_paths(roots: dict[str, pathlib.Path], msk_checkout: pathlib.Path, caller_image: pathlib.Path) -> list[pathlib.Path]:
+def _managed_paths(roots: dict[str, pathlib.Path], msk_checkout: pathlib.Path, caller_image: pathlib.Path | None) -> list[pathlib.Path]:
     """Return pre-existing installer-owned paths, excluding the caller artifact."""
     paths = [roots["home"] / ".local" / "bin" / source.name for source in _installer_sources(msk_checkout)]
     container_dir = pathlib.Path(os.environ.get("NVIM_CONTAINER_DIR", roots["home"] / "containers"))
     paths.extend((container_dir / "neovim.sif", container_dir / "neovim.previous.sif"))
     if container_dir.exists():
         paths.extend(container_dir.glob("neovim_*_g*_*_*.sif"))
-    caller_image = pathlib.Path(os.path.abspath(caller_image))
-    return [path for path in paths if pathlib.Path(os.path.abspath(path)) != caller_image]
-
-
-def _complete_compliance(plans: dict[str, tuple[pathlib.Path, dict]], roots: dict[str, pathlib.Path], msk_checkout: pathlib.Path, artifact: dict) -> bool:
-    """Require all checkout, host-tool, and active-image state before verify-only use."""
-    if not all(plan["compliant"] for _, plan in plans.values()):
-        return False
-    if _host_tool_mismatch(msk_checkout, roots["home"]) is not None:
-        return False
-    try:
-        return _active_image_digest(roots["home"]) == artifact["sha256"]
-    except OSError:
-        return False
+    if caller_image is not None:
+        caller_image = pathlib.Path(os.path.abspath(caller_image))
+        paths = [path for path in paths if pathlib.Path(os.path.abspath(path)) != caller_image]
+    return paths
 
 
 def _host_tool_mismatch(msk_checkout: pathlib.Path, home: pathlib.Path) -> str | None:
@@ -600,10 +624,49 @@ def _host_tool_mismatch(msk_checkout: pathlib.Path, home: pathlib.Path) -> str |
     return None
 
 
-def _active_image_digest(home: pathlib.Path) -> str:
-    """Return the digest of the image selected by the active managed link."""
+def _active_image_observation(home: pathlib.Path) -> dict:
+    """Classify the active selector without following unsafe image paths."""
     container_dir = pathlib.Path(os.environ.get("NVIM_CONTAINER_DIR", home / "containers"))
-    return _digest(container_dir / os.readlink(container_dir / "neovim.sif"))
+    selector = container_dir / "neovim.sif"
+    try:
+        os.lstat(selector)
+    except FileNotFoundError:
+        return {"state": "absent", "digest": None}
+    except OSError:
+        return {"state": "unsafe", "digest": None}
+    try:
+        selector_before = os.lstat(selector)
+        if not stat.S_ISLNK(selector_before.st_mode) or not stat.S_ISDIR(os.lstat(container_dir).st_mode):
+            raise OSError
+        target_value = os.readlink(selector)
+        target = pathlib.PurePosixPath(target_value)
+        if target.is_absolute() or not target.parts or any(part in {".", ".."} for part in target.parts):
+            raise OSError
+        candidate = container_dir.joinpath(*target.parts)
+        for parent in (container_dir, *candidate.parents):
+            if parent == container_dir.parent:
+                break
+            entry = os.lstat(parent)
+            if parent != candidate and (not stat.S_ISDIR(entry.st_mode) or stat.S_ISLNK(entry.st_mode)):
+                raise OSError
+        if not stat.S_ISREG(os.lstat(candidate).st_mode):
+            raise OSError
+        digest = _stable_regular_digest(candidate, "active image")
+        selector_after = os.lstat(selector)
+        selector_identity = lambda entry: (entry.st_dev, entry.st_ino, entry.st_mode, entry.st_size, entry.st_mtime_ns, entry.st_ctime_ns)
+        if selector_identity(selector_before) != selector_identity(selector_after) or os.readlink(selector) != target_value:
+            raise OSError
+        return {"state": "valid", "digest": digest}
+    except (OSError, DeploymentError):
+        return {"state": "unsafe", "digest": None}
+
+
+def _active_image_digest(home: pathlib.Path) -> str:
+    """Return the digest of a safely selected active image or raise OSError."""
+    observation = _active_image_observation(home)
+    if observation["state"] != "valid":
+        raise OSError("active image is unavailable")
+    return observation["digest"]
 
 
 def _consume_caller_image(source: pathlib.Path, roots: dict[str, pathlib.Path], expected_digest: str):
@@ -623,11 +686,8 @@ def _consume_caller_image(source: pathlib.Path, roots: dict[str, pathlib.Path], 
         raise DeploymentError("caller image could not be consumed after verified installation") from exc
 
 
-def _result(release: dict, roots: dict[str, pathlib.Path], artifact: dict, run_id: str, tag: str, started_at: str, log_path: pathlib.Path, actions: list[dict], outcome: str, phase: str, failed_step: str | None, diagnostic: str) -> dict:
+def _result(release: dict, roots: dict[str, pathlib.Path], artifact: dict, run_id: str, tag: str, started_at: str, log_path: pathlib.Path, actions: list[dict], outcome: str, phase: str, failed_step: str | None, diagnostic: str, observed_image: str | None) -> dict:
     """Build the complete, run-bound terminal result without command data."""
-    observed_image = None
-    with contextlib.suppress(OSError):
-        observed_image = _digest((pathlib.Path(os.environ.get("NVIM_CONTAINER_DIR", roots["home"] / "containers")) / os.readlink(pathlib.Path(os.environ.get("NVIM_CONTAINER_DIR", roots["home"] / "containers")) / "neovim.sif")))
     components = []
     for component in release["components"]:
         observed = None
@@ -638,15 +698,13 @@ def _result(release: dict, roots: dict[str, pathlib.Path], artifact: dict, run_i
     return {"schema": 1, "run_id": run_id, "release": tag, "started_at": started_at, "completed_at": _timestamp(), "outcome": outcome, "phase": phase, "components": components, "artifact": {"architecture": artifact["architecture"], "expected_sha256": artifact["sha256"], "observed_sha256": observed_image}, "actions": actions, "configuration_handoff": {"state": "configuration-pending", "contract_version": 1, "guidance": release["configuration"]["guidance"], "components": [{"name": item["name"], "repository": item["repository"], "commit": item["commit"]} for item in release["components"] if item["disposition"] == "configuration-owned"]}, "failed_step": failed_step, "diagnostic": REDACT.sub(r"\1=<redacted>", diagnostic)[:4096], "log_path": str(log_path)}
 
 
-def developer_result(admission: dict, *, actions: list[dict], artifact: dict, run_id: str, started_at: str, log_path: pathlib.Path, outcome: str, phase: str, failed_step: str | None, diagnostic: str) -> dict:
+def developer_result(admission: dict, *, actions: list[dict], artifact: dict, image: dict, run_id: str, started_at: str, log_path: pathlib.Path, outcome: str, phase: str, failed_step: str | None, diagnostic: str) -> dict:
     """Build the mode-tagged developer result from local-workspace evidence.
 
     The developer result intentionally has no release schema: it records only the
     selected local components and the observations needed to repair a local run.
     """
-    roots, profile, observed_image = _roots(), _developer_components(admission["commits"]), None
-    with contextlib.suppress(OSError):
-        observed_image = _active_image_digest(roots["home"])
+    roots, profile = _roots(), _developer_components(admission["commits"])
     components = []
     for name in ("msk_containers", "container_tools", "mkchad"):
         observed = None
@@ -656,7 +714,8 @@ def developer_result(admission: dict, *, actions: list[dict], artifact: dict, ru
     return {
         "mode": "developer", "run_id": run_id, "workspace": admission["parent"], "started_at": started_at, "completed_at": _timestamp(),
         "outcome": outcome, "phase": phase, "components": components,
-        "artifact": {"architecture": artifact["architecture"], "requested_sha256": artifact["sha256"], "observed_sha256": observed_image},
+        "artifact": {"architecture": artifact["architecture"], "requested_sha256": image["supplied_sha256"], "observed_sha256": image["active_sha256"]},
+        "image": image,
         "actions": actions, "failed_step": failed_step, "diagnostic": REDACT.sub(r"\1=<redacted>", diagnostic)[:4096], "log_path": str(log_path),
     }
 
@@ -676,22 +735,31 @@ def _publish(path: pathlib.Path, document: dict, *, validate=True):
     os.replace(temporary, path)
 
 
-def _execute_components(deployed: dict[str, dict], artifact: dict, image: pathlib.Path, *, log_path: pathlib.Path, result_path: pathlib.Path, run_id: str, replace_partial: bool, stage_sources, recheck_sources, result_builder, validate_result: bool) -> int:
+def _execute_components(deployed: dict[str, dict], artifact: dict, image: pathlib.Path | None, *, developer: bool, log_path: pathlib.Path, result_path: pathlib.Path, run_id: str, replace_partial: bool, stage_sources, recheck_sources, result_builder, validate_result: bool) -> int:
     """Run the shared target procedure from already-selected component sources.
 
     Source selection differs between release and developer modes; destination
     validation, lifecycle checks, apply order, and failure handling do not.
     """
     started_at, roots, current, phase, failure_step = _timestamp(), _roots(), None, "preflight", "preflight"
-    actions = [{"component": component["name"], "id": action["id"], "phase": action["phase"], "status": "pending"} for component in deployed.values() for action in component["actions"]]
+    is_image_action = lambda action: any(isinstance(argument, dict) and argument.get("token") == "staged_image" for argument in action["args"])
+    actions = [
+        {"component": component["name"], "id": action["id"], "phase": action["phase"], "status": "pending"}
+        for component in deployed.values()
+        for action in component["actions"]
+        if image is not None or not is_image_action(action)
+    ]
+    image_info = {"choice": "omitted" if image is None else "install", "supplied_sha256": None, "active_sha256": None, "decision": "preserved" if image is None else "pending"}
     staging = pathlib.Path(tempfile.mkdtemp(prefix="mkchad-deploy-"))
     try:
+        if image is not None:
+            image_info["supplied_sha256"] = _stable_regular_digest(image, "caller image")
+            if not developer and image_info["supplied_sha256"] != artifact["sha256"]:
+                raise DeploymentError("caller image digest does not match the release artifact")
         staged = stage_sources(deployed, staging)
         for name, component in deployed.items():
             _validate_actions(component, staged[name][1])
         recheck_sources()
-        staged_image = _stage_image(image, staging, artifact)
-        _runtime_image(staged_image, artifact["architecture"])
         plans = {
             name: (
                 _destination(roots, component),
@@ -702,6 +770,16 @@ def _execute_components(deployed: dict[str, dict], artifact: dict, image: pathli
             for name, component in deployed.items()
         }
         with _lock(roots["xdg_state_home"] / "mkchad" / "deployment.lock"):
+            active_image = _active_image_observation(roots["home"])
+            image_info["active_sha256"] = active_image["digest"]
+            if image is not None:
+                if active_image["state"] == "unsafe":
+                    image_info["decision"] = "blocked-unsafe-active"
+                    raise DeploymentError("active image selector is unsafe or unavailable")
+                if active_image["state"] == "valid" and active_image["digest"] == image_info["supplied_sha256"]:
+                    image_info.update(choice="reused", decision="reused-active")
+                else:
+                    image_info["decision"] = "install"
             lifecycle = roots["home"] / ".local" / "bin" / "mkchad-opencode-server"
             active = False
             if lifecycle.exists():
@@ -725,16 +803,29 @@ def _execute_components(deployed: dict[str, dict], artifact: dict, image: pathli
                     print(f"mkchad-deploy: --replace-partial asserted the managed service is inactive; replacing: {detail}", file=sys.stderr)
             recovery = staging / "recovery"
             recovery.mkdir(mode=0o700)
+            host_mismatch = _host_tool_mismatch(staged["msk_containers"][1], roots["home"])
+            checkout_mutation = any(not plan["compliant"] for _, plan in plans.values())
+            mutation_required = checkout_mutation or host_mismatch is not None or image_info["choice"] == "install"
+            if active and mutation_required:
+                raise DeploymentError("managed service is active and target is not completely compliant")
+            staged_image = None
+            if image_info["choice"] == "install":
+                assert image is not None and image_info["supplied_sha256"] is not None
+                staged_image = _stage_image(image, staging, artifact, image_info["supplied_sha256"])
+                _runtime_image(staged_image, artifact["architecture"])
+            if image_info["choice"] == "reused":
+                for item in actions:
+                    component = deployed[item["component"]]
+                    action = next(value for value in component["actions"] if value["id"] == item["id"])
+                    if is_image_action(action):
+                        item["status"] = "skipped-compliant"
             for component in deployed.values():
                 for action in component["actions"]:
-                    if action["phase"] == "preflight":
+                    if action["phase"] == "preflight" and (not is_image_action(action) or image_info["choice"] == "install"):
                         current = next(item for item in actions if item["component"] == component["name"] and item["id"] == action["id"])
                         _run_action(action, component, staged_image, recovery, staged[component["name"]][1])
                         current["status"] = "succeeded"
                         current = None
-            compliant = _complete_compliance(plans, roots, staged["msk_containers"][1], artifact)
-            if active and not compliant:
-                raise DeploymentError("managed service is active and target is not completely compliant")
             phase = "apply"
             for name in ("msk_containers", "container_tools", "mkchad"):
                 failure_step = f"checkout:{name}"
@@ -768,13 +859,15 @@ def _execute_components(deployed: dict[str, dict], artifact: dict, image: pathli
                             shutil.rmtree(temporary)
             for item in actions:
                 if item["phase"] == "apply":
-                    if compliant:
+                    component = deployed[item["component"]]
+                    action = next(value for value in component["actions"] if value["id"] == item["id"])
+                    if is_image_action(action) and image_info["choice"] != "install":
+                        item["status"] = "skipped-compliant"
+                    elif not is_image_action(action) and host_mismatch is None:
                         item["status"] = "skipped-compliant"
                     else:
                         current = item
                         failure_step = f"{item['component']}:{item['id']}"
-                        component = deployed[item["component"]]
-                        action = next(value for value in component["actions"] if value["id"] == item["id"])
                         _run_action(action, component, staged_image, recovery, plans[item["component"]][0])
                         item["status"] = "succeeded"
                         current = None
@@ -796,20 +889,23 @@ def _execute_components(deployed: dict[str, dict], artifact: dict, image: pathli
             mismatch = _host_tool_mismatch(plans["msk_containers"][0], roots["home"])
             if mismatch is not None:
                 raise DeploymentError(f"host-tool verification failed: {mismatch}")
-            failure_step = "installed-image-verification"
-            if _active_image_digest(roots["home"]) != artifact["sha256"]:
-                raise DeploymentError("installed image digest does not match the release artifact")
-            failure_step = "caller-image-consumption"
-            _consume_caller_image(image, roots, artifact["sha256"])
-            _publish(result_path, result_builder(roots, actions, "succeeded", phase, None, "deployment verified; configuration is pending", started_at), validate=validate_result)
+            if image_info["choice"] == "install":
+                failure_step = "installed-image-verification"
+                if _active_image_digest(roots["home"]) != image_info["supplied_sha256"]:
+                    raise DeploymentError("installed image digest does not match the selected caller image")
+                image_info["active_sha256"] = image_info["supplied_sha256"]
+                if not developer:
+                    failure_step = "caller-image-consumption"
+                    _consume_caller_image(image, roots, artifact["sha256"])
+            _publish(result_path, result_builder(roots, actions, "succeeded", phase, None, "deployment verified; configuration is pending", started_at, image_info), validate=validate_result)
             return 0
     except KeyboardInterrupt:
-        _publish(result_path, result_builder(roots, actions, "interrupted", phase, f"{current['component']}:{current['id']}" if current else failure_step, "deployment interrupted; repair or inspect and rerun", started_at), validate=validate_result)
+        _publish(result_path, result_builder(roots, actions, "interrupted", phase, f"{current['component']}:{current['id']}" if current else failure_step, "deployment interrupted; repair or inspect and rerun", started_at, image_info), validate=validate_result)
         return 2
     except (DeploymentError, OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
         if current is not None:
             current["status"] = "failed"
-        _publish(result_path, result_builder(roots, actions, "failed", phase, f"{current['component']}:{current['id']}" if current else failure_step, str(exc), started_at), validate=validate_result)
+        _publish(result_path, result_builder(roots, actions, "failed", phase, f"{current['component']}:{current['id']}" if current else failure_step, str(exc), started_at, image_info), validate=validate_result)
         print("mkchad-deploy: " + REDACT.sub(r"\1=<redacted>", str(exc)), file=sys.stderr)
         return 2
     finally:
@@ -826,18 +922,18 @@ def execute_deployment(repo: pathlib.Path, image: pathlib.Path, *, release_tag: 
         raise DeploymentError("release has no image for this architecture")
     deployed = {item["name"]: dict(item) for item in manifest["components"] if item["disposition"] == "deployed"}
     return _execute_components(
-        deployed, artifact, image, log_path=log_path, result_path=result_path, run_id=run_id, replace_partial=replace_partial,
+        deployed, artifact, image, developer=False, log_path=log_path, result_path=result_path, run_id=run_id, replace_partial=replace_partial,
         stage_sources=_stage_release_sources, recheck_sources=lambda: None, validate_result=True,
-        result_builder=lambda roots, actions, outcome, phase, failed_step, diagnostic, started_at: _result(manifest, roots, artifact, run_id, release_tag, started_at, log_path, actions, outcome, phase, failed_step, diagnostic),
+        result_builder=lambda roots, actions, outcome, phase, failed_step, diagnostic, started_at, image_info: _result(manifest, roots, artifact, run_id, release_tag, started_at, log_path, actions, outcome, phase, failed_step, diagnostic, image_info["active_sha256"]),
     )
 
 
-def execute_developer_deployment(workspace: pathlib.Path, image: pathlib.Path, *, log_path: pathlib.Path, result_path: pathlib.Path, run_id: str, replace_partial: bool = False) -> int:
+def execute_developer_deployment(workspace: pathlib.Path, image: pathlib.Path | None, *, log_path: pathlib.Path, result_path: pathlib.Path, run_id: str, replace_partial: bool = False) -> int:
     """Deploy clean local child commits through the regular target procedure.
 
     Local source commits are admitted and staged without consulting origins or
-    release metadata. The caller image remains required until the optional-image
-    developer flow is introduced separately.
+    release metadata. An omitted image preserves active image state; a supplied
+    image is never consumed from its caller path.
     """
     if not UUID.fullmatch(run_id):
         raise DeploymentError("invalid developer handoff")
@@ -845,14 +941,12 @@ def execute_developer_deployment(workspace: pathlib.Path, image: pathlib.Path, *
     architecture = {"amd64": "x86_64", "arm64": "aarch64"}.get(os.uname().machine.lower(), os.uname().machine.lower())
     if architecture not in ARCHITECTURES:
         raise DeploymentError("developer deployment has no image for this architecture")
-    if not image.is_file() or image.is_symlink():
-        raise DeploymentError("caller image is not a regular file")
-    artifact = {"architecture": architecture, "sha256": _digest(image)}
+    artifact = {"architecture": architecture, "sha256": None}
     deployed = _developer_components(admission["commits"])
     return _execute_components(
-        deployed, artifact, image, log_path=log_path, result_path=result_path, run_id=run_id, replace_partial=replace_partial,
+        deployed, artifact, image, developer=True, log_path=log_path, result_path=result_path, run_id=run_id, replace_partial=replace_partial,
         stage_sources=lambda _components, staging: stage_developer_sources(admission, staging), recheck_sources=lambda: recheck_developer_workspace(admission), validate_result=False,
-        result_builder=lambda _roots, actions, outcome, phase, failed_step, diagnostic, started: developer_result(admission, actions=actions, artifact=artifact, run_id=run_id, started_at=started, log_path=log_path, outcome=outcome, phase=phase, failed_step=failed_step, diagnostic=diagnostic),
+        result_builder=lambda _roots, actions, outcome, phase, failed_step, diagnostic, started, image_info: developer_result(admission, actions=actions, artifact=artifact, image=image_info, run_id=run_id, started_at=started, log_path=log_path, outcome=outcome, phase=phase, failed_step=failed_step, diagnostic=diagnostic),
     )
 
 
