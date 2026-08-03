@@ -37,6 +37,12 @@ Schema-1 manifests, bootstrap evidence, receipts, bundles, journals, and
 recovery records are unsupported history. The schema-2 deployer neither reads,
 migrates, writes, nor blocks on them.
 
+The trusted release profile allows the exact `HOME` root used by host-tool
+actions to be root- or current-user-owned and group-writable, as required by
+ACL-managed HPC homes. World-write remains rejected, and `.local`, `.local/bin`,
+installed tools, locks, and recovery state retain their stricter ownership and
+mode checks. This fixed profile requires no public trust option.
+
 ## Deployment Flow
 
 Each deployment performs complete preflight before mutating a final checkout:

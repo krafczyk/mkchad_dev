@@ -18,6 +18,7 @@ mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$XDG_RUN
 chmod 700 "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$XDG_RUNTIME_DIR" "$TMPDIR"
 export PATH="$canonical/bin:$PATH"
 export NVIM_CONTAINER_DIR="$HOME/containers"
+export MKCHAD_TRUST_GROUP_WRITABLE_ROOTS=caller-value
 
 python3 -m py_compile deploy/mkchad_release.py deploy/mkchad_deploy.py
 python3 -m unittest -v tests.test_mkchad_release tests.test_mkchad_deploy
@@ -39,6 +40,7 @@ mkdir -p "$canonical/components/msk_containers/bin" "$canonical/components/msk_c
 cat > "$canonical/components/msk_containers/bin/install_nvim.sh" <<'SH'
 #!/usr/bin/env sh
 set -eu
+[ "${MKCHAD_TRUST_GROUP_WRITABLE_ROOTS:-}" = 1 ] || exit 2
 if [ "${1:-}" = --check ]; then
   { [ "$#" -eq 1 ] || { [ "$#" -eq 3 ] && [ "$2" = --recovery-dir ] && [ -d "$3" ]; }; } || exit 2
   exit 0
@@ -63,6 +65,7 @@ SH
 cat > "$canonical/components/msk_containers/nvim/bin/install_nvim_container" <<'SH'
 #!/usr/bin/env sh
 set -eu
+[ -z "${MKCHAD_TRUST_GROUP_WRITABLE_ROOTS:-}" ] || exit 2
 dry_run=0
 if [ "${1:-}" = --dry-run ]; then dry_run=1; shift; fi
 [ "$#" -eq 3 ] && [ "$1" = --source-revision ] && [ "${#2}" -eq 40 ] && [ "${3##*/}" = nvim_container_x86.sif ] || exit 2
