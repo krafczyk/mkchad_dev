@@ -5,7 +5,8 @@
 This is the MkChad development environment on host `schumann`. Its workspace
 root is `/data0/matthew/Projects/mkchad_2`, development short name is
 `mkchad-v2`, and its disposable build and temporary-file root is
-`/tmp/mkchad-v2`.
+`/tmp/mkchad-v2`. This checkout is the `../mkchad_2` Git worktree relative to
+the primary MkChad checkout.
 
 This repository coordinates independent child repositories. Read the nearest
 child `AGENTS.md` before changing a child. Implement cross-repository work
@@ -31,6 +32,8 @@ repository that they apply to.
   safely reloads one project instance.
 - `compound-engineering/`: active Compound Engineering fork for cross-harness
   persona routing and shared global settings.
+- `config_files/`: visible host-specific configuration repository, applied
+  independently of release deployment.
 
 ## Cross-Repository Ownership
 

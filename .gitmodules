@@ -1,23 +1,32 @@
 [submodule "mkchad"]
 	path = mkchad
 	url = git@github.com:krafczyk/mkchad
+	branch = mkchad-v1
 [submodule "msk_containers"]
 	path = msk_containers
 	url = git@github.com:krafczyk/msk_containers
+	branch = mkchad-v1
 [submodule "opencode.nvim"]
 	path = opencode.nvim
 	url = git@github.com:krafczyk/opencode.nvim
+	branch = mkchad-v1
 [submodule "opencode_sprint_loop"]
 	path = opencode_sprint_loop
 	url = git@github.com:krafczyk/opencode_sprint_loop
+	branch = mkchad-v1
 [submodule "opencode-project-reload"]
 	path = opencode-project-reload
 	url = git@github.com:krafczyk/opencode-project-reload.git
+	branch = mkchad-v1
 [submodule "compound-engineering"]
 	path = compound-engineering
 	url = git@github.com:krafczyk/compound-engineering-plugin.git
-	branch = configurable-routing
+	branch = mkchad-v1
 [submodule "opencode"]
 	path = opencode
 	url = git@github.com:krafczyk/opencode.git
-	branch = custom-task-view
+	branch = mkchad-v1
+[submodule "config_files"]
+	path = config_files
+	url = git@github.com:krafczyk/config_files.git
+	branch = schumann
