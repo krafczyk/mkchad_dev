@@ -82,6 +82,13 @@ same-user processes are trusted. Other agents may edit the shared worktree
 concurrently. Other local users, package registries, GitHub, OpenCode servers,
 downloaded artifacts, and data returned by external services are untrusted.
 
+Supported environments include HPC systems and network-attached filesystems
+such as NFS, Lustre, and GPFS. The filesystem service, cluster administrators,
+and platform-provisioned project and state directories are trusted. Inode
+identity, ownership presentation, permission enforcement, atomicity, and other
+local-filesystem semantics may vary across hosts and mounts; do not assume ext4
+semantics unless a child repository explicitly requires them.
+
 Trust boundaries exist between child repositories, isolated checkouts and live
 user paths, containers and the host, local tools and external services, and
 managed clients and loopback services. Loopback is host-wide rather than
@@ -105,6 +112,29 @@ likelihood, confidence, priority, evidence, and disposition. P0 and P1 findings
 block completion by default. P2 and P3 findings are non-blocking unless the user
 promotes them. Record accepted or deferred findings honestly, and state the
 verification needed for any unresolved finding.
+
+A filesystem security finding must identify the protected asset, an untrusted
+actor with a reachable write capability, the supported execution path, and the
+concrete impact. Do not require inode pinning, `lstat`/`fstat` identity
+comparisons, permission repair, recursive ownership checks, or symlink defenses
+merely as defense in depth. Require them only for credentials, authority-bearing
+configuration, cross-user-writable state, privilege transitions, or a
+demonstrated time-of-check/time-of-use boundary under this threat model. Treat
+concerns that depend on unsupported local-filesystem semantics as portability
+requirements or residual risks rather than exploitable vulnerabilities.
+
+When reviewing or changing a child component, calibrate required controls and
+findings to that component's officially supported security disposition as
+established by its governing instructions, documentation, and tests. Tests that
+intentionally encode trust assumptions, deployment profiles, portability
+tradeoffs, or accepted residual risks are evidence of the supported contract;
+do not demand a stricter posture or more pedantic controls than that contract
+requires unless an explicit requirement changes it or a reachable scenario
+violates it. Extra checks whose only value is defense in depth beyond the
+supported disposition are not findings. Do not weaken tests merely to silence a
+finding. If implementation and the supported disposition conflict, fix the
+implementation; if the disposition intentionally changes, update its
+documentation and tests together.
 
 Treat signaling an unrelated process, exposing credentials or private session
 data, corrupting unrelated user work, connecting managed clients to an
