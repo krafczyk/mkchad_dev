@@ -62,7 +62,7 @@ OPENCODE_DB_ACTIONS = [
     {"id": "opencode-db-install", "phase": "apply", "path": "bin/install_opencode_db.sh", "args": ["--recovery-dir", {"token": "recovery_dir"}]},
     {"id": "opencode-db-verify", "phase": "verify", "path": "bin/install_opencode_db.sh", "args": ["--check"]},
 ]
-DEPLOYED_COMPONENTS = ("msk_containers", "container_tools", "mkchad", "opencode-db")
+DEPLOYED_COMPONENTS = tuple(name for name, disposition in COMPONENTS.items() if disposition == "deployed")
 
 
 class DeploymentError(RuntimeError):

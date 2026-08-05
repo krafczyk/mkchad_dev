@@ -204,17 +204,7 @@ def _rotate_logs(logs: pathlib.Path):
 
 def _fallback_result(run_id: str, release: str, started_at: str, log_path: pathlib.Path, diagnostic: str) -> dict:
     """Build a schema-1 failed result for acquisition or handoff failures."""
-    components = [
-        ("msk_containers", "deployed"),
-        ("container_tools", "deployed"),
-        ("mkchad", "deployed"),
-        ("opencode-db", "deployed"),
-        ("opencode", "embedded"),
-        ("opencode.nvim", "configuration-owned"),
-        ("opencode-project-reload", "configuration-owned"),
-        ("compound-engineering", "configuration-owned"),
-        ("opencode_sprint_loop", "disabled"),
-    ]
+    components = list(COMPONENT_DISPOSITIONS.items())
     return {
         "schema": 1,
         "run_id": run_id,
