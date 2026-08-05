@@ -23,6 +23,7 @@ repository that they apply to.
 - `opencode.nvim/`: active Neovim plugin connecting the editor to an OpenCode
   server.
 - `opencode/`: active OpenCode fork for MkChad-specific TUI integration.
+- `opencode-db/`: active standalone OpenCode SQLite cleanup tool.
 - `opencode_sprint_loop/`: frozen historical reference for the former Python
   controller.
 - `opencode_sprint_loop/opencode_sprint_loop.lua/`: frozen historical Neovim

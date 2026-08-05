@@ -30,3 +30,7 @@
 	path = config_files
 	url = git@github.com:krafczyk/config_files.git
 	branch = schumann
+[submodule "opencode-db"]
+	path = opencode-db
+	url = git@github.com:krafczyk/opencode-db.git
+	branch = mkchad-v1
