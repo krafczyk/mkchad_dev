@@ -8,13 +8,14 @@
     "schema": {"const": 2},
     "components": {
       "type": "array",
-      "minItems": 8,
-      "maxItems": 8,
-      "items": {"oneOf": [{"$ref": "#/$defs/msk_containers"}, {"$ref": "#/$defs/container_tools"}, {"$ref": "#/$defs/mkchad"}, {"$ref": "#/$defs/opencode"}, {"$ref": "#/$defs/opencode_nvim"}, {"$ref": "#/$defs/opencode_project_reload"}, {"$ref": "#/$defs/compound_engineering"}, {"$ref": "#/$defs/opencode_sprint_loop"}]},
+      "minItems": 9,
+      "maxItems": 9,
+      "items": {"oneOf": [{"$ref": "#/$defs/msk_containers"}, {"$ref": "#/$defs/container_tools"}, {"$ref": "#/$defs/mkchad"}, {"$ref": "#/$defs/opencode_db"}, {"$ref": "#/$defs/opencode"}, {"$ref": "#/$defs/opencode_nvim"}, {"$ref": "#/$defs/opencode_project_reload"}, {"$ref": "#/$defs/compound_engineering"}, {"$ref": "#/$defs/opencode_sprint_loop"}]},
       "allOf": [
         {"contains": {"$ref": "#/$defs/msk_containers"}, "minContains": 1, "maxContains": 1},
         {"contains": {"$ref": "#/$defs/container_tools"}, "minContains": 1, "maxContains": 1},
         {"contains": {"$ref": "#/$defs/mkchad"}, "minContains": 1, "maxContains": 1},
+        {"contains": {"$ref": "#/$defs/opencode_db"}, "minContains": 1, "maxContains": 1},
         {"contains": {"$ref": "#/$defs/opencode"}, "minContains": 1, "maxContains": 1},
         {"contains": {"$ref": "#/$defs/opencode_nvim"}, "minContains": 1, "maxContains": 1},
         {"contains": {"$ref": "#/$defs/opencode_project_reload"}, "minContains": 1, "maxContains": 1},
@@ -96,7 +97,7 @@
       "required": ["name", "disposition", "repository", "commit", "destination", "actions"],
       "additionalProperties": false,
       "properties": {
-        "name": {"enum": ["msk_containers", "container_tools"]},
+        "name": {"enum": ["msk_containers", "container_tools", "opencode-db"]},
         "disposition": {"const": "deployed"},
         "repository": {"$ref": "#/$defs/repository"},
         "commit": {"$ref": "#/$defs/commit"},
@@ -106,6 +107,7 @@
     },
     "msk_containers": {"allOf": [{"$ref": "#/$defs/deployed"}, {"properties": {"name": {"const": "msk_containers"}}}]},
     "container_tools": {"allOf": [{"$ref": "#/$defs/deployed"}, {"properties": {"name": {"const": "container_tools"}}}]},
+    "opencode_db": {"allOf": [{"$ref": "#/$defs/deployed"}, {"properties": {"name": {"const": "opencode-db"}}}]},
     "mkchad": {
       "type": "object",
       "required": ["name", "disposition", "repository", "commit", "destination", "actions"],

@@ -31,6 +31,7 @@ COMPONENTS = {
     "msk_containers": "deployed",
     "container_tools": "deployed",
     "mkchad": "deployed",
+    "opencode-db": "deployed",
     "opencode": "embedded",
     "opencode.nvim": "configuration-owned",
     "opencode-project-reload": "configuration-owned",
@@ -47,6 +48,7 @@ DEVELOPER_REPOSITORIES = {
     "msk_containers": "git@github.com:krafczyk/msk_containers",
     "container_tools": "git@github.com:krafczyk/container_tools",
     "mkchad": "git@github.com:krafczyk/mkchad",
+    "opencode-db": "git@github.com:krafczyk/opencode-db.git",
 }
 DEVELOPER_ACTIONS = [
     {"id": "host-tools-preflight", "phase": "preflight", "path": "bin/install_nvim.sh", "args": ["--check", "--recovery-dir", {"token": "recovery_dir"}]},
@@ -55,6 +57,12 @@ DEVELOPER_ACTIONS = [
     {"id": "image-install", "phase": "apply", "path": "nvim/bin/install_nvim_container", "args": ["--source-revision", {"token": "component_revision"}, {"token": "staged_image"}]},
     {"id": "host-tools-verify", "phase": "verify", "path": "bin/install_nvim.sh", "args": ["--check"]},
 ]
+OPENCODE_DB_ACTIONS = [
+    {"id": "opencode-db-preflight", "phase": "preflight", "path": "bin/install_opencode_db.sh", "args": ["--check", "--recovery-dir", {"token": "recovery_dir"}]},
+    {"id": "opencode-db-install", "phase": "apply", "path": "bin/install_opencode_db.sh", "args": ["--recovery-dir", {"token": "recovery_dir"}]},
+    {"id": "opencode-db-verify", "phase": "verify", "path": "bin/install_opencode_db.sh", "args": ["--check"]},
+]
+DEPLOYED_COMPONENTS = ("msk_containers", "container_tools", "mkchad", "opencode-db")
 
 
 class DeploymentError(RuntimeError):
@@ -369,6 +377,10 @@ def _developer_components(commits: dict[str, str]) -> dict[str, dict]:
             "name": "mkchad", "disposition": "deployed", "repository": DEVELOPER_REPOSITORIES["mkchad"], "commit": commits["mkchad"],
             "destination": {"root": "xdg_config_home", "path": "mkchad"}, "actions": [], "preserved_paths": ["opencode-server.json", "lazy-lock.json"],
         },
+        "opencode-db": {
+            "name": "opencode-db", "disposition": "deployed", "repository": DEVELOPER_REPOSITORIES["opencode-db"], "commit": commits["opencode-db"],
+            "destination": {"root": "xdg_data_home", "path": "mkchad/components/opencode-db"}, "actions": [dict(action) for action in OPENCODE_DB_ACTIONS],
+        },
     }
 
 
@@ -410,7 +422,20 @@ def _developer_child(path: pathlib.Path, name: str, *, allow_nested: bool = Fals
 
 
 def admit_developer_workspace(workspace: pathlib.Path) -> dict:
-    """Validate the canonical developer workspace and select its three clean child HEADs."""
+    """Select four clean child commits from one canonical developer workspace.
+
+    Args:
+        workspace: Parent MkChad Git top-level containing the expected children.
+
+    Returns:
+        Parent identity plus exact source paths and selected child commit IDs.
+
+    Raises:
+        DeploymentError: If the layout, child identity, commit, or cleanliness
+            check fails.
+
+    This function reads Git metadata but does not stage or mutate target paths.
+    """
     try:
         workspace = workspace.resolve(strict=True)
         top = pathlib.Path(_git(["rev-parse", "--show-toplevel"], workspace).stdout.strip()).resolve(strict=True)
@@ -418,22 +443,37 @@ def admit_developer_workspace(workspace: pathlib.Path) -> dict:
         raise DeploymentError("current directory is not the parent Git top level") from exc
     if workspace != top:
         raise DeploymentError("current directory is not the parent Git top level")
-    msk, tools, mkchad = workspace / "msk_containers", workspace / "msk_containers" / "container_tools", workspace / "mkchad"
+    msk, tools, mkchad, opencode_db = workspace / "msk_containers", workspace / "msk_containers" / "container_tools", workspace / "mkchad", workspace / "opencode-db"
     commits = {
         "msk_containers": _developer_child(msk, "msk_containers", allow_nested=True),
         "container_tools": _developer_child(tools, "container_tools"),
         "mkchad": _developer_child(mkchad, "mkchad"),
+        "opencode-db": _developer_child(opencode_db, "opencode-db"),
     }
     parent_head = _git(["rev-parse", "--verify", "HEAD^{commit}"], workspace, check=False).stdout.strip()
     return {
         "parent": {"path": str(workspace), "revision": parent_head if SHA1.fullmatch(parent_head) else None, "dirty": bool(_workspace_status(workspace))},
-        "sources": {"msk_containers": msk, "container_tools": tools, "mkchad": mkchad},
+        "sources": {"msk_containers": msk, "container_tools": tools, "mkchad": mkchad, "opencode-db": opencode_db},
         "commits": commits,
     }
 
 
 def recheck_developer_workspace(admission: dict):
-    """Refuse target mutation when any source changed after local staging began."""
+    """Refuse target mutation when an admitted source changed during staging.
+
+    Args:
+        admission: Result from :func:`admit_developer_workspace` containing the
+            four selected source paths and commit IDs.
+
+    Returns:
+        ``None`` when every source remains clean at its selected commit.
+
+    Raises:
+        DeploymentError: If a source changed identity, commit, or cleanliness.
+
+    This function reads child Git metadata and does not mutate sources or
+    deployment targets.
+    """
     for name, source in admission["sources"].items():
         try:
             commit = _developer_child(source, name, allow_nested=name == "msk_containers")
@@ -444,7 +484,21 @@ def recheck_developer_workspace(admission: dict):
 
 
 def stage_developer_sources(admission: dict, staging: pathlib.Path) -> dict[str, tuple[pathlib.Path, pathlib.Path]]:
-    """Stage each admitted local commit and overlay the independent nested checkout."""
+    """Stage each admitted local commit under a caller-owned temporary root.
+
+    Args:
+        admission: Result from :func:`admit_developer_workspace`.
+        staging: Empty caller-owned directory for bare repositories/checkouts.
+
+    Returns:
+        Component names mapped to their staged bare repository and checkout.
+
+    Raises:
+        DeploymentError: If an exact commit cannot be staged.
+
+    The nested container-tools checkout is overlaid in staged msk_containers;
+    no final deployment destination is changed.
+    """
     components = _developer_components(admission["commits"])
     staged = {name: _stage(component, staging, admission["sources"][name]) for name, component in components.items()}
     _overlay_container_tools(staged, components)
@@ -562,7 +616,7 @@ def _run_action(action: dict, component: dict, image: pathlib.Path, recovery: pa
     argv = [str(checkout / action["path"]), *(item if isinstance(item, str) else values[item["token"]] for item in action["args"])]
     environment = os.environ.copy()
     environment.pop("MKCHAD_TRUST_GROUP_WRITABLE_ROOTS", None)
-    if action["id"] in {"host-tools-preflight", "host-tools-install", "host-tools-verify"}:
+    if action["id"] in {"host-tools-preflight", "host-tools-install", "host-tools-verify", "opencode-db-preflight", "opencode-db-install", "opencode-db-verify"}:
         environment["MKCHAD_TRUST_GROUP_WRITABLE_ROOTS"] = "1"
     try:
         process = subprocess.Popen(argv, cwd=checkout, env=environment, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True, close_fds=True)
@@ -613,6 +667,7 @@ def _installer_sources(msk_checkout: pathlib.Path) -> list[pathlib.Path]:
 def _managed_paths(roots: dict[str, pathlib.Path], msk_checkout: pathlib.Path, caller_image: pathlib.Path | None) -> list[pathlib.Path]:
     """Return pre-existing installer-owned paths, excluding the caller artifact."""
     paths = [roots["home"] / ".local" / "bin" / source.name for source in _installer_sources(msk_checkout)]
+    paths.append(roots["home"] / ".local" / "bin" / "opencode-db")
     container_dir = pathlib.Path(os.environ.get("NVIM_CONTAINER_DIR", roots["home"] / "containers"))
     paths.extend((container_dir / "neovim.sif", container_dir / "neovim.previous.sif"))
     if container_dir.exists():
@@ -630,6 +685,14 @@ def _host_tool_mismatch(msk_checkout: pathlib.Path, home: pathlib.Path) -> str |
         if not target.is_file() or stat.S_IMODE(target.stat().st_mode) != 0o755 or _digest(target) != _digest(source):
             return source.name
     return None
+
+
+def _host_tool_mismatches(staged: dict[str, tuple[pathlib.Path, pathlib.Path]], home: pathlib.Path) -> dict[str, str | None]:
+    """Return independent managed-launcher compliance observations by component."""
+    launcher = home / ".local" / "bin" / "opencode-db"
+    source = staged["opencode-db"][1] / "bin" / "opencode-db"
+    opencode_db_mismatch = "opencode-db" if launcher.is_symlink() or not launcher.is_file() or stat.S_IMODE(launcher.stat().st_mode) != 0o755 or _digest(launcher) != _digest(source) else None
+    return {"msk_containers": _host_tool_mismatch(staged["msk_containers"][1], home), "opencode-db": opencode_db_mismatch}
 
 
 def _active_image_observation(home: pathlib.Path) -> dict:
@@ -708,12 +771,28 @@ def _result(release: dict, roots: dict[str, pathlib.Path], artifact: dict, run_i
 def developer_result(admission: dict, *, actions: list[dict], artifact: dict, image: dict, run_id: str, started_at: str, log_path: pathlib.Path, outcome: str, phase: str, failed_step: str | None, diagnostic: str) -> dict:
     """Build the mode-tagged developer result from local-workspace evidence.
 
-    The developer result intentionally has no release schema: it records only the
-    selected local components and the observations needed to repair a local run.
+    Args:
+        admission: Selected parent and four child source identities.
+        actions: Current deployment action-result records.
+        artifact: Selected architecture metadata.
+        image: Current image decision and digest observations.
+        run_id: Invocation UUID.
+        started_at: UTC start timestamp.
+        log_path: Absolute run-log path.
+        outcome: Terminal deployment outcome.
+        phase: Last deployment phase reached.
+        failed_step: Failed action/checkout identifier, when any.
+        diagnostic: Bounded terminal diagnostic.
+
+    Returns:
+        A mode-tagged developer result with selected/observed component commits.
+
+    The result intentionally has no release schema. Building it reads deployed
+    checkout HEADs when available and does not mutate deployment state.
     """
     roots, profile = _roots(), _developer_components(admission["commits"])
     components = []
-    for name in ("msk_containers", "container_tools", "mkchad"):
+    for name in DEPLOYED_COMPONENTS:
         observed = None
         with contextlib.suppress(Exception):
             observed = _git(["rev-parse", "HEAD"], _destination(roots, profile[name])).stdout.strip()
@@ -823,9 +902,9 @@ def _execute_components(deployed: dict[str, dict], artifact: dict, image: pathli
                     print(f"mkchad-deploy: --replace-partial asserted the managed service is inactive; replacing: {detail}", file=sys.stderr)
             recovery = staging / "recovery"
             recovery.mkdir(mode=0o700)
-            host_mismatch = _host_tool_mismatch(staged["msk_containers"][1], roots["home"])
+            host_mismatches = _host_tool_mismatches(staged, roots["home"])
             checkout_mutation = any(not plan["compliant"] for _, plan in plans.values())
-            mutation_required = checkout_mutation or host_mismatch is not None or image_info["choice"] == "install"
+            mutation_required = checkout_mutation or any(mismatch is not None for mismatch in host_mismatches.values()) or image_info["choice"] == "install"
             if active and mutation_required:
                 raise DeploymentError("managed service is active and target is not completely compliant")
             staged_image = None
@@ -846,7 +925,7 @@ def _execute_components(deployed: dict[str, dict], artifact: dict, image: pathli
                         current["status"] = "succeeded"
                         current = None
             phase = "apply"
-            for name in ("msk_containers", "container_tools", "mkchad"):
+            for name in DEPLOYED_COMPONENTS:
                 failure_step = f"checkout:{name}"
                 component, (destination, plan) = deployed[name], plans[name]
                 if plan["kind"] == "existing":
@@ -885,7 +964,7 @@ def _execute_components(deployed: dict[str, dict], artifact: dict, image: pathli
                         continue
                     if key in image_action_keys and image_info["choice"] != "install":
                         item["status"] = "skipped-compliant"
-                    elif key not in image_action_keys and host_mismatch is None:
+                    elif key not in image_action_keys and host_mismatches.get(item["component"]) is None:
                         item["status"] = "skipped-compliant"
                     else:
                         current = item
@@ -908,9 +987,9 @@ def _execute_components(deployed: dict[str, dict], artifact: dict, image: pathli
                 if _existing(plans[name][0], component, staged[name][1])["head"] != component["commit"]:
                     raise DeploymentError(f"deployed checkout is not at its selected commit: {name}")
             failure_step = "host-tool-verification"
-            mismatch = _host_tool_mismatch(plans["msk_containers"][0], roots["home"])
-            if mismatch is not None:
-                raise DeploymentError(f"host-tool verification failed: {mismatch}")
+            for name, mismatch in _host_tool_mismatches(staged, roots["home"]).items():
+                if mismatch is not None:
+                    raise DeploymentError(f"host-tool verification failed: {name}:{mismatch}")
             if image_info["choice"] == "install":
                 failure_step = "installed-image-verification"
                 if _active_image_digest(roots["home"]) != image_info["supplied_sha256"]:
@@ -938,7 +1017,27 @@ def _execute_components(deployed: dict[str, dict], artifact: dict, image: pathli
 
 
 def execute_deployment(repo: pathlib.Path, image: pathlib.Path, *, release_tag: str, log_path: pathlib.Path, result_path: pathlib.Path, run_id: str, replace_partial: bool = False) -> int:
-    """Preflight, apply, verify, and report one manifest-authorized release deployment."""
+    """Run one manifest-authorized release deployment synchronously.
+
+    Args:
+        repo: Checked-out release repository containing ``deploy/release.json``.
+        image: Caller-supplied image artifact.
+        release_tag: Validated release identity for the result.
+        log_path: Absolute launcher-owned log path.
+        result_path: Path receiving the terminal schema-1 result.
+        run_id: Invocation UUID.
+        replace_partial: Whether the operator asserted a legacy partial target
+            without lifecycle tooling is inactive.
+
+    Returns:
+        Zero on verified success, otherwise two after publishing failure state.
+
+    Raises:
+        DeploymentError: If launcher handoff or manifest selection is invalid.
+
+    The function stages exact repositories, may update deployed checkouts and
+    host tools, and atomically publishes a terminal result.
+    """
     if not TAG.fullmatch(release_tag) or ".." in release_tag or not UUID.fullmatch(run_id):
         raise DeploymentError("invalid launcher handoff")
     manifest = validate_release_v2_document(_load(repo / "deploy" / "release.json", "release manifest"))
@@ -956,9 +1055,24 @@ def execute_deployment(repo: pathlib.Path, image: pathlib.Path, *, release_tag: 
 def execute_developer_deployment(workspace: pathlib.Path, image: pathlib.Path | None, *, log_path: pathlib.Path, result_path: pathlib.Path, run_id: str, replace_partial: bool = False) -> int:
     """Deploy clean local child commits through the regular target procedure.
 
-    Local source commits are admitted and staged without consulting origins or
-    release metadata. An omitted image preserves active image state; a supplied
-    image is never consumed from its caller path.
+    Args:
+        workspace: Canonical parent workspace with four clean child checkouts.
+        image: Optional caller-owned image; omission preserves active image state.
+        log_path: Absolute launcher-owned log path.
+        result_path: Path receiving the terminal developer result.
+        run_id: Invocation UUID.
+        replace_partial: Whether the operator asserted a legacy partial target
+            without lifecycle tooling is inactive.
+
+    Returns:
+        Zero on verified success, otherwise two after publishing failure state.
+
+    Raises:
+        DeploymentError: If source admission, architecture, or handoff fails.
+
+    Local commits are staged without consulting origins or release metadata.
+    The procedure may update deployed checkouts and host tools; a supplied image
+    is never consumed from its caller path.
     """
     if not UUID.fullmatch(run_id):
         raise DeploymentError("invalid developer handoff")

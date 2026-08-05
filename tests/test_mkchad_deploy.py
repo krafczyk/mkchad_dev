@@ -41,6 +41,34 @@ class DeploymentContractTests(unittest.TestCase):
             self.assertIn("repository", component)
             self.assertIn("commit", component)
 
+    def test_checked_in_manifest_deploys_the_pinned_opencode_db_launcher(self):
+        """Keep the managed database utility distinct from configuration handoff."""
+        component = next(component for component in self.release["components"] if component["name"] == "opencode-db")
+        self.assertEqual(component["disposition"], "deployed")
+        self.assertEqual(component["repository"], "git@github.com:krafczyk/opencode-db.git")
+        self.assertEqual(component["commit"], "fd8782cf56c0823bf850f36c5967ade4da896d00")
+        self.assertEqual(component["destination"], {"root": "xdg_data_home", "path": "mkchad/components/opencode-db"})
+        self.assertEqual(
+            component["actions"],
+            [
+                {"id": "opencode-db-preflight", "phase": "preflight", "path": "bin/install_opencode_db.sh", "args": ["--check", "--recovery-dir", {"token": "recovery_dir"}]},
+                {"id": "opencode-db-install", "phase": "apply", "path": "bin/install_opencode_db.sh", "args": ["--recovery-dir", {"token": "recovery_dir"}]},
+                {"id": "opencode-db-verify", "phase": "verify", "path": "bin/install_opencode_db.sh", "args": ["--check"]},
+            ],
+        )
+
+    def test_json_schemas_close_nine_components_and_preserve_three_component_handoff(self):
+        """Keep schema 1 results aligned with the expanded deployed-child set."""
+        release_schema = json.loads((ROOT / "deploy/release-v2.schema.json").read_text(encoding="utf-8"))
+        result_schema = json.loads((ROOT / "deploy/result-v1.schema.json").read_text(encoding="utf-8"))
+        self.assertEqual((release_schema["properties"]["components"]["minItems"], release_schema["properties"]["components"]["maxItems"]), (9, 9))
+        self.assertEqual((result_schema["properties"]["components"]["minItems"], result_schema["properties"]["components"]["maxItems"]), (9, 9))
+        self.assertIn("opencode-db", result_schema["$defs"]["component"]["properties"]["name"]["enum"])
+        self.assertIn("opencode-db", result_schema["$defs"]["action"]["properties"]["component"]["enum"])
+        handoff = result_schema["$defs"]["configuration_handoff"]["properties"]["components"]
+        self.assertEqual((handoff["minItems"], handoff["maxItems"]), (3, 3))
+        self.assertEqual(set(result_schema["$defs"]["handoff_component"]["properties"]["name"]["enum"]), {"opencode.nvim", "opencode-project-reload", "compound-engineering"})
+
     def test_schema_1_and_unknown_fields_are_rejected(self):
         schema_1 = copy.deepcopy(self.release)
         schema_1["schema"] = 1
@@ -197,7 +225,15 @@ class DeploymentExecutionTests(unittest.TestCase):
         subprocess.run(["git", "-C", str(mkchad_source), "add", ".gitignore"], check=True)
         subprocess.run(["git", "-C", str(mkchad_source), "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-q", "-m", "ignore generated lock"], check=True)
         mkchad = subprocess.check_output(["git", "-C", str(mkchad_source), "rev-parse", "HEAD"], text=True).strip()
-        return {"msk_containers": msk, "container_tools": tools, "mkchad": mkchad, "old_mkchad": old_mkchad}
+        opencode_db = self._repo(
+            "opencode-db.git",
+            {
+                "bin/install_opencode_db.sh": "#!/bin/sh\nset -eu\ntarget=\"$HOME/.local/bin/opencode-db\"\nif [ \"${1:-}\" = --check ]; then\n  if [ \"$#\" -eq 3 ]; then [ \"$2\" = --recovery-dir ] && [ -d \"$3\" ] && [ ! -L \"$target\" ] || exit 2; exit \"${OPENCODE_DB_PREFLIGHT_STATUS:-0}\"; fi\n  [ \"$#\" -eq 1 ] && [ -f \"$target\" ] && [ ! -L \"$target\" ] && [ \"$(stat -c %a \"$target\")\" = 755 ] && cmp -s bin/opencode-db \"$target\" && \"$target\" --help >/dev/null || exit 2\n  exit 0\nfi\n[ \"$#\" -eq 2 ] && [ \"$1\" = --recovery-dir ] && [ -d \"$2\" ] && [ ! -L \"$target\" ] || exit 2\n[ \"${OPENCODE_DB_INSTALL_STATUS:-0}\" = 0 ] || exit \"$OPENCODE_DB_INSTALL_STATUS\"\nmkdir -p \"$HOME/.local/bin\"\ncp bin/opencode-db \"$target\"\nchmod 755 \"$target\"\n",
+                "bin/opencode-db": "#!/bin/sh\n[ \"${1:-}\" = --help ] && { printf '%s\\n' 'opencode-db help'; exit 0; }\nexit 0\n",
+            },
+            {"bin/install_opencode_db.sh", "bin/opencode-db"},
+        )
+        return {"msk_containers": msk, "container_tools": tools, "mkchad": mkchad, "opencode-db": opencode_db, "old_mkchad": old_mkchad}
 
     def _write_manifest(self):
         (self.repo / "deploy" / "release.json").write_text(json.dumps(self.manifest), encoding="utf-8")
@@ -220,6 +256,8 @@ class DeploymentExecutionTests(unittest.TestCase):
     def _destination(self, name):
         if name == "mkchad":
             return self.config / "mkchad"
+        if name == "opencode-db":
+            return self.data / "mkchad" / "components" / "opencode-db"
         base = self.data / "mkchad" / "components" / "msk_containers"
         return base / "container_tools" if name == "container_tools" else base
 
@@ -227,8 +265,8 @@ class DeploymentExecutionTests(unittest.TestCase):
         self.assertEqual(self._execute(), 0)
         first = self._result()
         self.assertEqual(first["outcome"], "succeeded")
-        self.assertEqual([action["status"] for action in first["actions"]], ["succeeded"] * 5)
-        for name in ("msk_containers", "container_tools", "mkchad"):
+        self.assertEqual([action["status"] for action in first["actions"]], ["succeeded"] * 8)
+        for name in ("msk_containers", "container_tools", "mkchad", "opencode-db"):
             destination = self._destination(name)
             self.assertEqual(subprocess.check_output(["git", "-C", str(destination), "rev-parse", "HEAD"], text=True).strip(), self.commits[name])
             self.assertEqual(subprocess.check_output(["git", "-C", str(destination), "config", "--get", "remote.origin.url"], text=True).strip().removesuffix(".git"), f"git@github.com:krafczyk/{name}")
@@ -236,6 +274,10 @@ class DeploymentExecutionTests(unittest.TestCase):
         self.assertEqual(hashlib.sha256(installed_image.read_bytes()).hexdigest(), self.manifest["artifacts"]["nvim-image"][0]["sha256"])
         self.assertEqual((self.home / ".local" / "bin" / "nvim_library.sh").stat().st_mode & 0o777, 0o755)
         self.assertTrue((self.home / ".local" / "bin" / "nvim_clear_npm_global").is_file())
+        launcher = self.home / ".local" / "bin" / "opencode-db"
+        self.assertEqual(launcher.read_bytes(), (self._destination("opencode-db") / "bin" / "opencode-db").read_bytes())
+        self.assertEqual(launcher.stat().st_mode & 0o777, 0o755)
+        self.assertIn("opencode-db help", subprocess.check_output([str(launcher), "--help"], text=True))
         preserved = {"opencode-server.json": "private\n", "lazy-lock.json": "{}\n"}
         for name, contents in preserved.items():
             (self._destination("mkchad") / name).write_text(contents, encoding="ascii")
@@ -249,7 +291,7 @@ class DeploymentExecutionTests(unittest.TestCase):
         self.assertEqual({name: (self._destination("mkchad") / name).read_text(encoding="ascii") for name in preserved}, preserved)
         os.environ["LIFECYCLE_STATUS"] = "healthy"
         self.assertEqual(self._execute("323e4567-e89b-12d3-a456-426614174000"), 0)
-        self.assertEqual([action["status"] for action in self._result()["actions"]], ["succeeded", "skipped-compliant", "skipped-compliant", "skipped-compliant", "succeeded"])
+        self.assertEqual([action["status"] for action in self._result()["actions"]], ["succeeded", "skipped-compliant", "skipped-compliant", "skipped-compliant", "succeeded", "succeeded", "skipped-compliant", "succeeded"])
 
     def test_same_active_digest_skips_all_image_work(self):
         self.assertEqual(self._execute(), 0)
@@ -330,6 +372,41 @@ class DeploymentExecutionTests(unittest.TestCase):
             self.assertEqual(self._execute("323e4567-e89b-12d3-a456-426614174000"), 0)
         self.assertEqual(host_tool.stat().st_mode & 0o777, 0o755)
 
+    def test_opencode_db_launcher_mismatch_requires_inactive_lifecycle_and_reinstalls(self):
+        self.assertEqual(self._execute(), 0)
+        launcher = self.home / ".local" / "bin" / "opencode-db"
+        launcher.write_text("outdated\n", encoding="ascii")
+        os.environ["LIFECYCLE_STATUS"] = "healthy"
+        self.assertEqual(self._execute("223e4567-e89b-12d3-a456-426614174000"), 2)
+        self.assertIn("managed service is active", self._result()["diagnostic"])
+        os.environ["LIFECYCLE_STATUS"] = "inactive"
+        self.assertEqual(self._execute("323e4567-e89b-12d3-a456-426614174000"), 0)
+        self.assertEqual(launcher.read_bytes(), (self._destination("opencode-db") / "bin" / "opencode-db").read_bytes())
+        self.assertEqual([action["status"] for action in self._result()["actions"]], ["succeeded", "skipped-compliant", "skipped-compliant", "skipped-compliant", "succeeded", "succeeded", "succeeded", "succeeded"])
+
+    def test_opencode_db_action_failure_and_unsafe_launcher_are_reported(self):
+        os.environ["OPENCODE_DB_INSTALL_STATUS"] = "7"
+        self.assertEqual(self._execute(), 2)
+        failed = self._result()
+        self.assertEqual(failed["failed_step"], "opencode-db:opencode-db-install")
+        self.assertEqual([action["status"] for action in failed["actions"]], ["succeeded"] * 4 + ["pending", "succeeded", "failed", "pending"])
+        os.environ.pop("OPENCODE_DB_INSTALL_STATUS")
+        launcher = self.home / ".local" / "bin" / "opencode-db"
+        launcher.parent.mkdir(parents=True, exist_ok=True)
+        launcher.symlink_to(self.root / "outside")
+        self.assertEqual(self._execute("223e4567-e89b-12d3-a456-426614174000", replace_partial=True), 2)
+        self.assertIn("action failed: opencode-db:opencode-db-preflight", self._result()["diagnostic"])
+
+    def test_opencode_db_launcher_is_a_partial_target_without_the_lifecycle_command(self):
+        launcher = self.home / ".local" / "bin" / "opencode-db"
+        launcher.parent.mkdir(parents=True)
+        launcher.write_text("legacy launcher\n", encoding="ascii")
+
+        self.assertEqual(self._execute(), 2)
+
+        self.assertIn(str(launcher), self._result()["diagnostic"])
+        self.assertIn("partial target has no lifecycle command", self._result()["diagnostic"])
+
     def test_dirty_wrong_image_and_preflight_failure_do_not_mutate(self):
         wrong = self.manifest["artifacts"]["nvim-image"][0]["sha256"]
         self.manifest["artifacts"]["nvim-image"][0]["sha256"] = "0" * 64
@@ -352,7 +429,7 @@ class DeploymentExecutionTests(unittest.TestCase):
         self.assertEqual(self._execute(), 2)
         failed = self._result()
         self.assertEqual(failed["failed_step"], "msk_containers:image-install")
-        self.assertEqual([action["status"] for action in failed["actions"]], ["succeeded", "succeeded", "succeeded", "failed", "pending"])
+        self.assertEqual([action["status"] for action in failed["actions"]], ["succeeded", "succeeded", "succeeded", "failed", "pending", "succeeded", "pending", "pending"])
         self.assertFalse(list(self.state.rglob("*journal*")))
         self.assertFalse(list(self.state.rglob("*recovery*")))
         os.environ.pop("IMAGE_INSTALL_STATUS")

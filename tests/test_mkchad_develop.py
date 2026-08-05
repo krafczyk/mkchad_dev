@@ -61,13 +61,22 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         self._commit(msk, "add tools")
         mkchad = self.root / "config"
         self._init(mkchad, {"init.lua": "return {}\n", ".gitignore": "opencode-server.json\nlazy-lock.json\n"})
+        database = self.root / "database"
+        self._init(database, {
+            "bin/install_opencode_db.sh": "#!/bin/sh\nexit 0\n",
+            "bin/opencode-db": "#!/bin/sh\n[ \"${1:-}\" = --help ] && exit 0\nexit 0\n",
+        })
+        (database / "bin/opencode-db").chmod(0o755)
+        self._commit(database, "make database launcher executable")
         self._run(["git", "-C", str(self.workspace), "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(msk), "msk_containers"])
         self._run(["git", "-C", str(self.workspace), "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(mkchad), "mkchad"])
+        self._run(["git", "-C", str(self.workspace), "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(database), "opencode-db"])
         self._commit(self.workspace, "add children")
         self._run(["git", "-C", str(self.workspace), "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive"])
         self.msk = self.workspace / "msk_containers"
         self.tools = self.msk / "container_tools"
         self.mkchad = self.workspace / "mkchad"
+        self.database = self.workspace / "opencode-db"
 
     def _run(self, command):
         return subprocess.run(command, check=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -96,21 +105,23 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         self._commit(self.tools, "unpublished tools")
         (self.mkchad / "init.lua").write_text("return { local_commit = true }\n", encoding="ascii")
         self._commit(self.mkchad, "unpublished config")
-        for child in (self.msk, self.tools, self.mkchad):
+        for child in (self.msk, self.tools, self.mkchad, self.database):
             self._run(["git", "-C", str(child), "remote", "remove", "origin"])
 
         admission = self.deploy.admit_developer_workspace(self.workspace)
         self.assertTrue(admission["parent"]["dirty"])
         self.assertEqual(admission["commits"]["container_tools"], self._commit_value(self.tools))
         self.assertEqual(admission["commits"]["mkchad"], self._commit_value(self.mkchad))
+        self.assertEqual(admission["commits"]["opencode-db"], self._commit_value(self.database))
         staging = pathlib.Path(tempfile.mkdtemp(prefix="mkchad-develop-stage-", dir="/tmp/mkchad-v1"))
         self.addCleanup(shutil.rmtree, staging, True)
         staged = self.deploy.stage_developer_sources(admission, staging)
         self.assertEqual(self._commit_value(staged["container_tools"][1]), admission["commits"]["container_tools"])
         self.assertEqual((staged["msk_containers"][1] / "container_tools" / "unpublished").read_text(encoding="ascii"), "snapshot\n")
+        self.assertEqual(self._commit_value(staged["opencode-db"][1]), admission["commits"]["opencode-db"])
 
     def test_dirty_children_and_workspace_layout_fail_before_staging(self):
-        for child, relative in ((self.msk, "untracked"), (self.tools, "untracked"), (self.mkchad, "init.lua")):
+        for child, relative in ((self.msk, "untracked"), (self.tools, "untracked"), (self.mkchad, "init.lua"), (self.database, "untracked")):
             with self.subTest(child=child):
                 target = child / relative
                 target.write_text("dirty\n", encoding="ascii")
@@ -170,8 +181,8 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         staging = pathlib.Path(tempfile.mkdtemp(prefix="mkchad-develop-stage-", dir="/tmp/mkchad-v1"))
         self.addCleanup(shutil.rmtree, staging, True)
         self.deploy.stage_developer_sources(admission, staging)
-        (self.mkchad / "init.lua").write_text("return { advanced = true }\n", encoding="ascii")
-        self._commit(self.mkchad, "advance clean head")
+        (self.database / "bin/opencode-db").write_text("#!/bin/sh\nexit 1\n", encoding="ascii")
+        self._commit(self.database, "advance clean database head")
 
         with self.assertRaisesRegex(self.deploy.DeploymentError, "source changed while staging"):
             self.deploy.recheck_developer_workspace(admission)
@@ -202,7 +213,7 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         image.write_bytes(b"developer image")
         (self.mkchad / "init.lua").write_text("return { deployed = true }\n", encoding="ascii")
         self._commit(self.mkchad, "local deployment")
-        for child in (self.msk, self.tools, self.mkchad):
+        for child in (self.msk, self.tools, self.mkchad, self.database):
             self._run(["git", "-C", str(child), "remote", "remove", "origin"])
         home = self.root / "home"
         environment = {
@@ -210,7 +221,7 @@ class DeveloperWorkspaceTests(unittest.TestCase):
             "XDG_STATE_HOME": str(self.root / "state"), "NVIM_CONTAINER_DIR": str(home / "containers"),
         }
         result_path = self.root / "developer-result.json"
-        with mock.patch.dict(os.environ, environment, clear=False), mock.patch.object(self.deploy, "_runtime_image"), mock.patch.object(self.deploy, "_run_action"), mock.patch.object(self.deploy, "_host_tool_mismatch", return_value=None), mock.patch.object(self.deploy, "_active_image_digest", return_value=hashlib.sha256(image.read_bytes()).hexdigest()):
+        with mock.patch.dict(os.environ, environment, clear=False), mock.patch.object(self.deploy, "_runtime_image"), mock.patch.object(self.deploy, "_run_action"), mock.patch.object(self.deploy, "_host_tool_mismatches", return_value={"msk_containers": None, "opencode-db": None}), mock.patch.object(self.deploy, "_active_image_digest", return_value=hashlib.sha256(image.read_bytes()).hexdigest()):
             self.assertEqual(self.deploy.execute_developer_deployment(self.workspace, image, log_path=self.root / "developer.log", result_path=result_path, run_id="123e4567-e89b-12d3-a456-426614174000"), 0)
         result = json.loads(result_path.read_text(encoding="utf-8"))
         self.assertEqual(result["mode"], "developer")
@@ -218,6 +229,7 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         self.assertEqual(result["diagnostic"], "developer deployment verified")
         destination = self.root / "config" / "mkchad"
         self.assertEqual(self._commit_value(destination), self._commit_value(self.mkchad))
+        self.assertEqual(self._commit_value(self.root / "data" / "mkchad" / "components" / "opencode-db"), self._commit_value(self.database))
         self.assertTrue(image.is_file())
 
     def test_omitted_image_preserves_active_state_and_skips_image_actions(self):
@@ -234,12 +246,12 @@ class DeveloperWorkspaceTests(unittest.TestCase):
             self.deploy, "_runtime_image", side_effect=AssertionError("runtime validation")
         ), mock.patch.object(self.deploy, "_active_image_digest", side_effect=AssertionError("image verification")), mock.patch.object(
             self.deploy, "_run_action", wraps=self.deploy._run_action
-        ) as action, mock.patch.object(self.deploy, "_host_tool_mismatch", return_value=None):
+        ) as action, mock.patch.object(self.deploy, "_host_tool_mismatches", return_value={"msk_containers": None, "opencode-db": None}):
             self.assertEqual(self.deploy.execute_developer_deployment(self.workspace, None, log_path=self.root / "developer.log", result_path=result_path, run_id="123e4567-e89b-12d3-a456-426614174000", replace_partial=True), 0)
 
         result = json.loads(result_path.read_text(encoding="utf-8"))
         self.assertEqual(result["image"], {"choice": "omitted", "supplied_sha256": None, "active_sha256": None, "decision": "preserved"})
-        self.assertEqual([item["id"] for item in result["actions"]], ["host-tools-preflight", "host-tools-install", "host-tools-verify"])
+        self.assertEqual([item["id"] for item in result["actions"]], ["host-tools-preflight", "host-tools-install", "host-tools-verify", "opencode-db-preflight", "opencode-db-install", "opencode-db-verify"])
         self.assertFalse(any(call.args[0]["id"].startswith("image-") for call in action.call_args_list))
         self.assertTrue((container_dir / "neovim.sif").is_symlink())
 
@@ -279,7 +291,7 @@ class DeveloperWorkspaceTests(unittest.TestCase):
             self.deploy, "_runtime_image", side_effect=AssertionError("runtime validation")
         ), mock.patch.object(self.deploy, "_active_image_digest", side_effect=AssertionError("image verification")), mock.patch.object(
             self.deploy, "_run_action", wraps=self.deploy._run_action
-        ) as action, mock.patch.object(self.deploy, "_host_tool_mismatch", return_value=None):
+        ) as action, mock.patch.object(self.deploy, "_host_tool_mismatches", return_value={"msk_containers": None, "opencode-db": None}):
             self.assertEqual(self.deploy.execute_developer_deployment(self.workspace, image, log_path=self.root / "developer.log", result_path=self.root / "developer-result.json", run_id="123e4567-e89b-12d3-a456-426614174000", replace_partial=True), 0)
 
         self.assertTrue(image.is_file())

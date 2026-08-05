@@ -98,7 +98,7 @@ if mode not in ('missing', 'stale'):
         'components': [
             {'name': name, 'disposition': disposition, 'requested_commit': '0' * 40, 'observed_commit': None}
             for name, disposition in [
-                ('msk_containers', 'deployed'), ('container_tools', 'deployed'), ('mkchad', 'deployed'),
+                ('msk_containers', 'deployed'), ('container_tools', 'deployed'), ('mkchad', 'deployed'), ('opencode-db', 'deployed'),
                 ('opencode', 'embedded'), ('opencode.nvim', 'configuration-owned'),
                 ('opencode-project-reload', 'configuration-owned'), ('compound-engineering', 'configuration-owned'),
                 ('opencode_sprint_loop', 'disabled'),

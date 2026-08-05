@@ -32,6 +32,18 @@
       "actions": [],
       "preserved_paths": ["opencode-server.json", "lazy-lock.json"]
     },
+    {
+      "name": "opencode-db",
+      "disposition": "deployed",
+      "repository": "git@github.com:krafczyk/opencode-db.git",
+      "commit": "fd8782cf56c0823bf850f36c5967ade4da896d00",
+      "destination": {"root": "xdg_data_home", "path": "mkchad/components/opencode-db"},
+      "actions": [
+        {"id": "opencode-db-preflight", "phase": "preflight", "path": "bin/install_opencode_db.sh", "args": ["--check", "--recovery-dir", {"token": "recovery_dir"}]},
+        {"id": "opencode-db-install", "phase": "apply", "path": "bin/install_opencode_db.sh", "args": ["--recovery-dir", {"token": "recovery_dir"}]},
+        {"id": "opencode-db-verify", "phase": "verify", "path": "bin/install_opencode_db.sh", "args": ["--check"]}
+      ]
+    },
     {"name": "opencode", "disposition": "embedded", "repository": "git@github.com:krafczyk/opencode.git", "commit": "a8a797ab717289fe30308b1e3bcc8dfa865beb4a"},
     {"name": "opencode.nvim", "disposition": "configuration-owned", "repository": "git@github.com:krafczyk/opencode.nvim", "commit": "37033dc157ac4c05c1e1525fe2fc9e87ae83e2ac"},
     {"name": "opencode-project-reload", "disposition": "configuration-owned", "repository": "git@github.com:krafczyk/opencode-project-reload.git", "commit": "4548302d5b79ab079b2a9d503a4556c6119cbab2"},

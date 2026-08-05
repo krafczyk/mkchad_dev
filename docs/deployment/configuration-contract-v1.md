@@ -6,7 +6,7 @@ successful `latest-result.json` has `configuration_handoff.state` set to
 explicit repository and commit pins from `deploy/release.json`, not derived
 from parent or nested Gitlinks.
 
-`msk_containers`, `container_tools`, and `mkchad` are deployed checkouts.
+`msk_containers`, `container_tools`, `mkchad`, and `opencode-db` are deployed checkouts.
 `opencode` is embedded in the verified SIF. `opencode.nvim`,
 `opencode-project-reload`, and `compound-engineering` remain
 configuration-owned; the deployer does not install them. `opencode_sprint_loop`

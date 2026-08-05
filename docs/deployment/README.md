@@ -54,13 +54,13 @@ top level:
 
 It is a developer workflow, not a release. The source authority is the exact
 clean committed `HEAD` of the checked-out `msk_containers`, its nested
-`container_tools`, and `mkchad` repositories. The parent repository may be
+`container_tools`, `mkchad`, and `opencode-db` repositories. The parent repository may be
 dirty. Child origins may be forked or missing, and unpublished local commits
 work without network access. Parent and nested gitlink revisions are not
 authority. Any dirty, staged, untracked, unmerged, renamed, or type-changing
 child bytes are rejected before target mutation.
 
-The command stages those three local commits and then follows the regular
+The command stages those four local commits and then follows the regular
 deployment procedure. Destinations still require their canonical origins and
 are protected when dirty. Checkouts converge exactly to the selected commits;
 host-tool actions, lifecycle inactivity for required mutation, partial-target
@@ -103,6 +103,13 @@ Both commands perform complete preflight before mutating a final checkout:
 An inactive service is required for mutation. When every checkout, host tool,
 and image already complies, an active service is allowed for a verify-only
 rerun. The omitted apply actions are recorded as `skipped-compliant`.
+
+`opencode-db` is a deployed child at
+`${XDG_DATA_HOME:-$HOME/.local/share}/mkchad/components/opencode-db`. Its
+child-owned installer provides `$HOME/.local/bin/opencode-db`; Python 3.11 or
+newer is required. This managed launcher installation builds no wheel, contacts
+no package index, and adds no dependency. The child repository's standalone
+wheel and virtual-environment installation remains independently supported.
 
 An existing clean component checkout does not require the lifecycle launcher to
 be preinstalled when no managed host tool or image exists yet. Deployment treats

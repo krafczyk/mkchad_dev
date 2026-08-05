@@ -3,6 +3,7 @@ set -euo pipefail
 umask 077
 
 root=${1:?usage: run_deployment_tests.sh TASK_DIRECTORY}
+project_root=$(pwd -P)
 canonical=$(realpath -m -- "$root")
 case "$canonical" in /tmp/mkchad-v1/*) ;; *) printf '%s\n' 'test root must be below /tmp/mkchad-v1' >&2; exit 2 ;; esac
 [[ ! -e $canonical && ! -L $canonical ]] || { printf '%s\n' 'test root must not already exist' >&2; exit 2; }
@@ -81,6 +82,9 @@ mkdir -p "$canonical/components/mkchad"
 printf '%s\n' 'opencode-server.json' 'lazy-lock.json' > "$canonical/components/mkchad/.gitignore"
 printf '%s\n' 'return {}' > "$canonical/components/mkchad/init.lua"
 
+git clone -q "$project_root/opencode-db" "$canonical/components/opencode-db"
+git -C "$canonical/components/opencode-db" checkout -q --detach fd8782cf56c0823bf850f36c5967ade4da896d00
+
 for component in container_tools msk_containers mkchad; do
   git init -q "$canonical/components/$component"
   git -C "$canonical/components/$component" add .
@@ -114,6 +118,7 @@ git -C "$canonical/source" -c user.name=test -c user.email=test@example.invalid 
 git -C "$canonical/source" tag v2-fixture
 git clone -q --bare "$canonical/source" "$canonical/release.git"
 git config --global url."file://$canonical/components/".insteadOf git@github.com:krafczyk/
+git config --global url."file://$canonical/components/opencode-db".insteadOf git@github.com:krafczyk/opencode-db.git
 git config --global url."file://$canonical/release.git".insteadOf git@github.com:krafczyk/mkchad_dev.git
 
 if IMAGE_PREFLIGHT_STATUS=7 python3 deploy/mkchad_release.py --release v2-fixture --image "$image"; then exit 1; fi
@@ -160,8 +165,12 @@ value = json.loads(pathlib.Path(sys.argv[1]).read_text())
 assert value["release"] == "v2-fixture-update"
 assert value["outcome"] == "succeeded"
 assert value["diagnostic"] == "deployment verified; configuration is pending"
-assert [action["status"] for action in value["actions"]] == ["succeeded", "skipped-compliant", "skipped-compliant", "skipped-compliant", "succeeded"]
+assert [action["status"] for action in value["actions"]] == ["succeeded", "skipped-compliant", "skipped-compliant", "skipped-compliant", "succeeded", "succeeded", "skipped-compliant", "succeeded"]
+assert {component["name"] for component in value["components"]} >= {"opencode-db"}
+launcher = pathlib.Path.home() / ".local/bin/opencode-db"
+assert launcher.is_file() and launcher.stat().st_mode & 0o777 == 0o755
 PY
+test -z "$(git -C "$XDG_DATA_HOME/mkchad/components/opencode-db" status --porcelain=v1 --untracked-files=all)"
 if python3 deploy/mkchad_deploy.py recover --deployment-id 123e4567-e89b-12d3-a456-426614174000; then exit 1; fi
 if python3 deploy/mkchad_release.py --release v2-fixture --image "$image" --expected-parent-commit "$(printf a%.0s {1..40})"; then exit 1; fi
 
@@ -173,11 +182,13 @@ git clone -q "$canonical/components/msk_containers" "$developer/msk-source"
 git -C "$developer/msk-source" -c protocol.file.allow=always submodule add -q "$developer/tools-source" container_tools
 git -C "$developer/msk-source" -c user.name=test -c user.email=test@example.invalid commit -q -m nested-tools
 git clone -q "$canonical/components/mkchad" "$developer/mkchad-source"
+git clone -q "$canonical/components/opencode-db" "$developer/opencode-db-source"
 cp deploy/mkchad_develop.py deploy/mkchad_deploy.py deploy/mkchad_release.py "$workspace/deploy/"
 chmod 755 "$workspace/deploy/mkchad_develop.py" "$workspace/deploy/mkchad_deploy.py" "$workspace/deploy/mkchad_release.py"
 git init -q "$workspace"
 git -C "$workspace" -c protocol.file.allow=always submodule add -q "$developer/msk-source" msk_containers
 git -C "$workspace" -c protocol.file.allow=always submodule add -q "$developer/mkchad-source" mkchad
+git -C "$workspace" -c protocol.file.allow=always submodule add -q "$developer/opencode-db-source" opencode-db
 git -C "$workspace" -c protocol.file.allow=always submodule update -q --init --recursive
 git -C "$workspace" add .
 git -C "$workspace" -c user.name=test -c user.email=test@example.invalid commit -q -m workspace
@@ -194,13 +205,17 @@ git -C "$tools" -c user.name=test -c user.email=test@example.invalid commit -q -
 printf '%s\n' 'return { developer = true }' >> "$workspace/mkchad/init.lua"
 git -C "$workspace/mkchad" add init.lua
 git -C "$workspace/mkchad" -c user.name=test -c user.email=test@example.invalid commit -q -m local-mkchad
-for child in "$workspace/msk_containers" "$tools" "$workspace/mkchad"; do
+printf '%s\n' '# local database child' >> "$workspace/opencode-db/bin/opencode-db"
+git -C "$workspace/opencode-db" add bin/opencode-db
+git -C "$workspace/opencode-db" -c user.name=test -c user.email=test@example.invalid commit -q -m local-opencode-db
+for child in "$workspace/msk_containers" "$tools" "$workspace/mkchad" "$workspace/opencode-db"; do
   git -C "$child" remote remove origin
 done
 printf '%s\n' parent-dirty > "$workspace/parent-untracked"
 msk_commit=$(git -C "$workspace/msk_containers" rev-parse HEAD)
 tools_commit=$(git -C "$tools" rev-parse HEAD)
 mkchad_commit=$(git -C "$workspace/mkchad" rev-parse HEAD)
+opencode_db_commit=$(git -C "$workspace/opencode-db" rev-parse HEAD)
 
 developer_home="$developer/home"
 developer_config="$developer/config"
@@ -223,7 +238,7 @@ run_developer() {
 }
 
 run_developer --replace-partial
-python3 - "$developer_state/mkchad/deploy/latest-result.json" "$msk_commit" "$tools_commit" "$mkchad_commit" <<'PY'
+python3 - "$developer_state/mkchad/deploy/latest-result.json" "$msk_commit" "$tools_commit" "$mkchad_commit" "$opencode_db_commit" <<'PY'
 import json
 import pathlib
 import sys
@@ -235,11 +250,15 @@ assert result["diagnostic"] == "developer deployment verified"
 assert result["workspace"]["dirty"] is True
 assert result["image"]["choice"] == "omitted"
 assert all("image" not in action["id"] for action in result["actions"])
-assert {item["name"]: item["observed_commit"] for item in result["components"]} == dict(zip(("msk_containers", "container_tools", "mkchad"), sys.argv[2:]))
+assert {item["name"]: item["observed_commit"] for item in result["components"]} == dict(zip(("msk_containers", "container_tools", "mkchad", "opencode-db"), sys.argv[2:]))
 PY
 test "$(git -C "$developer_data/mkchad/components/msk_containers" rev-parse HEAD)" = "$msk_commit"
 test "$(git -C "$developer_data/mkchad/components/msk_containers/container_tools" rev-parse HEAD)" = "$tools_commit"
 test "$(git -C "$developer_config/mkchad" rev-parse HEAD)" = "$mkchad_commit"
+test "$(git -C "$developer_data/mkchad/components/opencode-db" rev-parse HEAD)" = "$opencode_db_commit"
+test -x "$developer_home/.local/bin/opencode-db"
+"$developer_home/.local/bin/opencode-db" --help >/dev/null
+test -z "$(git -C "$developer_data/mkchad/components/opencode-db" status --porcelain=v1 --untracked-files=all)"
 test "$(readlink "$developer_home/containers/neovim.sif")" = "$active_target"
 test "$(sha256sum "$developer_home/containers/active.sif" | cut -d' ' -f1)" = "$active_digest"
 

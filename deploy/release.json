@@ -76,6 +76,36 @@
       "actions": []
     },
     {
+      "name": "opencode-db",
+      "disposition": "deployed",
+      "repository": "git@github.com:krafczyk/opencode-db.git",
+      "commit": "fd8782cf56c0823bf850f36c5967ade4da896d00",
+      "destination": {
+        "root": "xdg_data_home",
+        "path": "mkchad/components/opencode-db"
+      },
+      "actions": [
+        {
+          "id": "opencode-db-preflight",
+          "phase": "preflight",
+          "path": "bin/install_opencode_db.sh",
+          "args": ["--check", "--recovery-dir", {"token": "recovery_dir"}]
+        },
+        {
+          "id": "opencode-db-install",
+          "phase": "apply",
+          "path": "bin/install_opencode_db.sh",
+          "args": ["--recovery-dir", {"token": "recovery_dir"}]
+        },
+        {
+          "id": "opencode-db-verify",
+          "phase": "verify",
+          "path": "bin/install_opencode_db.sh",
+          "args": ["--check"]
+        }
+      ]
+    },
+    {
       "name": "opencode",
       "disposition": "embedded",
       "repository": "git@github.com:krafczyk/opencode.git",
