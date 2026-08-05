@@ -15,7 +15,7 @@ deepened: 2026-08-05
 ## Goal Capsule
 
 - **Objective:** Provide a standalone operator tool that cleans up an existing OpenCode SQLite database after the observed `SQLITE_PROTOCOL: locking protocol` failure without changing how OpenCode normally opens or manages its database.
-- **Product authority:** A new independent repository owns the cleanup CLI, recovery artifacts, validation, installation, and explicit pruning. OpenCode and MkChad receive only the prerequisite inverse changes needed to restore their pre-policy baseline; they and the container repositories receive no new cleanup integration or runtime behavior.
+- **Product authority:** A new independent repository owns the cleanup CLI, recovery artifacts, validation, installation, and explicit backup pruning. OpenCode and MkChad receive only the prerequisite inverse changes needed to restore their pre-policy baseline; they and the container repositories receive no new cleanup integration or runtime behavior.
 - **Stop conditions:** Stop when the source changes during capture or before installation, when normal WAL replay cannot produce a valid candidate, or when an uncertain-loss installation lacks explicit approval.
 - **Execution profile:** Deep, data-safety-sensitive implementation across one new repository plus prerequisite restoration in the existing OpenCode and MkChad repositories.
 - **Target repository:** `opencode-db` is an independent child repository at `opencode-db/` in the MkChad coordination repository, recorded as a submodule/gitlink alongside the existing children.
@@ -44,21 +44,21 @@ The desired intervention is an operator-run repair, not a replacement database p
 - **Trust the operator's repair context.** (session-settled: user-directed — chosen over confirmation prompts, process inspection, or concurrent-user coordination: invoking the repair command means the operator has already stopped OpenCode as needed.)
 - **Limit cleanup to normal WAL recovery.** (session-settled: user-directed — chosen over general SQLite salvage: only the observed locking-protocol case is in scope until another concrete failure is encountered.)
 - **Gate uncertain loss.** (session-settled: user-directed — chosen over refusing every uncertain candidate or installing best effort automatically: a readable candidate with unprovable completeness may install only after the operator reviews the uncertainty and explicitly approves it.)
-- **Prune only by explicit snapshot ID.** (session-settled: user-directed — chosen over automatic retention or unmanaged deletion: original snapshots remain until the operator selects one exact retained snapshot for deletion.)
+- **Prune backups only by explicit snapshot ID.** (session-settled: user-directed — chosen over automatic retention or unmanaged deletion: original snapshots remain until the operator selects one exact retained snapshot for deletion. The `prune-backup` name distinguishes recovery-artifact deletion from a future, more frequently used `prune` command for active-database retention.)
 
 <!-- ce-section: work-relationships -->
 ### How This Work Fits Together
 
 This plan owns one standalone cleanup product and supersedes the earlier runtime NFS database-policy direction.
 
-- **Independent child repository:** `opencode-db/` owns capture, cleanup, validation, preview, installation, and retained-snapshot pruning through its own Git history and parent gitlink.
+- **Independent child repository:** `opencode-db/` owns capture, cleanup, validation, preview, installation, and retained-backup pruning through its own Git history and parent gitlink.
 - **OpenCode:** Receives only the inverse commit that restores its pre-policy behavior, then requires no cleanup patch or integration.
 - **MkChad and container tooling:** MkChad receives only the inverse commits that restore its pre-policy behavior; neither it nor container tooling receives lifecycle, wrapper, packaging, or deployment integration for this product.
 - **Prior plan:** `docs/plans/2026-08-04-001-fix-nfs-opencode-database-policy-plan.md` remains historical context but is not an implementation source.
 
 ### Actors
 
-- A1. **Operator:** Supplies the database path, reviews cleanup results, authorizes uncertain installation when acceptable, and explicitly prunes retained snapshots. Service state is the operator's responsibility outside the tool.
+- A1. **Operator:** Supplies the database path, reviews cleanup results, authorizes uncertain installation when acceptable, and explicitly prunes retained backups. Service state is the operator's responsibility outside the tool.
 - A2. **Cleanup tool:** Preserves the source set, creates and validates candidates, installs only an authorized candidate, and reports bounded diagnostics.
 - A3. **OpenCode:** Reopens an installed database using its unchanged normal database behavior.
 
@@ -68,7 +68,7 @@ This plan owns one standalone cleanup product and supersedes the earlier runtime
 
 - R1. The cleanup tool must live in its own repository and be installable without modifying OpenCode, MkChad, or container repositories.
 - R2. The tool must operate only when invoked by an operator and must never run automatically during OpenCode startup or shutdown.
-- R3. The tool must identify and display the exact target database before capture, installation, or pruning.
+- R3. The tool must identify and display the exact target database before capture, installation, or backup pruning.
 
 **Operator trust boundary**
 
@@ -97,16 +97,16 @@ This plan owns one standalone cleanup product and supersedes the earlier runtime
 - R17. Installation must retain the complete pre-cleanup source snapshot as rollback evidence and must not claim success until the installed database reopens and validates cleanly.
 - R18. After installation, OpenCode must remain responsible for selecting and managing its normal database journal behavior.
 
-**Retention and pruning**
+**Retention and backup pruning**
 
 - R19. Source snapshots, candidates, and reports must remain private and persist without age- or count-based deletion.
-- R20. Pruning must select one exact retained snapshot ID and must not accept paths, prefixes, or glob patterns.
-- R21. Pruning must refuse a snapshot required by an incomplete installation and otherwise delete only the exact selected retained snapshot ID.
+- R20. Backup pruning must select one exact retained snapshot ID and must not accept paths, prefixes, or glob patterns.
+- R21. Backup pruning must refuse a snapshot required by an incomplete installation and otherwise delete only the exact selected retained snapshot ID.
 
 **Failure behavior**
 
 - R22. Interruption or I/O failure must leave the active database or a retained source snapshot reconstructible and must support a bounded retry or explicit abort.
-- R23. Human and machine-readable results must distinguish successful preview, uncertain candidate, validation failure, installed candidate, retained rollback, changed source, and completed prune.
+- R23. Human and machine-readable results must distinguish successful preview, uncertain candidate, validation failure, installed candidate, retained rollback, changed source, and completed backup prune.
 - R24. The tool must never silently fall back to an empty, in-memory, or newly initialized database.
 
 ### Cleanup Flow
@@ -122,7 +122,7 @@ flowchart TB
   Install -->|no| Preserve
   Install -->|yes| Recheck[Recheck unchanged source bytes]
   Recheck --> Replace[Install and reopen candidate]
-  Replace --> Retain[Retain original snapshot until exact prune]
+  Replace --> Retain[Retain original snapshot until exact backup prune]
 ```
 
 ### Key Flows
@@ -139,10 +139,10 @@ flowchart TB
   - **Steps:** A2 repeats the source-stability check, installs the selected candidate, reopens and validates it, and retains the original snapshot; A3 later uses the database normally.
   - **Outcome:** OpenCode can reopen the cleaned database without any runtime-policy change.
   - **Covers:** R4-R6, R14-R18, R22-R24.
-- F3. **Prune retained snapshot**
+- F3. **Prune retained backup**
   - **Trigger:** A1 decides an exact retained source snapshot is no longer needed.
   - **Actors:** A1, A2.
-  - **Steps:** A1 selects the exact snapshot ID; A2 verifies it is not active or required for rollback, deletes only that snapshot's artifacts, and reports the result.
+  - **Steps:** A1 selects the exact snapshot ID with `prune-backup`; A2 verifies it is not active or required for rollback, deletes only that snapshot's artifacts, and reports the result.
   - **Outcome:** Selected evidence is removed without retention automation or broad path deletion.
   - **Covers:** R19-R23.
 
@@ -155,13 +155,13 @@ flowchart TB
 - AE5. **Covers R12-R16.** Given candidate completeness cannot be proven, when installation is requested without authorization bound to that candidate and report, then installation is refused; exact explicit approval permits it.
 - AE6. **Covers R15-R18, R22.** Given a reviewed candidate and an unchanged source, when installation succeeds, then the candidate reopens cleanly and the complete original source snapshot remains available.
 - AE7. **Covers R4-R6, R16.** Given the source changes after preview, when installation runs, then it refuses before replacement; no process state is inspected.
-- AE8. **Covers R19-R21.** Given several retained snapshots, when prune receives one exact eligible ID, then it removes only that snapshot; paths, globs, active state, and required rollback evidence are refused.
+- AE8. **Covers R19-R21.** Given several retained snapshots, when `prune-backup` receives one exact eligible ID, then it removes only that snapshot; paths, globs, active state, and required rollback evidence are refused.
 
 ### Success Criteria
 
 - A fixture reproducing the observed `SQLITE_PROTOCOL: locking protocol` condition yields either a validated WAL-cleaned candidate or a preserved, actionable failure without source mutation.
 - Explicitly installed candidates reopen successfully under unchanged OpenCode behavior.
-- Every successful installation retains its original database and sidecars until exact-ID prune.
+- Every successful installation retains its original database and sidecars until exact-ID backup prune.
 - No supported workflow requires a change in the OpenCode, MkChad, or container repositories.
 
 ### Scope Boundaries
@@ -170,6 +170,7 @@ flowchart TB
 - Changing OpenCode's journal mode, synchronization settings, database path, startup, or schema is outside scope.
 - Service shutdown, cross-node ownership, leases, process inspection, concurrent-user coordination, automatic takeover, and continuous synchronization are outside scope.
 - Automatic cleanup, installation, rollback, or retention expiry is outside scope.
+- Pruning records from the active OpenCode database, reclaiming its internal free space, and the reserved future `prune` command are outside scope; this plan's `prune-backup` command deletes only retained recovery artifacts.
 - Failure modes other than the observed `locking protocol` error remain deferred until they are encountered and characterized.
 
 ### Dependencies and Assumptions
@@ -196,14 +197,14 @@ flowchart TB
 
 ## Planning Contract
 
-**Product Contract preservation:** changed: R4-R5 remove shutdown confirmation and process/concurrency responsibility; R7 names the supported standard sidecars; R13 defines the lightweight domain-aware preview; R16 retains only source-stability rechecks; R21 simplifies prune eligibility; and the repository relationship makes `opencode-db` a new child gitlink. F1-F3 and AE1-AE8 are updated to match those user-directed boundaries.
+**Product Contract preservation:** changed: R4-R5 remove shutdown confirmation and process/concurrency responsibility; R7 names the supported standard sidecars; R13 defines the lightweight domain-aware preview; R16 retains only source-stability rechecks; R20-R21 name the retained-artifact operation `prune-backup` and reserve `prune` for future active-database retention; and the repository relationship makes `opencode-db` a new child gitlink. F1-F3 and AE1-AE8 are updated to match those user-directed boundaries.
 
 ### Key Technical Decisions
 
 - KTD1. **Restore the existing products before building the standalone tool.** Reverse the known superseded OpenCode and MkChad changes through reviewable inverse commits rather than rewriting history, and remove only the identified uncommitted follow-on changes. Stop if those patch boundaries contain unrelated user work. This preserves R1 and the Product Contract decision that OpenCode, MkChad, and container behavior remain unchanged.
 - KTD2. **Build `opencode-db` as an independent Python child repository.** (session-settled: user-directed — chosen over MkChad-integrated code, a peer checkout, and Bun or native implementations: the cleanup utility needs independent history and installation within the coordination repository's child layout.) Use Python 3.11+, the standard library at runtime, a `src/` package layout, and a console-script entry point. Register child path `opencode-db`, URL `git@github.com:krafczyk/opencode-db.git`, and branch `mkchad-v1` in the parent `.gitmodules` and `AGENTS.md`, then record its child commit through the parent gitlink. Build a wheel and source distribution; remote creation and pushes remain separately authorized prerequisites, and PyPI publication is deferred.
 - KTD3. **Support Linux only in the first release.** (session-settled: user-directed — chosen over portability-first behavior: Linux supplies the mount and replacement semantics needed to admit local scratch and stage installation.) Service shutdown, process inspection, and concurrent database use are outside the tool's contract; commands begin immediately from the explicit path.
-- KTD4. **Require an explicit target path.** Every command requires an exact absolute `--database` path and never invokes OpenCode to discover it. Preview requires the canonical target to exist as a regular file; status, abort, resume, rollback, and prune may resolve a recorded target while its active main file is absent. Reject relative, in-memory, and unknown targets without guessing or creating a database. Every artifact command selects the exact target before a target-scoped ID.
+- KTD4. **Require an explicit target path.** Every command requires an exact absolute `--database` path and never invokes OpenCode to discover it. Preview requires the canonical target to exist as a regular file; status, abort, resume, rollback, and `prune-backup` may resolve a recorded target while its active main file is absent. Reject relative, in-memory, and unknown targets without guessing or creating a database. Every artifact command selects the exact target before a target-scoped ID.
 - KTD5. **Separate persistent evidence from admitted writable SQLite scratch.** Store private retained artifacts in a target-derived control directory adjacent to the database so later operator invocations can find them. Use Linux mount information to admit `tmpfs`, `ramfs`, `ext2`, `ext3`, `ext4`, `xfs`, `btrfs`, or `zfs` for SQLite scratch; `$TMPDIR` is a candidate, not proof of locality, and remote or unclassified filesystems fail closed. Retained candidates are hash-checked in place but SQLite-revalidated on a fresh admitted scratch copy. Post-promotion validation at the active target is the only non-scratch SQLite-open exception. Establish `0700` directories, `0600` files, and a `077` process umask before sensitive writes. Refuse capture when locality, privacy, or required space cannot be established.
 - KTD6. **Identify every supported source set and decision by content and target.** Capture the main database and every present standard `-wal`, `-shm`, and `-journal` sidecar with pre-copy and post-copy manifests containing target identity, presence, byte length, and SHA-256. Any rollback-journal presence is preserved as standard evidence but rejected as unsupported and non-installable without parsing or following super-journal references. A source snapshot ID binds its target and manifest, a candidate ID binds candidate bytes and target, and a report digest binds the preview decision. Any changed target, presence, size, or digest makes the capture or installation ineligible.
 - KTD7. **Use only SQLite's normal recovery path on the copied set.** (session-settled: user-directed — chosen over `.recover`, frame surgery, row salvage, or migration: only the observed WAL cleanup case is supported.) Preserve captured SHM as evidence but let SQLite rebuild the WAL index in scratch. Reject hot rollback-journal and simultaneous WAL/journal states as unsupported. Open with `mode=rw` so a missing main database cannot be created, run bounded WAL checkpoints while checking returned rows, and use Python's SQLite backup API to materialize a clean candidate from the recovered view.
@@ -211,7 +212,7 @@ flowchart TB
 - KTD9. **Bind approval to immutable target-scoped evidence.** Installation selects one target-scoped candidate ID and rechecks target identity, source manifest digest, candidate SHA-256, report schema version, and report SHA-256. An uncertain candidate additionally requires the operator to supply the exact report digest. Cross-target replay, regeneration, or any byte change invalidates prior approval.
 - KTD10. **Install through a durable per-file intent log.** A database set cannot be swapped atomically. Before each same-filesystem move, persist the exact source path, destination path, expected before/after presence and hashes, sequence number, and intended next mutation; mark completion only after the move and required sync. The immutable accepted source snapshot is rollback authority, while quarantined originals are usable only when their hashes match it. Filesystem contents are observations reconciled against the log, never phase authority by themselves. Reopen and validate with SQLite only; never start OpenCode. An interruption after active mutation exposes `status`, `resume`, or explicit `rollback`, never an automatic choice.
 - KTD11. **Make every operation bounded and stdout-pure in machine mode.** Chunked copy, hashing, SQLite backup, and validation honor finite deadlines. `--json` emits exactly one newline-terminated, versioned, bounded JSON object on stdout; diagnostics use stderr; credentials, message bodies, and fields outside the approved lightweight preview never appear; and stable statuses plus exit classes distinguish completion, decision-required preview, precondition refusal, operational failure, and manual recovery.
-- KTD12. **Keep prune minimal and exact.** Prune accepts one complete target-scoped snapshot ID, resolves it through the control store rather than a user path, refuses only a group required by an incomplete installation, and deletes only files bound to that group. If interrupted, the operator may retry the same exact ID to remove any remaining files; the tool does not maintain prune journals, tombstones, retention categories, or broad cleanup scans.
+- KTD12. **Keep backup pruning minimal and exact.** `prune-backup` accepts one complete target-scoped snapshot ID, resolves it through the control store rather than a user path, refuses only a group required by an incomplete installation, and deletes only files bound to that group. If interrupted, the operator may retry the same exact ID to remove any remaining files; the tool does not maintain backup-prune journals, tombstones, retention categories, or broad cleanup scans. `prune` remains unassigned in this release so a future active-database retention command can use the shorter, higher-frequency name.
 - KTD13. **Keep retained protocols readable and fail closed across versions.** Every target catalog, manifest, result, report, and install log records its schema and creating tool version. Unknown future schemas are read-only failures with no mutation. Released readers retain support for prior persisted schemas, and incomplete installation state is never migrated in place.
 - KTD14. **Keep preview lightweight and recognizable.** When the candidate is readable, query only a small stable subset regardless of whether all validation gates pass: `project.id`, `project.name`, and `project.worktree`; an optional credential-redacted `origin` remote discovered read-only from an available worktree; and the four most recently updated sessions using `session.id`, `session.title`, `session.project_id`, and `session.time_updated`. If those tables or columns are absent, mark that summary unavailable without changing generic SQLite cleanup classification. Group structured `foreign_key_check` rows by table. If global integrity validation fails, run bounded table-scoped `integrity_check(TABLE)` calls and count their non-`ok` rows per table instead of parsing integrity message text; retain unattributed global failures as a database-level count. An unreadable candidate reports validation failure without domain rows. Never show message bodies, prompts, tokens, permissions, model metadata, or arbitrary rows.
 
@@ -273,7 +274,7 @@ stateDiagram-v2
 | `cleanup abort` | Exact target and nonterminal capture/preview ID | No database precondition; exact operation only | `aborted`, `scratch_cleanup_required`, or refusal |
 | `cleanup resume` | Exact target and incomplete installation ID | Recorded state is reconcilable | `installed`, `install_incomplete`, or `manual_recovery_required` |
 | `cleanup rollback` | Exact target and incomplete installation ID | Retained source is reconstructible | `rolled_back`, `install_incomplete`, or `manual_recovery_required` |
-| `cleanup prune` | Exact target and snapshot ID | No active-database precondition | `pruned` or refusal |
+| `cleanup prune-backup` | Exact target and snapshot ID | No active-database precondition | `backup_pruned` or refusal |
 
 The human renderer may explain next actions, but it consumes the same result object as `--json`. Machine-mode usage errors also use the result schema rather than argparse's default prose.
 
@@ -286,7 +287,7 @@ opencode-db cleanup status --database ABSOLUTE_PATH [--operation ID] [--json]
 opencode-db cleanup abort --database ABSOLUTE_PATH --operation ID [--json]
 opencode-db cleanup resume --database ABSOLUTE_PATH --operation ID [--deadline-seconds N] [--json]
 opencode-db cleanup rollback --database ABSOLUTE_PATH --operation ID [--deadline-seconds N] [--json]
-opencode-db cleanup prune --database ABSOLUTE_PATH --snapshot ID [--json]
+opencode-db cleanup prune-backup --database ABSOLUTE_PATH --snapshot ID [--json]
 ```
 
 ### Artifact Layout and Identity
@@ -302,7 +303,7 @@ opencode-db cleanup prune --database ABSOLUTE_PATH --snapshot ID [--json]
 
 Schema version 1 emits one closed object with every top-level field present: `schema_version` (integer `1`), `command` (command string), `ok` (boolean), `status` (closed status string), `exit_code` (integer), `target` (absolute string or null), `snapshot_id`, `candidate_id`, `operation_id`, and `report_sha256` (bounded string or null), `completeness` (`complete`, `uncertain`, `invalid`, or null), `validation` (closed object), `preview` (closed object or null), `next_actions` (bounded list of command strings), and `diagnostics` (bounded list of closed `{code, message}` objects). The validation object always contains `integrity`, `foreign_keys`, `checkpoint`, `clean_reopen`, and `sidecars_absent`, each using `pass`, `fail`, or `not_run`. Preview contains bounded `projects`, `recent_sessions`, `table_issue_counts`, and `database_issue_count`; project/session entries expose only the KTD14 fields. Version-1 producers emit no unknown fields. Persisted version-1 readers reject unknown fields and unknown enum values without mutation; external consumers must branch on `schema_version` before interpreting a future schema.
 
-- Exit `0`: requested action reached a terminal successful state, including a complete preview, install, rollback, prune, or status read.
+- Exit `0`: requested action reached a terminal successful state, including a complete preview, install, rollback, backup prune, or status read.
 - Exit `2`: invalid command syntax or input shape.
 - Exit `3`: a valid uncertain preview requires a human decision before install.
 - Exit `4`: a safety precondition refused the action, including changed source, unsupported source state, invalid target, or mismatched retained evidence.
@@ -322,7 +323,7 @@ Schema version 1 emits one closed object with every top-level field present: `sc
 3. Bootstrap `opencode-db` and freeze its CLI, result, artifact, and privacy contracts.
 4. Implement explicit target validation, manifests, capture, and local scratch staging.
 5. Implement normal SQLite cleanup, completeness classification, validation, and preview reporting.
-6. Implement the durable install/recovery state machine, then minimal exact-ID prune.
+6. Implement the durable install/recovery state machine, then minimal exact-ID backup prune.
 7. Complete operator documentation, wheel/install smoke testing, private acceptance support, and final review.
 
 ### Assumptions and Implementation-Time Discovery
@@ -380,7 +381,7 @@ tests/
   test_target.py
 ```
 
-`model.py` owns versioned result, manifest, report, and state types; `artifacts.py` owns the target catalog, private storage, minimal prune, and content identity; `target.py` owns explicit path and scratch admission; `cleanup.py` owns copied-set SQLite processing; `install.py` owns installation, resume, and rollback; `cli.py` composes commands and renderers.
+`model.py` owns versioned result, manifest, report, and state types; `artifacts.py` owns the target catalog, private storage, minimal backup prune, and content identity; `target.py` owns explicit path and scratch admission; `cleanup.py` owns copied-set SQLite processing; `install.py` owns installation, resume, and rollback; `cli.py` composes commands and renderers.
 
 ---
 
@@ -496,22 +497,22 @@ tests/
   - Use byte-identical source sets at two targets and verify cross-target resume and rollback are refused before mutation.
 - **Verification:** Every injected interruption leaves either the original active set, the validated candidate, or exact retained bytes plus an actionable durable state; success is reported only after non-migrating SQLite validation at the target path.
 
-### U7. Prune one eligible snapshot safely
+### U7. Prune one eligible backup safely
 
 - **Goal:** Remove one exact retained snapshot group without broad path deletion or loss of required rollback evidence.
 - **Requirements:** R3, R19-R23, F3, AE8, KTD3, KTD6, KTD12-KTD13.
 - **Dependencies:** U6.
 - **Files:** `src/opencode_db/artifacts.py`, `src/opencode_db/install.py`, `src/opencode_db/cli.py`, `tests/test_artifacts.py`, `tests/test_install.py`, `tests/test_cli.py`.
-- **Approach:** Resolve only a syntactically complete ID through the exact target catalog, refuse a group referenced by an incomplete installation, and unlink only files enumerated by that group. An interrupted prune can retry the same exact ID against remaining files; there is no prune journal, tombstone, retention automation, or broad scan.
+- **Approach:** Expose this operation only as `prune-backup`, resolve only a syntactically complete ID through the exact target catalog, refuse a group referenced by an incomplete installation, and unlink only files enumerated by that group. An interrupted backup prune can retry the same exact ID against remaining files; there is no backup-prune journal, tombstone, retention automation, or broad scan. Reserve `prune` for future active-database retention work.
 - **Execution note:** Write negative destructive-path tests before implementing deletion.
 - **Patterns to follow:** `compound-engineering/docs/solutions/best-practices/preserve-user-content-across-all-destructive-paths.md` requires tests to prove that the intended deletion path ran and that sibling paths cannot reach protected content.
 - **Test scenarios:**
-  - Covers AE8. Prune one eligible exact ID among several groups and prove every unselected byte remains.
-  - Reject paths, prefixes, glob characters, unknown IDs, candidate IDs, wrong-target IDs, and groups referenced by an incomplete installation; permit exact prune of other snapshot groups.
+  - Covers AE8. Run `prune-backup` for one eligible exact ID among several groups and prove every unselected byte remains.
+  - Reject paths, prefixes, glob characters, unknown IDs, candidate IDs, wrong-target IDs, and groups referenced by an incomplete installation; permit exact backup prune of other snapshot groups.
   - Interrupt deletion once, retry the same ID, and verify only remaining files in that exact group are removed.
   - Replace a manifest-listed file with changed bytes or add an unexpected file; verify refusal rather than deleting mismatched or unlisted content.
-  - Keep OpenCode running only against the untouched active set and verify prune of an eligible retained group does not inspect or mutate it.
-- **Verification:** Prune can delete only the one manifest-bound eligible group, is restartable without broad scans, and cannot remove active or required recovery evidence.
+  - Keep OpenCode running only against the untouched active set and verify `prune-backup` of an eligible retained group does not inspect or mutate it.
+- **Verification:** `prune-backup` can delete only the one manifest-bound eligible group, is restartable without broad scans, and cannot remove active or required recovery evidence; no active-database `prune` command is exposed.
 
 ### U8. Document, package, and prove operator use
 
@@ -519,14 +520,14 @@ tests/
 - **Requirements:** R1-R5, R13, R18-R24, F1-F3, AE1-AE8, KTD2-KTD4, KTD10-KTD14.
 - **Dependencies:** U2-U7.
 - **Files:** `README.md`, `docs/protocol.md`, `pyproject.toml`, `tests/sqlite_fixtures.py`, `tests/test_cli.py`, `tests/test_cleanup.py`, `tests/test_install.py`, `tests/test_target.py`.
-- **Approach:** Document child-repository ownership, explicit target paths, immediate execution without shutdown confirmation or process coordination, lightweight preview fields and limitations, preview/install separation, uncertainty approval, status/abort/resume/rollback, retained protocol compatibility, minimal exact prune, JSON/exit contracts, deadlines, privacy, disk amplification, and the boundary that OpenCode starts separately. Add focused generated WAL fixtures to default tests and a private acceptance entry point that consumes a user-supplied copied `SQLITE_PROTOCOL` fixture without committing or printing it. Build and install a wheel in an isolated environment and smoke the console entry point.
+- **Approach:** Document child-repository ownership, explicit target paths, immediate execution without shutdown confirmation or process coordination, lightweight preview fields and limitations, preview/install separation, uncertainty approval, status/abort/resume/rollback, retained protocol compatibility, minimal exact `prune-backup`, reserved active-database `prune`, JSON/exit contracts, deadlines, privacy, disk amplification, and the boundary that OpenCode starts separately. Add focused generated WAL fixtures to default tests and a private acceptance entry point that consumes a user-supplied copied `SQLITE_PROTOCOL` fixture without committing or printing it. Build and install a wheel in an isolated environment and smoke the console entry point.
 - **Execution note:** Prefer install/runtime smoke proof for packaging, then run the deterministic suite; keep real network-filesystem acceptance explicitly opt-in and private.
 - **Patterns to follow:** README command clarity from `opencode_sprint_loop/README.md` as historical packaging reference; workspace protected-path and credential rules from `AGENTS.md`.
 - **Test scenarios:**
-  - Build a wheel, install it into a clean Python 3.11+ environment, and run help, complete preview, uncertain preview, install refusal, status, and exact prune through the installed console script.
+  - Build a wheel, install it into a clean Python 3.11+ environment, and run help, complete preview, uncertain preview, install refusal, status, and exact `prune-backup` through the installed console script.
   - Follow README instructions from a clean shell with an explicit absolute target; verify documented commands and output fields match behavior and no OpenCode discovery command runs.
   - Run the private observed-case gate against a copied input with a predefined expected classification/data oracle and source-byte-identity check; verify the original reproduces the motivating reopen failure, the cleaned disposable candidate reopens successfully under unchanged OpenCode, and the source remains unchanged. Accept a documented supported refusal only when the feasibility gate already established that refusal as the expected outcome.
-  - Verify docs state that commands do not ask about shutdown or inspect concurrent users, no automatic cleanup occurs, OpenCode is never started by the tool, snapshots persist until exact prune, preview is intentionally lightweight, and general salvage is unsupported.
+  - Verify docs state that commands do not ask about shutdown or inspect concurrent users, no automatic cleanup occurs, OpenCode is never started by the tool, snapshots persist until exact `prune-backup`, active-database `prune` is deferred, preview is intentionally lightweight, and general salvage is unsupported.
 - **Verification:** Source and wheel artifacts build reproducibly enough for local installation, the installed CLI passes smoke flows, default tests remain deterministic and credential-free, and docs match every public command/status and safety boundary.
 
 ---
@@ -537,7 +538,7 @@ Primary commands run from the `opencode-db` repository unless a row names anothe
 
 | Gate | Command | Proves | Applies to |
 |---|---|---|---|
-| Standard-library tests | `python -m unittest discover -s tests -v` | CLI, source capture, WAL cleanup, install recovery, and prune behavior | U2-U8 |
+| Standard-library tests | `python -m unittest discover -s tests -v` | CLI, source capture, WAL cleanup, install recovery, and backup-prune behavior | U2-U8 |
 | Bytecode validation | `python -m compileall -q src` | Import and syntax integrity under the selected interpreter | U2-U8 |
 | Lint | `ruff check .` | Static defects and repository style | U2-U8 |
 | Format | `ruff format --check .` | Stable Python formatting | U2-U8 |
@@ -549,7 +550,7 @@ Primary commands run from the `opencode-db` repository unless a row names anothe
 | MkChad restoration | Run the repository's existing Lua/Python OpenCode command and startup smoke tests that remain after the inverse commits | U1 removes recovery authority without regressing prior startup behavior | U1 |
 | Private observed-case acceptance | Copied fixture and supported network filesystem; private and outside default CI, but required before package implementation and release completion | The original reproduces the motivating failure, normal cleanup changes the disposable unchanged-OpenCode reopen outcome as expected, and source bytes remain identical | U2-U6, U8 |
 
-The default suite must generate focused WAL states through Python subprocesses rather than checking in user databases. It covers committed and uncommitted frames, missing and malformed standard sidecars, stale SHM, rollback-journal refusal, source mutation, cross-target replay, candidate/report mutation, lightweight project/session preview, credential-redacted optional remotes, table/database issue counts, representative fresh-process install recovery, one interrupted prune retry, schema incompatibility, timeout, no-space, scratch locality, privacy, and JSON redaction. It does not add process, stopped-service, or concurrent-user tests. Run only one resource-intensive suite at a time.
+The default suite must generate focused WAL states through Python subprocesses rather than checking in user databases. It covers committed and uncommitted frames, missing and malformed standard sidecars, stale SHM, rollback-journal refusal, source mutation, cross-target replay, candidate/report mutation, lightweight project/session preview, credential-redacted optional remotes, table/database issue counts, representative fresh-process install recovery, one interrupted backup-prune retry, schema incompatibility, timeout, no-space, scratch locality, privacy, and JSON redaction. It does not add process, stopped-service, or concurrent-user tests. Run only one resource-intensive suite at a time.
 
 ---
 
@@ -561,7 +562,7 @@ The default suite must generate focused WAL states through Python subprocesses r
 - U4 is complete when normal SQLite WAL handling produces only validated sidecar-free candidates, completeness classifications are reproducible, and unsupported/salvage states cannot install.
 - U5 is complete when preview shows bounded recognizable project records, four recent sessions, and table/database issue counts without requiring schema expertise or exposing message content, and any changed candidate/report byte invalidates installation authority.
 - U6 is complete when representative fresh-process abrupt-death tests at original retention, candidate promotion, and rollback prove deterministic status, resume, rollback, or manual recovery without a false success or lost source set.
-- U7 is complete when target-scoped exact-ID prune removes only one eligible manifest-bound group, refuses incomplete-install dependencies, and can retry the same ID after one representative interruption.
+- U7 is complete when target-scoped exact-ID `prune-backup` removes only one eligible manifest-bound group, refuses incomplete-install dependencies, can retry the same ID after one representative interruption, and leaves `prune` unassigned for future active-database retention.
 - U8 is complete when docs, wheel smoke, deterministic fixtures, and the private observed-case acceptance gate match the shipped behavior.
 - All Verification Contract gates applicable to the final diff pass. If the private observed-case fixture or expected oracle is unavailable, implementation may be reported code-complete but the product and release Definition of Done remain unmet.
 - No OpenCode, MkChad, or container runtime-policy behavior remains changed by this effort, and `opencode-db` is recorded as a normal child submodule/gitlink of the coordination repository.
