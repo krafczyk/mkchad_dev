@@ -61,6 +61,15 @@ substituting a runtime. `plugin:validate` also requires the repository-pinned
 Use task-specific directories beneath `/tmp/mkchad-v1`. Repository instructions
 define focused verification and any required local toolchain details.
 
+## Schumann Container Storage Override
+
+Container image builds and SingularityCE/Apptainer runtime storage are an
+explicit exception to the default disposable root on this host. The tracked
+Schumann `~/.config/ct_runtime.conf` redirects their large cache and temporary
+trees beneath `/data1/matthew`; architecture-specific Buildx caches are
+serialized and generation-rotated there. Source checkouts, ordinary tests, and
+all other disposable artifacts remain beneath `/tmp/mkchad-v1`.
+
 ## Protected Live Paths
 
 Treat `~/.config/mkchad`, `~/.local/state/mkchad`,
