@@ -13,12 +13,12 @@ execution: code
 
 ## Goal Capsule
 
-- **Objective:** Make released `host-bridge` binaries and configured host tool roots available explicitly inside MkChad v1 x86_64 and AArch64 Neovim environments.
-- **Product authority:** This plan integrates completed container-prerequisite and standalone-host-bridge releases; it does not redesign either product.
+- **Objective:** Make released `host-bridge` binaries and the generic `/host` mirror available explicitly inside MkChad v1 x86_64 and AArch64 Neovim environments.
+- **Product authority:** This plan consumes completed container-prerequisite and automatic host-root projection work plus the standalone host-bridge release; it does not redesign those products.
 - **User outcome:** An agent or operator inside MkChad can explicitly run host Cargo tools, bounded Slurm clients, or file-level repair commands against an already-visible mounted root through the best compatible backend.
-- **Open blockers:** The prerequisite `msk_containers` commit must be verified, and the standalone child release commit, installer, archives, and checksums must be published before integration can land.
+- **Open blockers:** The automatic host-root projection prerequisite must be implemented and verified, the prerequisite `msk_containers` commit must be verified, and the standalone child release commit, installer, archives, and checksums must be published before integration can land. This development environment has no container runtime, so native Docker/SIF claims additionally require operator-returned host reports from the supplied integration runner.
 - **Stop conditions:** Stop if host paths must replace the image's normal `/usr`, a persistent instance can reuse the wrong bind profile, release deployment cannot verify the exact native host-bridge artifact, or unavailable full-root semantics are hidden by rewrite fallback.
-- **Tail ownership:** Consume the immutable published host-bridge release, then complete and publish `container_tools`, `msk_containers`, and `mkchad` serially before recording exact child commits, artifacts, schemas, and gitlinks in one verified parent integration boundary.
+- **Tail ownership:** Consume the immutable published host-bridge release, complete deterministic work in `container_tools`, `msk_containers`, and `mkchad`, provide exact host-run commands, validate returned native reports, and only then record the claimed child commits, artifacts, schemas, and gitlinks in one verified parent integration boundary.
 
 ---
 
@@ -26,7 +26,7 @@ execution: code
 
 ### Summary
 
-MkChad projects selected host filesystem paths into dedicated `/host/*` locations without changing the image's ordinary command environment. The installed standalone `host-bridge` binary consumes a user-owned runtime-neutral config and explicitly launches host/root commands through Bubblewrap, PRoot, or caller-authorized rewrite behavior.
+MkChad consumes the generic writable `/host` mirror without changing the image's ordinary command environment. The installed standalone `host-bridge` binary consumes a user-owned runtime-neutral config and explicitly launches host/root commands through Bubblewrap, PRoot, or caller-authorized rewrite behavior.
 
 ### Key Decisions
 
@@ -36,11 +36,12 @@ MkChad projects selected host filesystem paths into dedicated `/host/*` location
 - **Support x86_64 and AArch64 only.** (session-settled: user-directed - chosen over PPC64LE integration.)
 - **Use light compatibility-oriented policy.** (session-settled: user-directed - chosen over command authorization and filesystem hardening: the feature assumes trusted callers and ordinary path behavior.)
 - **Require explicit rewrite degradation.** (session-settled: user-directed - chosen over silent fallback when namespace and ptrace backends are unavailable.)
+- **Provide one operator-runnable integration suite.** (session-settled: user-directed - runtime-dependent integration claims must be captured by a cumulative host test because the development environment has no container tools.)
 
 ### Actors
 
 - A1. **MkChad operator:** Installs an x86_64 or AArch64 release and supplies optional site-specific host-bridge configuration.
-- A2. **MkChad launcher:** Selects the image, fixes the persistent bind profile, and projects host paths at dedicated visible destinations.
+- A2. **MkChad launcher:** Selects the image, fixes the persistent bind profile, and consumes host paths from the generic mirror at dedicated visible destinations.
 - A3. **In-container agent or shell:** Explicitly invokes `host-bridge` for a host/root command.
 - A4. **Host bridge:** Reads the runtime-neutral config and selects Bubblewrap, PRoot, or explicitly permitted rewrite semantics.
 - A5. **Release deployer:** Stages, verifies, installs, and records the exact architecture-specific host-bridge artifact.
@@ -58,12 +59,12 @@ MkChad projects selected host filesystem paths into dedicated `/host/*` location
 **Host path projection**
 
 - R6. Normal image `/usr`, `/bin`, `/sbin`, `/lib*`, `/etc`, and `/opt/msk` must remain unchanged outside a nested host-bridge launch.
-- R7. Maintained launchers must bind available host system trees read-only beneath dedicated `/host/*` destinations before persistent instance creation.
-- R8. The initial common projection set must cover host `/usr`, `/bin`, `/sbin`, `/lib`, `/lib64`, and `/opt` when each source exists, while preserving explicit absence rather than creating misleading empty roots.
-- R9. Slurm integration must support optional host `/etc/slurm` and `/run/munge` or `/var/run/munge` projections without reading credentials in launcher diagnostics.
-- R10. Existing automatic workspace, home, and shared-filesystem binds remain visible at their current paths and may be referenced by host-bridge projections without duplication.
-- R11. Every explicit host-bridge bind must participate in the persistent-instance profile; no launcher may try to add a bind while executing an existing instance.
-- R12. Changing the resolved immutable bridge executable, effective config path, explicit bind set, or resolved bind-source identity must select a new persistent-instance identity rather than reuse an incompatible instance.
+- R7. Maintained launchers must consume the automatic `/host` projection selected by `container_tools` rather than constructing their own fixed host-system bind list.
+- R8. The selected projection strategy and exact bind set must be fixed before persistent instance creation and must participate in its canonical profile identity.
+- R9. Slurm integration must support host configuration and runtime resources through `/host/etc/slurm` and `/host/run/munge` when present without reading credentials in launcher diagnostics.
+- R10. Existing automatic workspace, home, and shared-filesystem binds remain visible at their current paths; host-bridge profiles may reference those paths directly or through the generic mirror.
+- R11. Every explicit host-bridge bind and the effective automatic host mirror must participate in the persistent-instance profile; no launcher may try to add or replace a bind while executing an existing instance.
+- R12. Persistent identity must be finalized only after all automatic, explicit user, bridge, bootstrap, cwd, and generated mirror binds are assembled. Changing the resolved immutable bridge executable, effective config path, explicit bridge/base bind identity, effective UID/GID/supplementary-group realization, generated projection strategy, or generated lexical-source/resolved-target/destination/access/recursion tuple selects a new identity; incidental generated inode, device, mount-ID, timestamp, or same-path network-remount changes do not.
 
 **Configuration and UX**
 
@@ -90,6 +91,7 @@ MkChad projects selected host filesystem paths into dedicated `/host/*` location
 - R27. Release and developer terminal result schema 2 must represent `nvim-image` and `host-bridge-binary` separately under one closed `artifacts` object. Each entry is either null before admission/not applicable/not requested or records architecture plus expected/observed checksum; the bridge entry additionally records expected/observed source commit. Successful release x86_64/AArch64 results require both entries, successful PPC64LE results require a null bridge entry, developer omission uses a null bridge entry, and fallback/interrupted results use the same shape with unavailable observations null.
 - R28. A managed OpenCode server lifecycle must record the canonical persistent-container profile identity. A start against an existing different, malformed, legacy, or future identity fails closed with explicit stop/start guidance instead of reusing or automatically stopping the old server; absent lifecycle state permits first-start creation.
 - R29. Documentation and isolated tests must show unprivileged file-level repair of an already-visible, same-architecture mounted root within caller permissions; MkChad does not discover or add arbitrary repair-root binds.
+- R30. The parent must ship one opt-in `tests/host_bridge_release_runtime_test.sh` that consumes an accepted projection report and tests the cumulative release/outer-projection/nested-backend flows. It emits bounded schema `mkchad.host-bridge-release-runtime/v1` with exact source, image, archive, case, and cleanup evidence; exit 77 grants no backend or architecture claim.
 
 ### Key Flows
 
@@ -97,7 +99,7 @@ MkChad projects selected host filesystem paths into dedicated `/host/*` location
 flowchart TB
   DEP[Deploy native host-bridge artifact] --> LAUNCH[MkChad launcher]
   CFG[User-owned bridge config] --> LAUNCH
-  LAUNCH --> BIND[Fix /host projections before instance start]
+  LAUNCH --> BIND[Fix selected /host mirror before instance start]
   BIND --> IMG[Persistent Neovim image]
   IMG --> EXPLICIT[host-bridge -- command]
   EXPLICIT --> BW[Bubblewrap exact-root probe]
@@ -106,13 +108,14 @@ flowchart TB
   PR -->|explicit degradation only| RW[Rewrite]
 ```
 
-- F1. **Host Cargo tool:** The operator configures a profile using `/host` system paths and the already-mounted home/project; an agent invokes a Cargo-installed command explicitly and receives its native result.
+- F1. **Host Cargo tool:** The operator configures a profile using the automatic `/host` mirror and the already-mounted home/project; an agent invokes a Cargo-installed command explicitly and receives its native result.
 - F2. **Slurm inspection:** The launcher projects host Slurm libraries/configuration/socket; an agent invokes `squeue`, `sinfo`, or read-oriented `scontrol` through host-bridge.
 - F3. **Slurm submission:** An agent invokes `sbatch` with a workspace script; the projected cwd and host site stack submit it once and return the native client result.
 - F4. **Backend diagnosis:** The agent requests JSON doctor output and sees installed plus operational Bubblewrap/PRoot status for the configured profile.
 - F5. **Unsupported host:** Both full-root probes fail; host-bridge exits without launching until the caller explicitly requests rewrite degradation.
 - F6. **Release deployment:** The deployer stages the native binary and image, verifies checksums and source commits, installs child and host tools serially, then reports exact observed state.
 - F7. **Mounted-root repair:** An already-mounted same-architecture fixture is selected as the standalone profile root; a caller performs bounded file-level repair without MkChad adding a new bind or claiming elevated authority.
+- F8. **External host verification:** After deterministic gates pass, the implementer supplies one command per available backend/architecture. The operator runs the cumulative host suite with an accepted matching projection report and returns its JSON result; the coordinator validates all digests, applicable cases, and cleanup before accepting the integration claim.
 
 ### Acceptance Examples
 
@@ -128,6 +131,7 @@ flowchart TB
 - AE10. Given an opt-in real HPC profile, bounded Slurm inspection and a user-supplied safe submission smoke pass without exposing site credentials in logs or release state.
 - AE11. Given an already-visible mounted-root fixture, an unprivileged repair command changes only caller-writable fixture files, and a read-only profile refuses the same write.
 - AE12. Given an active managed OpenCode server under one bridge profile identity, a start with a changed binary, effective config path, or bind-set identity fails with bounded stop/start guidance and neither reuses nor signals the existing server.
+- AE13. Given an accepted projection report, local image, and exact host-bridge archive, one opt-in host command runs only isolated fake-Cargo/fake-Slurm/repair fixtures and emits a redacted exact-source report. Missing runtime, image, architecture, archive, or matching projection evidence exits 77 and remains unclaimed.
 
 ### Scope Boundaries
 
@@ -135,7 +139,7 @@ flowchart TB
 
 - Host-bridge child registration and release/deployment metadata.
 - Static native binary installation and fixed in-image availability.
-- Read-only projection of common host system paths to `/host/*` before persistent instance startup.
+- Consumption of the automatic writable host mirror before persistent instance startup.
 - User-owned runtime-neutral config and examples.
 - Explicit Cargo tool and Slurm submit/inspect flows.
 - File-level repair of already-visible same-architecture mounted roots.
@@ -161,6 +165,7 @@ flowchart TB
 
 ### Dependencies And Assumptions
 
+- `docs/plans/2026-08-06-001-feat-automatic-host-root-projection-plan.md` has produced a verified generic `/host` capability plus an accepted exact-source host report for every backend/architecture claimed here.
 - The container-prerequisites plan has produced a verified `msk_containers` commit containing Bubblewrap and PRoot for x86_64/AArch64; this plan owns building and publishing the final integrated images.
 - The standalone plan has published checksum-addressed static host-bridge artifacts and an installer contract.
 - Apptainer/Singularity permits the configured outer binds and fixes them for the life of a persistent instance.
@@ -171,6 +176,7 @@ flowchart TB
 
 - `msk_containers/container_tools/ct_instance_exec.sh` defines immutable persistent-instance bind profiles and execution without late bind changes.
 - `msk_containers/container_tools/ct_library.sh` defines current explicit bind and environment injection contracts.
+- `docs/plans/2026-08-06-001-feat-automatic-host-root-projection-plan.md` defines the generic host mirror, backend parity, and best-effort failure contract consumed here.
 - `msk_containers/nvim/bin/mkchad` and `mkchad-opencode-server` own current persistent launch integration.
 - `msk_containers/bin/install_nvim.sh` owns installed MkChad host launchers.
 - `mkchad/lua/configs/opencode.lua` owns managed OpenCode lifecycle state validation, healthy-state reuse, and start/stop fencing inside the image.
@@ -181,25 +187,26 @@ flowchart TB
 
 ## Planning Contract
 
-**Product Contract preservation:** Product decisions from the confirmed brainstorm are captured unchanged; planning adds cross-repository ownership, fixed projection layout, deployment expansion, and verification sequence.
+**Product Contract preservation:** Product decisions from the confirmed brainstorm are captured unchanged; planning adds cross-repository ownership, generic host-mirror consumption, deployment expansion, and verification sequence.
 
 ### Key Technical Decisions
 
 - KTD1. **Consume a published root child.** Add `host-bridge/` as an independent parent submodule on branch `mkchad-v1` only after the exact released child commit is fetchable.
 - KTD2. **Install one native static artifact on the host.** The public and developer launchers admit `--host-bridge-archive`, the release deployer selects x86_64 or AArch64, verifies checksum plus embedded source commit, and delegates check/apply/verify to the already-published `host-bridge/scripts/install-release.sh`.
 - KTD3. **Bind only one immutable installed executable into a fixed image location.** The child installer maintains `$HOME/.local/bin/host-bridge` as an atomic selector into `${XDG_DATA_HOME:-$HOME/.local/share}/mkchad/tools/host-bridge/SHA256/host-bridge`. The launcher resolves the selector once, verifies the selected regular file against the digest-named immutable path, and projects that resolved path read-only to `/opt/msk/host-bridge/bin/host-bridge`; the bootstrap prepends only `/opt/msk/host-bridge/bin`, not the host's general binary directories. Ordinary deployment never overwrites or deletes old immutable payloads, so a concurrent selector update cannot change an already-resolved bind source.
-- KTD4. **Project host system trees under `/host`.** Bind existing `/usr`, `/bin`, `/sbin`, `/lib`, `/lib64`, and `/opt` to matching `/host/*` paths read-only, leaving image paths intact until Bubblewrap/PRoot constructs a nested execution root.
-- KTD5. **Keep site extras explicit and bounded.** Project existing Slurm configuration and Munge runtime directories to fixed `/host/etc/slurm` and `/host/run/munge` paths; other shared application mounts continue through existing mount detection and are referenced at their visible paths by user config.
+- KTD4. **Consume the generic writable host mirror.** Depend on the completed automatic host-root projection prerequisite for `/host` across every backend, leaving image paths intact until Bubblewrap or PRoot constructs a nested execution root.
+- KTD5. **Reference site state through the mirror.** Host-bridge profiles may reference Slurm configuration, Munge runtime state, and other host paths beneath `/host`; launchers do not construct site-specific system binds.
 - KTD6. **Use one dedicated user-owned config directory.** Launchers set `HOST_BRIDGE_CONFIG=${XDG_CONFIG_HOME:-$HOME/.config}/mkchad/host-bridge/config.toml`; when the existing dedicated parent directory is not already visible, bind only that directory read-only at the same absolute path. The core config names only image-visible paths such as `/host/usr` and current workspace mounts.
-- KTD7. **Make binary, config-path, and bind changes canonical instance and managed-server changes.** The launcher computes a lowercase SHA-256 host-bridge key over a NUL-framed `host-bridge-profile-v1` record containing labeled fields for resolved immutable binary path and checksum, normalized absolute `HOST_BRIDGE_CONFIG`, and each ordered normalized functional source/destination/access bind tuple. It passes that digest through the new `ct_instance_exec.sh --ct-profile-key` contract.
-- KTD8. **Export the canonical persistent profile from `container_tools`.** Extend only persistent instance execution with optional `--ct-profile-key 64-hex`. Include a supplied key in the existing canonical profile hash alongside image, bootstrap, mount argv, resolved bind paths, and bind `stat` identities; preserve the old hash when absent. Inject the resulting full 64-hex digest as reserved `MKCHAD_CONTAINER_PROFILE_ID` during both instance start and exec, rejecting caller override. The in-image lifecycle records that canonical digest, so source replacement or remount at the same path cannot reuse stale managed state.
+- KTD7. **Make binary, config-path, and explicit bridge-bind changes canonical instance and managed-server changes.** The launcher computes a lowercase SHA-256 host-bridge key over a NUL-framed `host-bridge-profile-v1` record containing labeled fields for resolved immutable binary path and checksum, normalized absolute `HOST_BRIDGE_CONFIG`, and each ordered normalized bridge-specific source/destination/access bind tuple. It passes that digest through the new `ct_instance_exec.sh --ct-profile-key` contract.
+- KTD8. **Export the complete canonical persistent profile from `container_tools`.** Extend only persistent instance execution with optional `--ct-profile-key 64-hex`. Finalize the digest after existing automatic/base mounts, explicit user/bridge binds, bootstrap, implicit cwd, and generated mirror binds are assembled and conflicts resolved. Include a supplied key alongside existing identity inputs, effective UID/primary-GID/sorted-supplementary-GID/group-mode realization, and the prerequisite's complete semantic strategy plus lexical-source/resolved-target/destination/access/recursion tuples. Preserve stat identity behavior for existing base/explicit binds, but do not add volatile stat or mount metadata for generated `/host` binds. Inject the resulting full 64-hex digest as reserved `MKCHAD_CONTAINER_PROFILE_ID` during instance start and exec, rejecting caller override.
 - KTD9. **Expand release schema coherently.** Add one universally recorded deployed component, one architecture-specific artifact family, `staged_host_bridge`, exact action ordering, caller archive ingress, and result schema 2 across every closed validator and fallback producer.
 - KTD10. **Preserve PPC64LE.** The ninth component metadata and inert checkout remain universal so the manifest shape stays closed; bridge artifact admission, installation actions, launcher binds, and observations apply only to x86_64/AArch64. PPC64LE supplies no bridge archive and retains existing runtime behavior.
+- KTD11. **Compose one host evidence bundle.** U3-U5 define integration cases, while U7 creates one parent runner that first validates a matching accepted `container-tools.host-projection-runtime/v1` report and then exercises the cumulative release flow. Its fake-runtime/schema tests run locally; only the operator executes real Docker/SIF cases.
 
 ### Managed Lifecycle Identity Contract
 
 - The host-bridge profile key always exists, including when the bridge selector is absent. Its labeled binary fields contain either `present`, resolved immutable path, and SHA-256, or `absent` and empty path/checksum; the remaining fields always contain the effective absolute config path and normalized explicit bridge binds.
-- `ct_instance_exec.sh` emits `MKCHAD_CONTAINER_PROFILE_ID` as exactly 64 lowercase hex characters after hashing the host-bridge key together with its complete existing instance inputs and resolved bind identities. The in-image lifecycle never recomputes host paths or accepts caller override through `--ct-env`.
+- `ct_instance_exec.sh` emits `MKCHAD_CONTAINER_PROFILE_ID` as exactly 64 lowercase hex characters only after hashing the host-bridge key, all finalized effective bind inputs, the effective identity realization, and the complete semantic generated-mirror profile. The in-image lifecycle never recomputes host paths or accepts caller override through `--ct-env`.
 - OpenCode lifecycle state schema 5 is schema 4 plus required `container_profile_id`; every other schema-4 field and validation rule remains unchanged. New starts write schema 5. Status and explicit stop continue to report/operate on valid legacy state under existing identity controls, but start never adopts or rewrites a schema 1-4, malformed, or future state as matching schema 5. An absent state permits ordinary first-start creation.
 - Under the lifecycle fence, start compares the supplied digest before health-based reuse or process spawn. Existing-state mismatch returns typed `container_profile_mismatch` with stop/start guidance and performs no signal, unlink, state replacement, transport change, or backend contact.
 
@@ -208,16 +215,9 @@ flowchart TB
 | Host source when present | Image-visible destination | Access | Purpose |
 |---|---|---|---|
 | Resolved `${XDG_DATA_HOME:-$HOME/.local/share}/mkchad/tools/host-bridge/SHA256/host-bridge` selected by `$HOME/.local/bin/host-bridge` | `/opt/msk/host-bridge/bin/host-bridge` | read-only | Immutable explicit launcher binary |
-| `/usr` | `/host/usr` | read-only | Host executables, loaders, libraries, data |
-| `/bin` | `/host/bin` | read-only | Legacy/merged-usr command path |
-| `/sbin` | `/host/sbin` | read-only | Legacy administrative command path |
-| `/lib` | `/host/lib` | read-only | Host loader/library path |
-| `/lib64` | `/host/lib64` | read-only | 64-bit host loader/library path |
-| `/opt` | `/host/opt` | read-only | Site software installed under `/opt` |
-| `/etc/slurm` | `/host/etc/slurm` | read-only | Optional Slurm configuration |
-| `/run/munge` or `/var/run/munge` | `/host/run/munge` | read-only bind | Optional authentication socket visibility |
+| Automatic host `/` strategy or generated top-level fallback | `/host` and matching `/host/*` destinations | host permissions | Generic host binaries, libraries, configuration, writable state, and non-kernel submounts |
 
-An existing external `${XDG_CONFIG_HOME}/mkchad/host-bridge/` is additionally bound read-only at the same path; no sibling XDG configuration is exposed. The default `$HOME/.config` needs no extra bind. Absent optional sources are omitted with bounded diagnostics; required executable and common-root failures block bridge enablement but not ordinary MkChad launch.
+An existing external `${XDG_CONFIG_HOME}/mkchad/host-bridge/` is additionally bound read-only at the same path; no sibling XDG configuration is exposed. The default `$HOME/.config` needs no extra bind. The automatic mirror warns and preserves ordinary MkChad launch when unavailable; explicit host-bridge capability diagnosis reports whether the required paths are usable.
 
 ### User Configuration Example
 
@@ -259,7 +259,7 @@ required = false
 
 The repository ships examples only; it never writes this live file.
 
-The example uses `inherit` because MkChad's outer Apptainer/Singularity binds already enforce read-only access to the projected system and Slurm sources. This keeps PRoot eligible without weakening writes: integration tests must prove a write through PRoot is still refused at the outer bind. Standalone profiles that rely on host-bridge itself to enforce read-only access continue to use `read-only` and exclude PRoot.
+The example uses `inherit` because the automatic outer mirror preserves the invoking user's host permissions and writable access. Profiles that require host-bridge itself to enforce read-only access continue to use `read-only` and exclude PRoot when it cannot enforce that restriction.
 
 ### Release And Deployment Model
 
@@ -302,6 +302,29 @@ The example uses `inherit` because MkChad's outer Apptainer/Singularity binds al
 - Use exact architecture and checksum evidence before installing a binary.
 - Cross-repository implementation is serial: immutable host-bridge release, `container_tools`, `msk_containers`, `mkchad`, then parent deploy/release/submodule integration.
 - Use `/tmp/mkchad-v1/host-bridge-integration` for disposable fixtures and release staging.
+- Host-run evidence uses `/tmp/mkchad-v1/host-bridge-host`, isolated HOME/XDG roots, fake Cargo/Slurm/socket/repair fixtures, local images/archives only, and no live MkChad configuration, registry pulls, real scheduler calls, or arbitrary projected-path writes.
+
+### Host-Run Evidence Contract
+
+From the parent workspace, the operator runs one backend/architecture at a time:
+
+```bash
+MKCHAD_HOST_BRIDGE_RUNTIME_TEST=1 \
+  bash tests/host_bridge_release_runtime_test.sh \
+    --backend apptainer \
+    --image "$MKCHAD_HOST_TEST_SIF" \
+    --host-bridge-archive "$MKCHAD_HOST_TEST_BRIDGE_ARCHIVE" \
+    --projection-report /tmp/mkchad-v1/host-root-projection-host/apptainer-RUN_ID/report.json \
+    --work /tmp/mkchad-v1/host-bridge-host/apptainer-RUN_ID
+```
+
+Docker accepts an already-local image selector and resolves it once to the immutable image ID used by every launch. SingularityCE/Apptainer require an absolute regular SIF that is copied, using reflink when available, into the work directory and executed only from that staged copy. The bridge archive and projection report are likewise copied into private staging before validation. Before creating fixtures, the runner requires the prerequisite report to have the exact schema, overall `passed` outcome, no skipped applicable case, successful exact cleanup, matching backend/architecture/image digest, and matching reviewed `container_tools` source digest. Malformed, failed, unavailable, incomplete, or mismatched prerequisite evidence exits 77 with no integration claim.
+
+`--work` must be a new directory beneath `/tmp/mkchad-v1/host-bridge-host`. Existing, relative, or out-of-root paths are invalid exit 2 before mutation and emit no report. Environmental failure to create an otherwise valid work directory emits one stdout-only unavailable JSON object with exit 77 and no file. After creation, every syntactically valid non-help run writes `$work/report.json` and emits the same single JSON object on stdout. Exit 0 means all applicable cases passed, 1 means failure, and 77 means disabled or unavailable/no claim; `--help` emits usage and exit 0 without a report.
+
+Schema `mkchad.host-bridge-release-runtime/v1` records exact parent/child source commits and a closed NUL-framed manifest digest, immutable image ID/content digest, staged archive digest, runtime/version/architecture, accepted staged projection-report digest, stable cases, bounded timings, and exact cleanup. All launches use the admitted immutable image and staged archive bytes. Source manifests and staged inputs are hashed before dispatch and at completion; any change fails the run. Cases cover bridge/config binds, Bubblewrap, PRoot/denial, Cargo-like execution, fake Slurm query/submission, mounted-root repair, and canonical profile/managed-server mismatch. The report excludes config contents, environment dumps, host inventories, scheduler credentials, raw argv, and payload output. Returned reports are accepted only when every digest matches the reviewed integration tree and every applicable case plus cleanup passes.
+
+Host-dependent coverage is cumulative rather than one harness per unit: U3 defines launcher/mirror/profile cases, U4 supplies packaged image/backend checks, U5 supplies managed-lifecycle mismatch cases, and U7 assembles and fake-tests the one operator runner. U1, U2, U3, U5, and U6 still require their deterministic suites locally; missing container tools excuse only the explicitly host-dependent execution, not fixture, schema, static-analysis, or report-validation tests.
 
 ### Sequencing
 
@@ -309,13 +332,16 @@ The example uses `inherit` because MkChad's outer Apptainer/Singularity binds al
 flowchart TB
   P2[Standalone child release] --> U1[U1 Verify deployment contract]
   P1[Verified prerequisite child commit] --> U2[U2 Canonical instance profile export]
+  P0[Automatic host-root projection] --> U2
   U1 --> U2
-  U2 --> U3[U3 MkChad projection launchers]
+  U2 --> U3[U3 MkChad mirror consumption]
   U3 --> U4[U4 Image and installer integration]
   U4 --> U5[U5 Managed lifecycle profile identity]
   U5 --> U6[U6 Parent release schema and deployer]
-  U6 --> U7[U7 End-to-end verification]
-  U7 --> U8[U8 Child publication and parent registration]
+  U6 --> IMAGE[Build final immutable candidate images]
+  IMAGE --> U7[U7 End-to-end verification]
+  U7 --> HOST[Operator native reports]
+  HOST --> U8[U8 Child publication and parent registration]
 ```
 
 ### Requirement Traceability
@@ -328,22 +354,24 @@ flowchart TB
 | U4 | R4-R17, R23-R25, R29 | F1-F5, F7 | AE1-AE8, AE11 |
 | U5 | R12-R13, R24, R28 | F4 | AE6-AE7, AE12 |
 | U6 | R1-R5, R21-R24, R26-R27 | F6 | AE6, AE8-AE9, AE12 |
-| U7 | R1-R29 | F1-F7 | AE1-AE12 |
-| U8 | R1-R5, R21-R24, R26-R28 | F6 | AE6, AE8-AE9, AE12 |
+| U7 | R1-R30 | F1-F8 | AE1-AE13 |
+| U8 | R1-R5, R21-R24, R26-R28, R30 | F6, F8 | AE6, AE8-AE9, AE12-AE13 |
 
 ### Risks And Mitigations
 
 | Risk | Impact | Mitigation | Required proof |
 |---|---|---|---|
 | Host paths overlay image system paths globally | Image corruption or nondeterminism | Bind only beneath `/host/*`; nested backend applies mappings | Launcher argv and ordinary command tests |
+| Automatic host mirror is partial or unavailable | Host tools observe incomplete roots | Preserve ordinary launch, expose bounded diagnostics, and let host-bridge capability checks refuse unsupported profiles | Direct, fallback, partial, and unavailable projection tests |
 | Bind added after instance startup | Tool sees stale or absent paths | Fix all binds in profile before `instance start` | Persistent reuse/profile-change tests |
 | Selector update races launcher resolution | New profile identity names old or mutable bytes | Resolve and verify immutable payload once; retain old payloads | Paused-launch selector update and next-launch tests |
-| Munge/Slurm layout differs by site | Slurm commands fail | Optional fixed common binds plus documented visible-path config | Fake layouts and opt-in site evidence |
+| Munge/Slurm layout differs by site | Slurm commands fail | Document visible mirror paths and keep profile selection user-owned | Fake layouts and opt-in site evidence |
 | Rewrite silently handles failed full-root setup | Incorrect Slurm/Cargo behavior | No global degradation consent | Both-backends-denied integration test |
 | Release schema updated incompletely | Deployment admission or recovery breaks | Treat schema/deployer/release/tests as one unit | Invalid-manifest matrix and recovery tests |
 | New component breaks PPC64LE | Existing users lose deployments | Architecture-conditional artifact requirement | PPC release fixture remains green |
 | Default tests submit real jobs | Unintended scheduler effects | Fake clients by default; explicit opt-in live smoke | Network/credential-free suite audit |
-| Active managed server outlives path, inode, image, or bridge change | Commands route through stale mounts or binary | Persist and compare canonical `container_tools` profile digest; require explicit stop/start | Same-path source replacement and active-server mismatch tests without signaling |
+| Active managed server outlives a semantic bind, effective-group, image, or bridge change | Commands route through stale mounts, access, or binary | Persist and compare the canonical profile digest; include effective identity realization, keep generated mirror identity semantic, and require explicit stop/start for accepted same-path remount staleness | Semantic generated-bind, group-change, explicit-source replacement, and active-server mismatch tests without signaling |
+| Native result is unavailable or from mismatched source/image/archive | False integration or architecture claim | One exact-source host runner consumes the prerequisite report and emits closed digests; exit 77 remains unclaimed | Operator-returned report validated against reviewed commits and artifacts |
 
 ---
 
@@ -363,26 +391,26 @@ flowchart TB
 - **Goal:** Give managed in-container processes the same full profile identity that `container_tools` uses to select a persistent instance.
 - **Files:** `msk_containers/container_tools/ct_instance_exec.sh`; `msk_containers/container_tools/tests/instance_exec_test.sh`; `msk_containers/container_tools/README.md`.
 - **Approach:** Add optional exactly-once `--ct-profile-key 64-hex` handling to persistent instance execution only. When present, append a NUL-framed label/value to the existing profile-hash input; when absent, preserve the exact prior hash. After computing the canonical digest, reject any caller `--ct-env MKCHAD_CONTAINER_PROFILE_ID=...` override and inject the digest into both `instance start` and every `exec`. Keep full 64-hex environment identity while retaining the existing 32-hex instance-name prefix. Commit and verify `container_tools` independently before its parent gitlink changes.
-- **Test scenarios:** Existing caller/hash compatibility without a key; malformed/duplicate key; key changes profile; full environment value matches profile; start and reuse exec receive the same value; caller override rejected; image/bootstrap/bind/path/inode/type changes alter the value; bind source replacement at the same path; concurrent first use; no argument leaks to payload; existing timeout/non-signaling behavior.
+- **Test scenarios:** Existing caller/hash compatibility without a key; malformed/duplicate key; key changes profile; full environment value matches profile; start and reuse exec receive the same value; caller override rejected; digest is absent until all binds are finalized; adding/changing an explicit user bind changes identity; auto/required/refresh may reuse when effective binds and identity realization match; effective UID/primary GID/supplementary GIDs/group mode changes alter it; image/bootstrap/base-or-explicit bind path/inode/type changes alter it; generated strategy/lexical-source/resolved-target/destination/access/recursion changes alter it; generated inode/device/mount-ID/time/remount metadata does not; concurrent first use; no argument leaks to payload; existing timeout/non-signaling behavior.
 - **Verification:** Run `tests/instance_exec_test.sh` and the child shell/static-analysis gates from `msk_containers/container_tools`.
-- **Dependencies:** U1 and the verified prerequisite child state.
+- **Dependencies:** U1, the verified container-prerequisite child state, and the completed automatic host-root projection prerequisite.
 
-### U3. Add Fixed Host Projections To MkChad Launchers
+### U3. Consume The Host Mirror In MkChad Launchers
 
-- **Goal:** Make the bridge binary and common host roots visible before persistent instance creation without changing ordinary image resolution.
+- **Goal:** Make the bridge binary and effective generic host mirror visible before persistent instance creation without changing ordinary image resolution.
 - **Files:** `msk_containers/container_tools` gitlink; `msk_containers/nvim/bin/host_bridge_library.sh`; `msk_containers/nvim/bin/mkchad`; `msk_containers/nvim/bin/nvim_shell`; `msk_containers/nvim/bin/mkchad-opencode-server`; `msk_containers/nvim/bin/mkchad-container-bootstrap`; `msk_containers/tests/host_bridge_wrapper_test.sh`; `msk_containers/tests/opencode_server_wrapper_test.sh`.
-- **Approach:** Record the verified U2 nested gitlink. Centralize array-based optional/required bind construction, immutable selector resolution, and host-bridge key calculation in one sourced host library. Add the resolved static binary and existing system/Slurm paths as explicit read-only outer binds, bind only an existing dedicated external host-bridge config directory at the same path, set the fixed config environment, and expose only the bridge binary directory inside PATH. Persistent editor and managed OpenCode invocations pass the key through `--ct-profile-key`; nonpersistent `nvim_shell` shares projections and config but does not pass an instance-only option or claim lifecycle identity. Status-only operations remain free of unnecessary bridge binds.
-- **Test scenarios:** Config absent; default and dedicated external XDG roots; no external XDG sibling exposure; relative XDG root rejection; nonexistent dedicated root omitted with explicit missing-config behavior; bridge absent key; every optional path absent/present; paths with spaces; read-only bind argv; PRoot write refusal through inherited outer read-only access; image `/usr` unchanged; exact bridge PATH precedence; no host PATH/LD import; deterministic NUL-framed key; persistent first start/reuse; selector update during paused launch still binds the resolved immutable payload; binary, bind-set, bind-source identity, and in-home/external effective config-path changes select separate instances; nonpersistent shell omits the profile option; stale instance remains separate; ordinary MkChad/OpenCode behavior; no late bind attempt.
+- **Approach:** Record the verified U2 nested gitlink. Centralize immutable selector resolution, bridge-specific bind construction, and host-bridge key calculation in one sourced host library while consuming the generic mirror selected by `container_tools`. Add only the resolved static binary as an explicit read-only outer bind, bind an existing dedicated external host-bridge config directory at the same path when needed, set the fixed config environment, and expose only the bridge binary directory inside PATH. Persistent editor and managed OpenCode invocations pass the key through `--ct-profile-key`; nonpersistent `nvim_shell` shares the mirror and config but does not pass an instance-only option or claim lifecycle identity. Status-only operations remain free of unnecessary bridge binds.
+- **Test scenarios:** Config absent; default and dedicated external XDG roots; no external XDG sibling exposure; relative XDG root rejection; nonexistent dedicated root omitted with explicit missing-config behavior; bridge absent key; direct, fallback, partial, and unavailable host mirrors; paths with spaces; host-permission writes beneath fixture `/var` and `/run`; image `/usr` unchanged; exact bridge PATH precedence; no host PATH/LD import; deterministic NUL-framed key; persistent first start/reuse; selector update during paused launch still binds the resolved immutable payload; binary, projection strategy, complete semantic generated bind set, effective group realization, explicit bridge-bind identity, and in-home/external effective config-path changes select separate instances; generated network-remount metadata does not; nonpersistent shell omits the profile option; stale instance remains separate; ordinary MkChad/OpenCode behavior; no late bind attempt.
 - **Verification:** Run focused launcher/wrapper tests and shellcheck changed scripts.
 - **Dependencies:** U2 and the verified prerequisite `msk_containers` commit.
 
 ### U4. Package The Integration In Both Maintained Images And Installers
 
 - **Goal:** Provide fixed image destinations, examples, and installed launcher files with x86_64/AArch64 parity.
-- **Files:** `msk_containers/nvim/x86/nvim_container_x86.dockerfile`; `msk_containers/nvim/aarch64/nvim_container_aarch64.dockerfile`; `msk_containers/bin/install_nvim.sh`; `msk_containers/docs/adr/002-package-selections.md`; `msk_containers/tests/nvim_container_tooling_test.sh`; `msk_containers/tests/install_nvim_test.sh`; `msk_containers/tests/host_bridge_integration_test.sh`; `msk_containers/docs/host-bridge.md`.
-- **Approach:** Create `/opt/msk/host-bridge/bin`, install the launcher helper with existing host tools, document user-owned config and use cases, and retain architecture parity. Do not embed the host-bridge release binary in the SIF; the outer release deploys and binds the exact host binary. After focused and native image verification, commit the `msk_containers` child independently before parent deployment work begins.
+- **Files:** `msk_containers/nvim/x86/nvim_container_x86.dockerfile`; `msk_containers/nvim/aarch64/nvim_container_aarch64.dockerfile`; `msk_containers/bin/install_nvim.sh`; `msk_containers/docs/adr/002-package-selections.md`; `msk_containers/tests/nvim_container_tooling_test.sh`; `msk_containers/tests/install_nvim_test.sh`; `msk_containers/tests/host_bridge_integration_test.sh`; `msk_containers/tests/host_bridge_backend_runtime_test.sh`; `msk_containers/docs/host-bridge.md`.
+- **Approach:** Create `/opt/msk/host-bridge/bin`, install the launcher helper with existing host tools, document user-owned config and use cases, and retain architecture parity. Do not embed the host-bridge release binary in the SIF; the outer release deploys and binds the exact host binary. Keep `host_bridge_backend_runtime_test.sh` as the bounded in-image capability probe consumed by U7's parent host runner. Commit the deterministically verified `msk_containers` source independently before parent deployment work begins, but make no native image claim until U7/HOST tests the final immutable candidate bytes.
 - **Test scenarios:** Missing destination; installer first install/no-op/recovery; source changes; x86/ARM parity; PPC exclusion; documentation/config examples parse; binary remains externally supplied; image backend tools present from the prerequisite commit.
-- **Verification:** Run tooling and installer tests, build both images serially, and smoke the fixed binary bind in native Docker and SIF environments.
+- **Verification:** Run tooling, installer, parity, and backend-harness schema tests locally. Supply serial native image build/smoke commands to the operator when unavailable here; validate returned image/backend reports before claiming that architecture.
 - **Dependencies:** U3.
 
 ### U5. Bind Managed OpenCode State To The Canonical Profile
@@ -406,20 +434,20 @@ flowchart TB
 ### U7. Prove End-To-End Host Tool Flows
 
 - **Goal:** Validate the complete release, outer projection, nested backend, and explicit Cargo, Slurm, and mounted-root command experience.
-- **Files:** `tests/test_host_bridge_release_integration.py`; `docs/deployment/README.md`; no new `msk_containers` files after its U4 commit.
-- **Approach:** Build isolated host-root fixtures with fake Cargo and Slurm process trees, mounted-root repair tree, config, Unix socket, and submission records. Run through deployed host bridge and SIF under Bubblewrap and PRoot. Real HPC is optional post-release site certification, separately authorized and bounded, not a substitute for or blocker to deterministic release gates.
-- **Test scenarios:** AE1-AE12; exact host binary checksum/source commit; ordinary image command isolation; Cargo child process and output path; Slurm query/submission argv and cwd; already-visible mounted-root read/write; backend denial matrix; explicit rewrite only; binary/config/bind update; managed-server identity mismatch; selective process interruption; no credentials or live paths; native x86/ARM; legacy PPC release.
-- **Verification:** Run isolated integration on native x86_64 and AArch64. If explicitly authorized on a real HPC site, separately certify `sinfo`, `squeue`, `scontrol show config`, and one user-approved safe `sbatch` fixture; report absence without blocking release.
+- **Files:** `tests/test_host_bridge_release_integration.py`; new `tests/host_bridge_release_runtime_test.sh`; `docs/deployment/README.md`; no new `msk_containers` files after its U4 commit.
+- **Approach:** Build the final immutable candidate images from the already-pinned U4-U6 source state, recording their content digests before any native claim. Build isolated host-root fixtures with fake Cargo and Slurm process trees, mounted-root repair tree, config, Unix socket, and submission records. Add one opt-in parent host runner that validates an accepted projection report and delegates through the deployed host bridge and the exact candidate image under Bubblewrap and PRoot. Deterministic tests fake every runtime/archive/report boundary and validate schema, redaction, source binding, immutable input use, pre/post digest stability, exit 0/1/2/77, and exact cleanup. Real HPC remains separate optional post-release certification, never an input to the default host runner.
+- **Test scenarios:** AE1-AE13; exact host binary checksum/source commit; ordinary image command isolation; Cargo child process and output path; fake Slurm query/submission argv and cwd; already-visible mounted-root read/write; backend denial matrix; explicit rewrite only; binary/config/bind update; managed-server identity mismatch; selective process interruption; no credentials or live paths; native x86/ARM; legacy PPC release; missing/mismatched projection report, image, archive, source tree, architecture, and cleanup evidence.
+- **Verification:** Run deterministic integration and host-runner schema/fake-boundary tests locally. Build each final candidate image once on an applicable builder, then supply one exact command per operator-available native x86_64/AArch64 Docker/SIF environment and accept only reports matching those candidate digests. If explicitly authorized on a real HPC site, separately certify `sinfo`, `squeue`, `scontrol show config`, and one user-approved safe `sbatch` fixture; report absence without blocking release.
 - **Dependencies:** U6.
 
 ### U8. Publish Children And Complete Parent Integration
 
 - **Goal:** Publish the remaining child histories and land one exact MkChad v1 release boundary after consuming the already-published standalone child.
 - **Files:** `host-bridge` gitlink; `msk_containers` gitlink; `mkchad` gitlink; nested `msk_containers/container_tools` gitlink; parent release/deployment/docs files from U6.
-- **Approach:** Verify the immutable published host-bridge commit/artifacts, publish the already-committed `container_tools`, `msk_containers`, and `mkchad` children serially in dependency order, build and publish final integrated images, then commit parent submodules plus release/deployment integration. Stage only intended files and preserve unrelated work; do not modify or republish host-bridge in this plan.
-- **Test scenarios:** All four child commits fetch from declared remotes; host-bridge artifact and image checksums match their recorded commits; recursive clone resolves including the nested child; deploy verify-only reports compliant state; parent diff has intended gitlinks and integration files only; no live config enters Git.
+- **Approach:** Verify the immutable published host-bridge commit/artifacts, publish the already-committed `container_tools`, `msk_containers`, and `mkchad` children serially in dependency order, publish the exact U7/HOST-tested image bytes without rebuilding, then commit parent submodules plus release/deployment integration. Any image rebuild or source change invalidates the reports and returns to U7/HOST before publication. Stage only intended files and preserve unrelated work; do not modify or republish host-bridge in this plan.
+- **Test scenarios:** All four child commits fetch from declared remotes; host-bridge artifact and published image checksums exactly match the accepted host reports and recorded commits; rebuild detection invalidates evidence; recursive clone resolves including the nested child; deploy verify-only reports compliant state; parent diff has intended gitlinks and integration files only; no live config enters Git.
 - **Verification:** Repeat child broad gates at pinned commits, parent deployment suite, `git submodule status --recursive`, `git diff --check`, and final staged-diff inspection.
-- **Dependencies:** U7 and explicit authorization for `container_tools`, `msk_containers`, `mkchad`, image, and parent publication plus final release actions.
+- **Dependencies:** U7, accepted native reports for every backend/architecture claimed by the release, and explicit authorization for `container_tools`, `msk_containers`, `mkchad`, image, and parent publication plus final release actions.
 
 ---
 
@@ -428,23 +456,25 @@ flowchart TB
 ### Focused Repository Gates
 
 - `host-bridge`: read-only installer and release-contract conformance against both exact published native archives.
-- `container_tools`: persistent-instance profile-key, resolved bind-identity, environment-injection, compatibility, concurrency, and timeout tests; shellcheck changed scripts.
-- `msk_containers`: host-bridge wrapper, OpenCode wrapper, installer, and container tooling tests; shellcheck changed scripts.
+- `container_tools`: automatic host-root strategy, backend translation, supplementary-group argv, persistent-instance profile-key, resolved bind-identity, compatibility, concurrency, and timeout tests; shellcheck changed scripts.
+- `msk_containers`: host-bridge wrapper, OpenCode wrapper, installer, container tooling, and backend-runtime-harness schema tests; shellcheck changed scripts.
 - `mkchad`: lifecycle, state-schema, and startup-race tests for schema-5 profile identity and fail-closed mismatch.
-- Parent: schema, deployer, developer-tree, release-launcher, and host-bridge integration tests.
+- Parent: schema, deployer, developer-tree, release-launcher, host-bridge integration, and host-runner fake-boundary/report-validation tests.
 
-### Real Runtime Gates
+### Operator Host Runtime Gates
 
-- Native x86_64 Docker and SIF: bridge binary bind, Bubblewrap fixture, PRoot fixture, Cargo-like flow, Slurm-like flow, and mounted-root fixture.
+- Native x86_64 Docker and SIF: automatic writable host mirror, bridge binary bind, Bubblewrap fixture, PRoot fixture, Cargo-like flow, Slurm-like flow, and mounted-root fixture.
 - Native AArch64 Docker and SIF: the same suite; source parity alone is insufficient.
 - Backend-denied runners: prove bounded unavailable diagnostics and no silent rewrite.
 - Optional post-release HPC certification: run only user-approved read commands and one safe submission fixture, with no credential or private configuration capture; this is not a release completion gate.
+
+Each claimed Docker/SIF and architecture combination requires both an accepted matching projection report and `mkchad.host-bridge-release-runtime/v1` report from the documented one-command runner. The development environment records these gates as unavailable rather than invoking missing tools. The operator executes suites serially and returns the exact JSON plus exit status; exit 77, a missing report, a digest mismatch, or a skipped applicable case makes no claim for that combination.
 
 ### Deployment Gates
 
 - Validate release manifest schema 2 with exactly nine recognized components and terminal result schema 2 with both closed artifact keys after expansion.
 - Validate architecture-conditioned host-bridge artifact requirements while preserving PPC64LE image behavior.
-- Verify child commits, native artifact checksum, installed binary identity, image checksum, and configuration guidance.
+- Verify child commits, native artifact checksum, installed binary identity, published image checksum, accepted host-report image digest, and configuration guidance all agree.
 - Exercise first install, compliant no-op, verify-only active service, partial state, failure recovery, and interruption.
 - Confirm release/deployment output excludes config contents, host environment, host path inventory, scheduler credentials, and private session data.
 
@@ -453,7 +483,8 @@ flowchart TB
 - Run one resource-intensive image or integration suite at a time.
 - Repeat broad child verification only after all focused cross-repository changes settle.
 - Do not mutate protected live MkChad paths during automated verification.
-- Report real HPC and architecture gates not run, with the missing environment rather than substitute evidence.
+- Validate operator reports against the reviewed commits, image/archive digests, prerequisite report, and cleanup before closeout.
+- Report real HPC, backend, and architecture gates not run, with the missing environment rather than substitute evidence.
 
 ---
 
@@ -461,12 +492,14 @@ flowchart TB
 
 - MkChad v1 records and deploys one exact published host-bridge child and native x86_64/AArch64 artifacts.
 - The selector resolves to a checksum-addressed immutable static binary available inside maintained SIFs only through its fixed bridge path; ordinary host binaries never enter image PATH automatically.
-- Common host system and optional Slurm paths are visible beneath `/host/*` before persistent instance creation and never replace image roots globally.
+- The selected automatic host mirror is visible beneath `/host` before persistent instance creation, preserves caller authority, and never replaces image roots globally.
 - User-owned runtime-neutral configuration remains outside deployment and is documented with Cargo, Slurm, doctor, and failure examples.
-- Bubblewrap and PRoot full-root flows pass native x86_64 and AArch64 integration tests; denied policies produce bounded no-dispatch outcomes.
+- Bubblewrap and PRoot full-root flows have accepted exact-source native x86_64 and AArch64 host reports; denied policies produce bounded no-dispatch outcomes.
 - Rewrite degradation is never globally enabled or silently selected.
 - Cargo-installed host tools, fake/default Slurm submit/inspect, and already-visible mounted-root repair flows pass deterministically; optional real HPC site certification is reported separately when authorized.
-- Host-bridge binary, effective config-path, bind-set, or resolved bind-source identity changes select compatible persistent-instance profiles, and managed OpenCode starts fail closed on canonical identity mismatch rather than reusing or signaling a stale server.
+- Host-bridge binary, effective config path, explicit bind identity, effective group realization, or complete semantic generated mirror changes select compatible persistent-instance profiles; incidental generated mount metadata does not. Managed OpenCode starts fail closed on canonical identity mismatch rather than reusing or signaling a stale server.
 - Release schema, deployer, release launcher, result schema 2, developer deployment, documentation, and tests agree on the ninth component and new artifact family.
+- The cumulative host runner, prerequisite-report validation, fake-boundary tests, redacted result schema, and one-command operator instructions ship with the integration; unavailable exit 77 never becomes a support claim.
+- Published native images are the exact U7/HOST-tested bytes; any rebuild invalidates prior runtime evidence.
 - Legacy PPC64LE MkChad release behavior remains valid without host-bridge.
 - Child repositories are committed and published before one separate parent integration commit, with unrelated work and live configuration preserved.
