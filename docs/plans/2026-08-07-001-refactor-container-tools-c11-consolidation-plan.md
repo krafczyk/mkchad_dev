@@ -23,7 +23,7 @@ execution: code
 
 ### Summary
 
-`container_tools` becomes one regular C11 software package with a new `container-tools` executable, private runtime libraries, and configurable installation prefix. The host installation launches containers and publishes the semantic bind manifest; an independently selected image installation consumes that manifest and provides host-root command execution. Existing public `ct_*.sh` commands remain as C11-backed compatibility entry points until their consumers migrate.
+`container_tools` becomes one regular C11 software package with a new `container-tools` executable, private runtime libraries, and configurable installation prefix. The host installation launches the original container and publishes the semantic bind manifest; an independently selected in-container installation uses that manifest to run a command inside a nested recreation of the selected program root without launching another image. Existing public `ct_*.sh` commands remain as C11-backed compatibility entry points until their consumers migrate.
 
 ### Problem Frame
 
@@ -34,7 +34,7 @@ The semantic manifest reveals the natural product boundary: one product should o
 ### Key Decisions
 
 - **One C11 product owns outer launch and host execution.** (session-settled: user-directed - chosen over a separate host-bridge repository and release: manifest production and consumption belong to one versioned product.)
-- **Install as a regular prefix-based package.** (session-settled: user-directed - chosen over a product-managed version store: operators select host and image versions through `PATH`, `LD_LIBRARY_PATH`, or direct executable/script paths.)
+- **Install as a regular prefix-based package.** (session-settled: user-directed - chosen over a product-managed version store: operators select host and in-container versions through `PATH`, `LD_LIBRARY_PATH`, or direct executable/script paths.)
 - **Expose one executable with a new interface.** (session-settled: user-approved - chosen over multiple executables or public library frontends: one CLI keeps versioning, installation, and behavior coherent.)
 - **Keep package libraries private initially.** (session-settled: user-approved - chosen over a supported public C ABI: no current C consumer justifies permanent ABI carrying cost.)
 - **Move all product behavior into C11.** (session-settled: user-approved - chosen over porting launch paths only or requiring a later core migration: sourced build, cache, state, mount, and lifecycle behavior need one authority.)
@@ -43,7 +43,7 @@ The semantic manifest reveals the natural product boundary: one product should o
 - **Migrate consumers explicitly and individually.** (session-settled: user-approved - chosen over a global switch or automatic fallback: each consumer adopts the new interface under its own tests.)
 - **Treat existing behavior as the parity baseline.** (session-settled: user-approved - chosen over redesigning behavior during the language migration: intentional behavior changes remain separate product decisions.)
 - **Share canonical state during migration.** (session-settled: user-approved - chosen over preview or split state: compatibility scripts and direct C11 consumers must safely reuse the same caches, manifests, locks, profiles, and persistent instances.)
-- **Freeze the bind-manifest grammar for each product major.** (session-settled: user-approved - chosen over exact-version matching or runtime schema negotiation: independently selected host and image releases within one major must interoperate.)
+- **Freeze the bind-manifest grammar for each product major.** (session-settled: user-approved - chosen over exact-version matching or runtime schema negotiation: independently selected host and in-container releases within one major must interoperate.)
 - **Expose generic profile identity.** (session-settled: user-approved - chosen over a MkChad-specific core environment contract: lifecycle consumers may use the product identity without owning its hash semantics.)
 
 ```mermaid
@@ -53,17 +53,17 @@ flowchart TB
   BUILD[Image build callers] --> HOST
   HOST --> STATE[Shared canonical state]
   HOST --> PLAN[Major-compatible bind manifest]
-  PLAN --> IMAGE[Image container-tools host command]
-  IMAGE --> ROOT[Layered host-root execution]
+  PLAN --> CONTAINER[In-container container-tools host command]
+  CONTAINER --> ROOT[Nested selected-root execution]
 ```
 
 ### Actors
 
-- A1. **Operator:** Installs and selects independent host and image package versions.
+- A1. **Operator:** Installs and selects independent host and in-container package versions.
 - A2. **Compatibility caller:** Uses an existing `ct_*.sh` command without migrating its invocation yet.
 - A3. **Native CLI consumer:** Calls the new `container-tools` interface directly.
 - A4. **Host installation:** Selects an outer runtime, prepares mounts and state, launches the container, and publishes the bind manifest.
-- A5. **Image installation:** Consumes the bound manifest and executes explicit host-root commands through the supported nested backend.
+- A5. **In-container installation:** Consumes the bound manifest and runs explicit commands inside a nested recreation of the selected program root within the original container.
 - A6. **Lifecycle consumer:** Uses the generic persistent profile identity to reject incompatible reuse.
 
 ### Requirements
@@ -72,19 +72,19 @@ flowchart TB
 
 - R1. `container_tools` must remain an independently versioned repository and become the source of one C11 software package.
 - R2. The package must install beneath a caller-selected prefix and support selection through `PATH`, `LD_LIBRARY_PATH`, or direct paths while resolving each invocation to one coherent package version.
-- R3. The package must expose one new `container-tools` executable interface for outer launch, shell, persistent instances, mount inspection, configuration and storage helpers, diagnostics, and host-root execution.
+- R3. The package must expose one new `container-tools` executable interface for outer launch, shell, persistent instances, mount inspection, configuration and storage helpers, diagnostics, and nested selected-root execution.
 - R4. Package libraries must remain private implementation details in the first C11 product generation; installed headers and a supported public C ABI are not required.
 - R5. The C11 implementation must own all behavior currently implemented by the `container_tools` shell family and `ct_library.sh`.
 - R6. The package must absorb host-bridge behavior without creating a separate repository, release, installed artifact family, or product version.
 - R7. Existing Docker, Podman, SingularityCE, and Apptainer outer-runtime support must remain in scope.
-- R8. Existing PPC64LE container-tools behavior must remain supported, while host-root command execution retains its approved x86_64 and AArch64 scope until separately expanded.
+- R8. The C11 package must remain architecture-neutral across every architecture on which it and its external dependencies can be built and run; unavailable external backends are capability outcomes rather than product architecture exclusions.
 
-**Independent host and image installations**
+**Independent host and in-container installations**
 
-- R9. Host and image environments must be able to install different `container-tools` releases from the same product major.
-- R10. The host installation must produce and bind the exact semantic manifest for each eligible local non-dry launch it constructs; dry runs and automatic launches through explicit remote Docker/Podman endpoints preserve their current no-manifest behavior.
-- R11. The image installation must consume the exact bound manifest for explicit host-root execution without searching host state or requiring the host executable to be bound into the container; an absent selector cannot claim host-root capability.
-- R12. The image-installed executable must provide host-root execution through the approved Bubblewrap, PRoot, and explicit rewrite semantics.
+- R9. Host and in-container environments must be able to install different `container-tools` releases from the same product major.
+- R10. The host installation must produce and bind the same semantic manifest contract for every eligible local non-dry SingularityCE, Apptainer, Docker, and Podman launch; dry runs produce none, and explicit remote Docker/Podman endpoints cannot claim a local host projection or manifest.
+- R11. The in-container installation must consume the exact bound manifest to reconstruct eligible caller-visible overlays inside the nested command environment without searching host state, binding the host executable inward, or launching another image.
+- R12. Host execution must use a profile-selected program root already visible inside the original container, defaulting to `/host` while allowing another mounted Linux root, and must apply eligible manifest overlays over that selected root.
 - R13. A manifest produced by any release in one product major must be accepted by every other release in that major.
 - R14. The manifest grammar must remain closed and unchanged within a product major; a grammar change requires a new product major.
 - R15. A major mismatch or invalid manifest must fail before nested backend probing or command dispatch while ordinary container behavior remains usable.
@@ -117,8 +117,8 @@ flowchart TB
 **Release and integration**
 
 - R32. Each package release must identify its executable, private libraries, compatibility scripts, protocols, documentation, and source commit as one coherent version; cross-prefix binary, library, or script mixing must fail explicitly.
-- R33. Host deployment and image construction must select and verify their package versions and provenance independently, including an allowed same-major version difference.
-- R34. MkChad release/deployment metadata must retain one `container_tools` product component, separately record the host-installed and image-embedded package identities, and add no standalone host-bridge component or artifact family.
+- R33. Host deployment and image construction must select and verify the host and in-container package versions and provenance independently, including an allowed same-major version difference.
+- R34. MkChad release/deployment metadata must retain one `container_tools` product component, separately record the host-installed and in-container package identities, and add no standalone host-bridge component or artifact family.
 - R35. Existing container and host installers must preserve check, apply, verify, interruption, and recovery behavior while installing the prefix-based package and compatibility scripts.
 - R36. Documentation and plans must stop presenting host-bridge as a separate product and must identify the new executable as the manifest producer and consumer.
 
@@ -126,14 +126,15 @@ flowchart TB
 
 - R37. The standalone host-bridge Product Contract is inherited as normative behavior except where this plan explicitly changes product ownership, executable naming, installation, artifact, and release boundaries.
 - R38. Inherited behavior includes strict profiles and configuration discovery, visible-root and projection semantics, mount-plan validation, cwd and environment handling, Bubblewrap/PRoot/rewrite eligibility, bounded probes and cleanup, executable compatibility, doctor output, exact-once dispatch, explicit degradation consent, and Cargo/Slurm/repair outcomes.
+- R39. The selected program root and manifest-derived overlays must be independent inputs: `/host` supplies the default invoking-host root, while another already-visible root can supply repair or test semantics without losing caller workspace and other eligible manifest projections.
 
 ### Key Flows
 
 - F1. **Unmigrated wrapper launch:** A wrapper calls its existing `ct_*.sh` command, the compatibility entry point invokes the selected C11 package, and the payload observes parity behavior.
 - F2. **Migrated consumer launch:** A consumer calls the new executable interface directly and uses the same runtime, state, and profile contracts as compatibility callers.
-- F3. **Cross-install host execution:** The selected host package launches the outer container and binds its manifest; the independently selected image package validates that manifest and explicitly executes a host-root command.
+- F3. **Cross-install selected-root execution:** The selected host package launches the original container and binds its manifest; the independently selected in-container package validates that manifest and runs the command inside a nested recreation of the configured program root.
 - F4. **Mixed persistent reuse:** Compatibility and direct C11 callers contend under the same locks and reuse only a persistent instance with the exact matching canonical profile.
-- F5. **Prefix-selected installation:** An operator installs host and image packages under different prefixes and selects each through its environment or an exact path without changing protocol behavior.
+- F5. **Prefix-selected installation:** An operator installs host and in-container packages under different prefixes and selects each through its environment or an exact path without changing protocol behavior.
 - F6. **Build caller migration:** An image-build script replaces sourced `ct_library.sh` calls with executable operations while retaining architecture-specific cache and runtime storage behavior.
 - F7. **Later compatibility retirement:** A later change proves zero supported script callers and accepted parity evidence before removing compatibility entry points.
 
@@ -141,16 +142,17 @@ flowchart TB
 
 - AE1. Given existing `nvim_shell`, `mkchad`, and managed OpenCode wrappers, installing the C11 package and compatibility scripts preserves their current invocations and payload results without wrapper edits.
 - AE2. Given representative Docker, Podman, SingularityCE, and Apptainer inputs, Bash-baseline fixtures and C11-backed compatibility commands produce the same effective runtime argv, state records, statuses, and bounded failure classes; eligible non-dry local launches also produce the same manifest bytes, while dry and explicit-remote automatic launches produce none.
-- AE3. Given a host `1.x` package and a different image `1.y` package, a complete valid major-1 manifest supports host-root execution without binding the host package inward.
-- AE4. Given a host and image package from different majors, host-root execution refuses the manifest before backend probing while the ordinary outer container command remains usable.
+- AE3. Given a host `1.x` package and a different in-container `1.y` package, a complete valid major-1 manifest supports selected-root execution without binding the host package inward or launching another image.
+- AE4. Given host and in-container packages from different majors, selected-root execution refuses the manifest before backend probing while the ordinary original-container command remains usable.
 - AE5. Given packages installed under two different prefixes, changing `PATH`, `LD_LIBRARY_PATH`, or the exact invoked path selects one complete intended package without rewriting files; a binary, script, or private-library mismatch across prefixes fails explicitly.
 - AE6. Given compatibility and direct C11 callers start the same persistent profile concurrently, one instance is created or reused under the shared lock and neither caller signals or adopts unrelated state.
 - AE7. Given a profile input, mount plan, runtime selection, or effective identity changes, both compatibility and direct callers select the same new profile identity and leave the old instance untouched.
 - AE8. Given each current image-build script, replacing `ct_library.sh` sourcing with executable operations preserves configured cache/tmp paths, Buildx cache rotation, architecture separation, and failure behavior.
 - AE9. Given a retained public script, removing or breaking the C11 executable fails explicitly and never executes a legacy fallback implementation.
 - AE10. Given the C11 cutover is complete, the repository and installed package contain the five compatibility scripts but no `ct_library.sh`, and no non-test source attempts to source it.
-- AE11. Given release/deployment metadata for the consolidated product, one `container_tools` product component separately identifies and verifies the selected host and image package versions, source provenance, and same-major compatibility without a standalone host-bridge gitlink or artifact.
-- AE12. Given a supported host-root command, the image executable preserves the approved argv, cwd, environment, descriptor, signal, backend ordering, degradation-consent, and no-double-dispatch behavior.
+- AE11. Given release/deployment metadata for the consolidated product, one `container_tools` product component separately identifies and verifies the selected host and in-container package versions, source provenance, and same-major compatibility without a standalone host-bridge gitlink or artifact.
+- AE12. Given the default `/host` program root or another already-visible mounted Linux root, the in-container executable preserves the approved manifest overlays, argv, cwd, environment, descriptor, signal, backend ordering, degradation-consent, and no-double-dispatch behavior within the original container.
+- AE13. Given another supported architecture with a working C11 toolchain, the package core builds and runs while each unavailable external nested backend is reported as a capability result rather than an architecture-wide product exclusion.
 
 ### Scope Boundaries
 
@@ -169,7 +171,6 @@ flowchart TB
 - Migrating wrappers that can continue through retained compatibility scripts.
 - Removing the five compatibility scripts after all supported consumers migrate.
 - A supported public C library ABI and installed development headers.
-- Expanding host-root execution beyond x86_64 and AArch64.
 - Distribution-specific packaging beyond the configurable prefix installation contract.
 
 **Outside this product's identity**
@@ -177,7 +178,7 @@ flowchart TB
 - A separate host-bridge repository, release, installer, or version.
 - Product-managed version stores or selectors that replace ordinary prefix and environment selection.
 - Automatic fallback from the new executable interface to the legacy Bash implementation.
-- Exact host/image release matching within one product major.
+- Exact host/in-container release matching within one product major.
 - A security sandbox, privilege boundary, or container runtime replacement.
 
 ### Dependencies And Assumptions
@@ -194,9 +195,9 @@ flowchart TB
 This plan owns the consolidated `container_tools` product and replaces the current separate-product direction. The relationships below orient planning; they are not a committed implementation sequence.
 
 - **Provides the baseline:** `docs/plans/2026-08-06-001-feat-automatic-host-root-projection-plan.md` defines the implemented projection, manifest, profile, and evidence behavior that C11 must preserve.
-- **Remains a prerequisite:** `docs/plans/2026-08-04-002-feat-host-bridge-container-prerequisites-plan.md` continues to supply Bubblewrap, PRoot, and architecture toolchains, but its separate future executable wording must be reconciled.
+- **Remains a capability prerequisite:** `docs/plans/2026-08-04-002-feat-host-bridge-container-prerequisites-plan.md` continues to supply Bubblewrap, PRoot, and toolchains for maintained images, but its separate executable and product-level architecture exclusions must be reconciled.
 - **Is superseded only for product ownership:** `docs/plans/2026-08-04-003-feat-standalone-host-bridge-plan.md` remains the normative host-execution behavior contract, but host-bridge no longer becomes an independent repository, executable product, installation, artifact, or release.
-- **Must be reframed:** `docs/plans/2026-08-04-004-feat-mkchad-host-bridge-integration-plan.md` must consume the image-installed package, remove the host binary bind and standalone artifact, and retain its lifecycle and native evidence goals.
+- **Must be reframed:** `docs/plans/2026-08-04-004-feat-mkchad-host-bridge-integration-plan.md` must consume the in-container package, remove the host binary bind and standalone artifact, and retain its lifecycle and native evidence goals.
 - **Enables later work:** Consumer-by-consumer migration to the direct executable interface and final compatibility-script retirement occur after this plan.
 
 ### Sources And Research
