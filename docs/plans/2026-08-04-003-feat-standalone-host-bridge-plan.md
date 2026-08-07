@@ -13,7 +13,7 @@ execution: code
 
 ## Goal Capsule
 
-- **Objective:** Build a runtime-neutral Linux command launcher that executes ELF binaries and shebang scripts against configured filesystem roots already visible to the caller.
+- **Objective:** Build a runtime-neutral Linux command launcher that executes ELF binaries and shebang scripts against configured filesystem roots already visible to the caller, optionally layering an exact bound semantic caller-mount plan over that root.
 - **Product authority:** This plan owns the standalone `host-bridge` product and releases; MkChad image provisioning and launcher integration remain separate plans.
 - **Execution profile:** One C11 package and executable, built in the current MkChad images and released as static musl x86_64 and AArch64 artifacts.
 - **Open blockers:** None for source work. U8 publication requires explicit remote authorization plus native x86_64 and AArch64 runners on which both real backend suites pass; unavailable release gates block publication rather than being replaced by weaker evidence.
@@ -26,7 +26,7 @@ execution: code
 
 ### Summary
 
-`host-bridge` launches a command using a configured Linux root or prefix projection without depending on a particular container runtime. It prefers a real Bubblewrap mount namespace, falls back to PRoot syscall translation, and offers bounded ELF/shebang rewriting only when the caller explicitly accepts weaker semantics.
+`host-bridge` launches a command using a configured Linux root or prefix projection without depending on a particular container runtime. When a profile names a bound `ct-mount-plan-v1` selector, the configured root supplies the host runtime filesystem and eligible caller data mounts are replayed over it, preserving workspaces and other outer-launch inputs. It prefers a real Bubblewrap mount namespace, falls back to PRoot syscall translation, and offers bounded ELF/shebang rewriting only when the caller explicitly accepts weaker semantics.
 
 ### Problem Frame
 
@@ -42,6 +42,7 @@ Tools installed outside the current filesystem root may be visible but unusable 
 - **Prefer Bubblewrap, then PRoot.** (session-settled: user-directed - chosen over one full-root backend: hosts differ in namespace and ptrace policy.)
 - **Require explicit semantic degradation.** (session-settled: user-directed - chosen over silent fallback: rewrite mode does not project descendant filesystem access.)
 - **Keep security policy light.** (session-settled: user-directed - chosen over container trust classification, allowlists, ownership checks, and symlink hardening: this tool is a compatibility launcher for trusted paths and callers.)
+- **Layer caller mounts over the selected root.** (session-settled: user-approved - chosen over replacing the complete caller namespace with a pure host root: outer workspace, home, and explicit data mounts remain available to nested host commands through the exact bound semantic plan.)
 
 ### Actors
 
@@ -50,6 +51,7 @@ Tools installed outside the current filesystem root may be visible but unusable 
 - A3. **Configured root:** A Linux filesystem tree already visible at a caller-side path.
 - A4. **Full-root backend:** Bubblewrap or PRoot, providing projected descendant path semantics at different fidelity and cost.
 - A5. **Rewrite backend:** A bounded entry-point compatibility mechanism for ELF and shebang launch when explicitly permitted.
+- A6. **Semantic mount plan:** An optional exact bound `ct-mount-plan-v1` record describing caller-visible paths and their selected-root targets without exposing outer host-source paths.
 
 ### Requirements
 
@@ -70,6 +72,18 @@ Tools installed outside the current filesystem root may be visible but unusable 
 - R10. Read-only root or projection access must be enforced when requested; a backend incapable of enforcement must be excluded rather than silently weakening access.
 - R11. Host bridge must not create network, PID, IPC, UTS, or cgroup isolation unless a future explicit configuration contract adds it.
 - R12. Host bridge must not imply real root, setuid, file-capability, service-management, mount, or block-device authority.
+
+**Semantic caller-mount layering**
+
+- R33. A profile may name one absolute caller-visible `mount_plan` path; omission disables semantic-plan consumption, while a configured missing path fails before probing.
+- R34. Host bridge must parse only the closed NUL-delimited `ct-mount-plan-v1` grammar, enforce the 1 MiB/4096-entry bounds, final NUL, canonical decimal count, normalized paths, role/access/recursion enums, and lowercase SHA-256 digest over the record with the digest field omitted.
+- R35. The configured profile root is the lower runtime filesystem. Ordered `detected-automatic`, caller-data `explicit`, and `persistent-automatic-cwd` entries whose target is not `/` are replayed from `caller_path` to `target_path` over that root; `generated-host-root` establishes root-selection evidence and `bootstrap-internal` is never replayed. Producer-omitted launcher-internal binds, protection masks, and the manifest bind are not semantic entries. A replayable entry or configured projection targeting `/` is invalid because only the profile root may establish the lower root.
+- R36. Manifest-derived and configured projections form one deterministic overlay plan after the root: one stable parent-before-child target ordering applies across both sources; between unrelated targets, manifest entries precede configured projections and each source retains declaration order. Exact duplicate targets are rejected, and cwd mapping uses longest-prefix matching over the combined plan.
+- R37. A malformed, future, digest-mismatched, truncated, semantically inconsistent, or changed configured manifest fails before any backend probe or command dispatch. Host bridge reads the exact configured bound file and must never scan state directories or infer an active digest.
+- R38. Manifest consumption must use only caller-visible and selected-root target paths. It must not require or reconstruct outer host-source paths, backend argv, mountinfo, stat identities, credentials, or container-runtime APIs.
+- R39. A full-root profile with `mount_plan` configured requires `completeness = complete`, strategy `direct` or `fallback`, and at least one `generated-host-root` entry whose `caller_path` equals the normalized join of the configured root and its `target_path`. Every generated entry must satisfy that relation. A valid partial or `none` plan remains diagnosable but is not eligible for full-root dispatch.
+- R40. Bubblewrap is eligible only when every overlay destination and required parent already exists beneath the configured root with a source-compatible file or directory type, including the internal trampoline destination. Missing or mismatched targets fail its probe without modifying the configured root; PRoot eligibility remains governed by its independently tested translation behavior.
+- R41. Doctor JSON must represent disabled, ready, absent, partial, `none`, malformed, future, digest-mismatched, semantically invalid, and changed-during-read mount-plan states as completed capability diagnoses. These states dispatch no command; exit 125 remains reserved for failures that prevent a trustworthy complete report.
 
 **Backend selection and execution**
 
@@ -102,7 +116,7 @@ Tools installed outside the current filesystem root may be visible but unusable 
 
 ### Key Flows
 
-- F1. **Full-root automatic execution:** The caller selects a profile; host-bridge validates it, probes Bubblewrap then PRoot with exact mappings, selects the first compatible backend, and dispatches once.
+- F1. **Full-root automatic execution:** The caller selects a profile; host-bridge validates its configured root, optional exact semantic plan, and combined overlays, probes Bubblewrap then PRoot with those exact mappings, selects the first compatible backend, and dispatches once.
 - F2. **Explicit rewrite:** The caller requests or permits rewrite; host-bridge resolves and inspects the entry point, reports degraded semantics, and directly launches the supported ELF or interpreter chain.
 - F3. **Capability diagnosis:** `host-bridge doctor --json` reports installed candidates, exact probe results, supported profile capabilities, architecture, and bounded reasons without launching the requested command.
 - F4. **Cargo tool:** A profile maps a visible host toolchain and project; Cargo and its descendants execute against that root while preserving jobserver and terminal descriptors.
@@ -121,6 +135,9 @@ Tools installed outside the current filesystem root may be visible but unusable 
 - AE8. Given a mounted-root fixture with `root_access = "inherit"`, a repair command changes only fixture files permitted to the current user; with `root_access = "read-only"`, the same write is refused and PRoot is ineligible unless read-only access is already enforced outside host-bridge and represented as `inherit`.
 - AE9. Given malformed ELF, a foreign machine type, an overlong/recursive shebang, or a missing interpreter, rewrite exits before launch with a typed diagnostic.
 - AE10. Given released x86_64 and AArch64 archives, each binary runs `--version`, parses the example config, and completes native Bubblewrap/PRoot fixture smokes without a dynamic language runtime.
+- AE11. Given root `/host`, a valid bound manifest, and caller workspace `/workspace`, Bubblewrap and PRoot observe host `/usr` from `/host/usr` while `/workspace` resolves to the caller mount recorded by the manifest; image-only paths do not replace either layer.
+- AE12. Given a missing, future, truncated, self-consistently malformed, digest-mismatched, or concurrently changed configured manifest, host-bridge probes no backend and dispatches no command.
+- AE13. Given a replayable entry targeting `/`, host-bridge rejects the plan before probing; given a valid child target absent from the lower root, Bubblewrap reports an incompatible profile without creating the target while an independently compatible PRoot may still be selected.
 
 ### Scope Boundaries
 
@@ -144,6 +161,7 @@ Tools installed outside the current filesystem root may be visible but unusable 
 
 - Linux is the only supported kernel.
 - The caller or surrounding runtime makes every configured root and projection visible before invocation.
+- A configured semantic mount plan is already bound at the exact caller-visible path by the surrounding launcher; standalone host-bridge never searches launcher state or chooses among manifests.
 - Bubblewrap requires host support for unprivileged user/mount namespaces and an outer policy that permits the needed operations.
 - PRoot requires ptrace/process-memory behavior permitted by host and outer-runtime policy.
 - Full-root backends use the caller's real kernel, identity, network, and permissions.
@@ -163,7 +181,7 @@ Tools installed outside the current filesystem root may be visible but unusable 
 
 ## Planning Contract
 
-**Product Contract preservation:** Product decisions from the confirmed brainstorm are captured unchanged; planning adds the C package shape, config parser pin, backend mechanics, tests, release evidence, and repository sequence.
+**Product Contract preservation:** changed: the user-approved layered namespace adds A6, R33-R41, AE11-AE13, and corresponding F1 detail. Existing standalone behavior remains unchanged when `mount_plan` is omitted; planning retains the prior C package, backend, release, and scope decisions.
 
 ### Key Technical Decisions
 
@@ -177,6 +195,9 @@ Tools installed outside the current filesystem root may be visible but unusable 
 - KTD8. **Name the weak backend `rewrite`.** It covers ELF and shebang entry points, not a complete root, and therefore cannot be mistaken for full-root operation.
 - KTD9. **Launch once.** Probe before dispatch, then commit to one backend; setup or child failure after dispatch never retries elsewhere.
 - KTD10. **Ship static musl artifacts.** Build native x86-64-v1 and generic AArch64 binaries, with no bundled Bubblewrap or PRoot.
+- KTD11. **Treat the bound mount plan as an optional input contract.** Add a bounded internal `ct-mount-plan-v1` parser and internal SHA-256 implementation; profiles opt in with one absolute `mount_plan` path, and absence of that field preserves standalone root/projection behavior.
+- KTD12. **Compose one layered namespace.** Build backend argv from the configured root first, then merge eligible manifest entries and configured projections into one stable parent-before-child target order. For unrelated targets, emit manifest entries before configured projections and preserve declaration order within each source. Reject exact-target collisions instead of guessing precedence, and never replay bootstrap-internal; launcher-internal binds, protection masks, and the manifest bind are absent from semantic entries by producer contract.
+- KTD13. **Do not let Bubblewrap materialize overlay targets in the lower root.** Validate destination existence and type before probing and mark Bubblewrap incompatible when its setup would create a path. This preserves writable host-root semantics without allowing a capability probe to mutate that root; PRoot is evaluated separately.
 
 ### High-Level Design
 
@@ -203,15 +224,10 @@ default_profile = "host"
 root = "/host"
 root_access = "inherit"
 semantics = "full-root"
+mount_plan = "/.container-tools-mount-plan"
 cwd_unmapped = "error"
 path = ["/home/user/.cargo/bin", "/usr/local/bin", "/usr/bin", "/bin"]
 environment_remove = ["LD_PRELOAD"]
-
-[[profiles.host.projections]]
-visible = "/workspace"
-target = "/workspace"
-access = "inherit"
-required = true
 
 [[profiles.host.projections]]
 visible = "/host-run/munge"
@@ -226,13 +242,13 @@ SLURM_CONF = "/etc/slurm/slurm.conf"
 - `root` and `visible` paths are paths in the caller's current namespace.
 - `target` paths are paths in the selected execution root.
 - `version = 1` is required. The root object accepts only `version`, `default_profile`, and the `profiles` table; `default_profile` must name an existing profile and may be overridden only by `--profile`.
-- Each profile requires `root`, `root_access`, `semantics`, `cwd_unmapped`, and `path`; `environment_remove`, `environment`, and `projections` are optional. `root_access` and projection `access` accept only `inherit` or `read-only`; PRoot is ineligible when host-bridge itself must enforce either read-only value.
+- Each profile requires `root`, `root_access`, `semantics`, `cwd_unmapped`, and `path`; `mount_plan`, `environment_remove`, `environment`, and `projections` are optional. A configured `mount_plan` is an absolute normalized caller-visible path to a required `ct-mount-plan-v1` record. `root_access` and projection `access` accept only `inherit` or `read-only`; PRoot is ineligible when host-bridge itself must enforce either read-only value.
 - `semantics` accepts only `full-root` or `rewrite`. `cwd_unmapped` accepts only `error` or `root`; `root` maps an otherwise unmapped caller cwd to target `/`. PATH entries and projection targets are absolute target-side paths.
 - `[profiles.NAME.environment]` sets string-valued variables. `environment_remove` is an array of variable names; setting and removing the same name is invalid. `PATH` is reserved and is invalid in both environment collections: host bridge exports the colon-joined profile `path` as `PATH` for initial command lookup and every descendant. Host bridge applies other removals, then sets, to the inherited environment.
 - A projection requires `visible`, `target`, `access`, and `required`. A missing required source fails before probing; a missing optional source is omitted and reported without inspecting its contents.
 - Discovery order is `--config PATH`, `HOST_BRIDGE_CONFIG`, `$XDG_CONFIG_HOME/host-bridge/config.toml` when set, then `$HOME/.config/host-bridge/config.toml`. A selected explicit path that is absent is an error; implicit candidates are skipped only when absent, and the first existing malformed candidate fails without fallback. No candidate means the typed missing-config diagnostic.
 - Profiles may explicitly use `semantics = "rewrite"`; a full-root profile still requires an invocation-level `--allow-degraded=rewrite` before rewrite selection.
-- Unknown fields, duplicate profile names, duplicate targets, malformed enums, relative paths, `..`, NUL, oversized files, and excessive mapping counts fail before probing.
+- Unknown fields, duplicate profile names, duplicate targets across configured and manifest-derived projections, a replayable target `/`, malformed enums, relative paths, `..`, NUL, oversized files, and excessive mapping counts fail before probing.
 - Paths are not canonicalized and symlinks are not rejected.
 - Initial bounds: 1 MiB config, 64 profiles, 256 projections per profile, 256 PATH entries, 128 environment changes, 4 shebang recursion levels, and 8 KiB diagnostics per backend.
 
@@ -246,6 +262,7 @@ SLURM_CONF = "/etc/slurm/slurm.conf"
   "profile": "host",
   "architecture": "x86_64",
   "requested_semantics": "full-root",
+  "mount_plan": {"configured": true, "status": "ready", "digest": "64-lowercase-hex", "strategy": "direct", "completeness": "complete", "detail": ""},
   "backends": [
     {"name": "bubblewrap", "installed": true, "eligible": true, "operational": "yes", "reason_code": "ready", "detail": ""},
     {"name": "proot", "installed": true, "eligible": true, "operational": "not-probed", "reason_code": "earlier-backend-ready", "detail": ""},
@@ -255,7 +272,8 @@ SLURM_CONF = "/etc/slurm/slurm.conf"
 ```
 
 - Backend entries are always ordered `bubblewrap`, `proot`, `rewrite`; `operational` is `yes`, `no`, or `not-probed`.
-- Version-1 `reason_code` values are `ready`, `not-installed`, `incompatible-profile`, `policy-denied`, `probe-timeout`, `probe-failed`, `earlier-backend-ready`, and `degradation-not-authorized`. `detail` is opaque, escaped, credential-free, and limited to 8 KiB per backend.
+- `mount_plan.status` is `disabled`, `ready`, `absent`, `partial`, `none`, `malformed`, `future`, `digest-mismatch`, `semantic-invalid`, or `changed-during-read`. Digest, strategy, and completeness are strings only when trustworthy and otherwise null; `detail` is bounded and credential-free.
+- Version-1 `reason_code` values are `ready`, `not-installed`, `incompatible-profile`, `mount-plan-unavailable`, `policy-denied`, `probe-timeout`, `probe-failed`, `earlier-backend-ready`, and `degradation-not-authorized`. `detail` is opaque, escaped, credential-free, and limited to 8 KiB per backend.
 - A valid completed diagnosis exits 0 even when no backend is operational. Invalid configuration or inability to produce a complete report exits 125 with a typed stderr diagnostic and no partial JSON object.
 
 ### Backend Contracts
@@ -308,6 +326,10 @@ host-bridge/
   cmake/
   docs/
   src/
+    mount_plan.c
+    mount_plan.h
+    sha256.c
+    sha256.h
   tests/
     fixtures/
   vendor/tomlc17/
@@ -346,12 +368,12 @@ flowchart TB
 | Unit | Requirements | Flows | Acceptance examples |
 |---|---|---|---|
 | U1 | R1-R6, R31 | F1-F3 | AE10 |
-| U2 | R3-R12 | F1-F6 | AE1, AE5-AE8 |
+| U2 | R3-R12, R33-R41 | F1-F6 | AE1, AE5-AE8, AE11-AE13 |
 | U3 | R1, R18-R25, R32 | F1-F3 | AE1, AE9 |
-| U4 | R7-R15, R18-R22, R32 | F1, F3-F6 | AE1, AE5-AE8 |
-| U5 | R7-R15, R18-R22, R32 | F1, F3-F6 | AE2, AE6-AE8 |
+| U4 | R7-R15, R18-R22, R32-R40 | F1, F3-F6 | AE1, AE5-AE8, AE11-AE13 |
+| U5 | R7-R15, R18-R22, R32-R40 | F1, F3-F6 | AE2, AE6-AE8, AE11-AE13 |
 | U6 | R16-R26 | F2-F3 | AE3-AE4, AE9 |
-| U7 | R13-R30, R32 | F1-F6 | AE1-AE9 |
+| U7 | R13-R30, R32-R41 | F1-F6 | AE1-AE9, AE11-AE13 |
 | U8 | R31 | F3-F6 | AE10 |
 
 ### Risks And Mitigations
@@ -367,6 +389,8 @@ flowchart TB
 | Static binary loses terminal or descriptor behavior | Cargo/interactive breakage | Preserve process contract and native PTY tests | Jobserver, PTY, signal, and status tests |
 | PRoot is older and misses a new syscall | Partial root semantics | Exact-profile descendant probe and documented residual | Representative file-operation integration suite |
 | A denied or wedged probe leaves descendants | Persistent availability loss | Owned process group, bounded TERM/KILL, complete reap before fallback | Stubborn-child timeout and unrelated-process tests |
+| Bound manifest is malformed, stale, or interpreted differently | Wrong caller data overlays or cross-project routing | Closed parser, digest/framing validation, exact configured selector, and no state discovery | Golden vector, malformed matrix, changed-during-read, and layered workspace tests |
+| Bubblewrap creates a missing overlay target in the writable lower root | Capability checks mutate host state | Require pre-existing type-compatible targets and use an existing internal destination | Missing parent/leaf, type mismatch, read-only, and unchanged-root tests |
 
 ---
 
@@ -381,12 +405,12 @@ flowchart TB
 - **Verification:** Configure and run CTest with the system compiler, then configure a static musl release build in the provisioned image.
 - **Dependencies:** Container prerequisites plan for in-image musl verification.
 
-### U2. Implement Strict Profiles And Projection Planning
+### U2. Implement Strict Profiles, Mount Plans, And Projection Planning
 
-- **Goal:** Turn strict TOML into one deterministic root/projection/environment plan.
-- **Files:** `host-bridge/src/config.c`; `host-bridge/src/config.h`; `host-bridge/src/path_map.c`; `host-bridge/src/path_map.h`; `host-bridge/tests/test_config.c`; `host-bridge/tests/test_path_map.c`; `host-bridge/host-bridge.example.toml`; `host-bridge/docs/config.md`.
-- **Approach:** Validate the versioned schema, enforce bounds, preserve ordinary symlinks, map cwd through longest prefix, and separate visible caller paths from target paths.
-- **Test scenarios:** Every discovery tier; unknown/duplicate fields; malformed TOML; excessive size/counts; relative, parent, NUL, and non-UTF-8 config paths; overlapping projections; duplicate targets; missing required versus optional paths; mapped and unmapped cwd; environment set/remove; reserved PATH set/remove rejection; exported descendant PATH; root `/`; mounted root; paths with spaces.
+- **Goal:** Turn strict TOML plus an optional exact semantic mount plan into one deterministic layered root/projection/environment plan.
+- **Files:** `host-bridge/src/config.c`; `host-bridge/src/config.h`; `host-bridge/src/mount_plan.c`; `host-bridge/src/mount_plan.h`; `host-bridge/src/sha256.c`; `host-bridge/src/sha256.h`; `host-bridge/src/path_map.c`; `host-bridge/src/path_map.h`; `host-bridge/tests/test_config.c`; `host-bridge/tests/test_mount_plan.c`; `host-bridge/tests/test_path_map.c`; new `host-bridge/tests/fixtures/ct-mount-plan-v1/`; `host-bridge/host-bridge.example.toml`; `host-bridge/docs/config.md`.
+- **Approach:** Validate the versioned schemas, descriptor-pin and bound the configured manifest read, verify its digest/framing/roles and generated-root derivation, classify `bootstrap-internal` as non-replayed, reject unknown roles and replay target `/`, and merge eligible manifest/configured overlays into one stable parent-before-child order after the root. Producer-omitted launcher internals never appear in valid grammar. Manifest-before-configured source rank and declaration order provide the total tie-breaker for unrelated targets. Preserve ordinary symlinks, map cwd through longest prefix, and separate visible caller paths from target paths. Keep shared producer-consumer valid/invalid byte vectors so both repositories prove the same protocol interpretation.
+- **Test scenarios:** Every discovery tier; unknown/duplicate fields; malformed TOML; excessive size/counts; relative, parent, NUL, and non-UTF-8 config paths; absent manifest behavior; valid direct/fallback/none manifests; every role tuple; generated-root join success and wrong-root failure; replay target `/`; final-NUL, count, enum, digest, future-version, size/entry, and changed-during-read failures; overlapping projections; cross-source ancestor ordering; exact target collisions across manifest/config; missing required versus optional paths; mapped and unmapped cwd; environment set/remove; reserved PATH set/remove rejection; exported descendant PATH; root `/`; mounted root; layered `/host` plus caller workspace; paths with spaces.
 - **Verification:** Focused config and path-map CTest targets plus example-config parse smoke.
 - **Dependencies:** U1.
 
@@ -403,8 +427,8 @@ flowchart TB
 
 - **Goal:** Construct and prove exact kernel mount-namespace semantics without adding unrelated isolation.
 - **Files:** `host-bridge/src/backend_bubblewrap.c`; `host-bridge/src/trampoline.c`; `host-bridge/src/backend.h`; `host-bridge/tests/test_bubblewrap.c`; `host-bridge/tests/full_root_fixture.c`; `host-bridge/docs/backends.md`.
-- **Approach:** Generate ordered bind or read-only-bind argv, map the internal trampoline, chdir to the target cwd, retain other namespaces, and probe through the exact plan before dispatch.
-- **Test scenarios:** Backend absent; user namespace denied; mount denied; root and nested overlays; read-only enforcement; required device/proc/run projections; cwd; environment; descriptors; terminal; command status and signal; probe pass followed by launch failure; no retry.
+- **Approach:** Generate bind or read-only-bind argv for the root followed by the globally ordered manifest/configured overlays; require every destination parent/leaf and internal trampoline target to exist with a compatible type beneath the lower root, chdir to the target cwd, retain other namespaces, and probe through that exact plan without creating paths before dispatch.
+- **Test scenarios:** Backend absent; user namespace denied; mount denied; root and nested overlays; host runtime plus caller workspace layering; cross-source ancestor ordering; exact-target collision refusal; replay target `/`; bootstrap/internal-entry exclusion; absent parent/leaf and type mismatch leave the lower root unchanged; read-only enforcement; required device/proc/run projections; cwd; environment; descriptors; terminal; command status and signal; probe pass followed by launch failure; no retry.
 - **Verification:** Fake-argv tests always; real Bubblewrap fixture on capable x86_64 and AArch64 Linux runners.
 - **Dependencies:** U3.
 
@@ -412,7 +436,7 @@ flowchart TB
 
 - **Goal:** Provide full-root fallback on ptrace-capable systems without implicit fake-root or convenience mappings.
 - **Files:** `host-bridge/src/backend_proot.c`; `host-bridge/tests/test_proot.c`; `host-bridge/tests/full_root_fixture.c`; `host-bridge/docs/backends.md`.
-- **Approach:** Generate only `-r`, explicit `-b`, `-w`, trampoline, and command argv. Exclude profiles requiring host-bridge to enforce read-only root or projections, accept `inherit` when an outer runtime already enforces access, probe exact descendant path behavior, and retain PRoot diagnostics as bounded opaque evidence.
+- **Approach:** Generate only `-r`, ordered explicit `-b` mappings from manifest-derived and configured overlays, `-w`, trampoline, and command argv. Exclude profiles requiring host-bridge to enforce read-only root or projections, accept `inherit` when an outer runtime already enforces access, probe exact descendant path behavior, and retain PRoot diagnostics as bounded opaque evidence.
 - **Test scenarios:** Backend absent; ptrace denied; nested PRoot; root/projection/cwd mapping; subprocess tree; socket projection; no `-R`, `-S`, `-0`, or QEMU; read-only root/projection exclusion; externally enforced inherited read-only source; child status versus internal failure ambiguity; debugger incompatibility note; no retry.
 - **Verification:** Fake-argv tests always; real PRoot fixture on ptrace-capable x86_64 and AArch64 Linux runners.
 - **Dependencies:** U3.
@@ -431,7 +455,7 @@ flowchart TB
 - **Goal:** Deliver one coherent command experience and prove the three representative workloads.
 - **Files:** `host-bridge/src/main.c`; `host-bridge/src/backend.c`; `host-bridge/src/doctor.c`; `host-bridge/tests/test_backend_selection.c`; `host-bridge/tests/test_doctor.c`; `host-bridge/tests/test_use_cases.c`; `host-bridge/docs/troubleshooting.md`; `host-bridge/README.md`.
 - **Approach:** Filter by profile capabilities, probe in fixed order, clean up each owned probe before fallback, freeze one dispatch, and provide the exact version-1 JSON diagnosis. Use synthetic roots and fake services rather than live host or cluster state in default tests.
-- **Test scenarios:** AE1-AE9; all backend availability matrices; forced backends; root and projection read-only filtering; explicit degradation; exact doctor schema/reason enums; malformed probe output; five-second timeout and bounded cleanup; Cargo-like compiler/linker descendants and jobserver; Slurm-like config/socket/script submission and queries; mounted-root read/write; no command double-run.
+- **Test scenarios:** AE1-AE9 and AE11-AE13; all backend availability matrices; forced backends; root and projection read-only filtering; exact manifest selector/digest and layered caller workspace; malformed/future/partial/none/changed manifest diagnosis without probing; explicit degradation; exact doctor mount-plan object/schema/reason enums; malformed probe output; five-second timeout and bounded cleanup; Cargo-like compiler/linker descendants and jobserver; Slurm-like config/socket/script submission and queries; mounted-root read/write; no command double-run.
 - **Verification:** Full CTest suite, static analysis, sanitizers, and native Bubblewrap/PRoot integration tests.
 - **Dependencies:** U4-U6.
 
@@ -492,7 +516,10 @@ ctest --test-dir /tmp/mkchad-v1/host-bridge/debug --output-on-failure
 
 - `host-bridge` exists as an independent C11 repository with one executable and no runtime language dependency.
 - Strict TOML profiles describe only currently visible roots and projections; no container runtime is encoded in the core contract.
+- Optional exact `ct-mount-plan-v1` consumption layers caller data mounts over the configured root without state scanning, host-source reconstruction, or launcher-specific APIs.
+- The consumer verifies exact generated-root derivation, rejects replay target `/`, globally orders overlay parents before children, and reports every unavailable plan state through closed doctor JSON.
 - Bubblewrap and PRoot exact-profile probes and full-root launches work on supported capable x86_64 and AArch64 hosts.
+- Bubblewrap never creates a missing overlay or trampoline destination in the configured lower root; incompatible target layouts fail without mutation and may still use an independently compatible PRoot.
 - Backend filtering preserves read-only requirements and never silently weakens semantics.
 - Rewrite supports the declared native ELF/shebang entry points only after explicit consent and always reports its limits.
 - No command can be dispatched twice through backend fallback.
