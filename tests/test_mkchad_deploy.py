@@ -15,6 +15,8 @@ import tempfile
 import unittest
 from unittest import mock
 
+import jsonschema
+
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -64,6 +66,53 @@ class DeploymentContractTests(unittest.TestCase):
         packages = self.release["artifacts"]["container-tools-package"]
         self.assertEqual({package["role"] for package in packages}, {"host", "container"})
         self.assertEqual({package["product_major"] for package in packages}, {1})
+        self.assertEqual(
+            {image["architecture"] for image in self.release["artifacts"]["nvim-image"]},
+            {package["architecture"] for package in packages},
+        )
+
+    def test_generated_package_scripts_are_not_launcher_sources(self):
+        """Leave configured compatibility scripts under package verification."""
+        sources = {path.name for path in self.deploy._installer_sources(ROOT / "msk_containers")}
+        self.assertNotIn("ct_args.sh", sources)
+        self.assertNotIn("ct_exec.sh", sources)
+        self.assertIn("nvim", sources)
+
+    def test_real_package_archive_passes_staging_and_installer_preflight(self):
+        """Exercise deployment admission against an exact production package."""
+        variable_names = (
+            "CT_PACKAGE_ARCHIVE", "CT_PACKAGE_SHA256", "CT_PACKAGE_VERSION",
+            "CT_PACKAGE_SOURCE_COMMIT", "CT_PACKAGE_ARCHITECTURE", "CT_PACKAGE_LIBC",
+        )
+        values = {name: os.environ.get(name) for name in variable_names}
+        if not all(values.values()):
+            self.skipTest("no exact production container-tools package supplied")
+        expected = {
+            "role": "host",
+            "architecture": values["CT_PACKAGE_ARCHITECTURE"],
+            "version": values["CT_PACKAGE_VERSION"],
+            "product_major": int(values["CT_PACKAGE_VERSION"].split(".", 1)[0]),
+            "source_commit": values["CT_PACKAGE_SOURCE_COMMIT"],
+            "sha256": values["CT_PACKAGE_SHA256"],
+            "libc": values["CT_PACKAGE_LIBC"],
+            "source_filename_class": "container-tools-package",
+        }
+        with tempfile.TemporaryDirectory(prefix="deploy-real-package-", dir="/tmp/mkchad-v1") as temporary:
+            root = pathlib.Path(temporary)
+            staged, identity = self.deploy._stage_package(
+                pathlib.Path(values["CT_PACKAGE_ARCHIVE"]), root, expected
+            )
+            self.assertEqual(identity, expected)
+            subprocess.run(
+                [
+                    "bash", str(ROOT / "msk_containers/container_tools/scripts/install-package.sh"),
+                    "--check", "--archive", str(staged), "--sha256", expected["sha256"],
+                    "--version", expected["version"], "--source-commit", expected["source_commit"],
+                    "--architecture", expected["architecture"], "--libc", expected["libc"],
+                    "--prefix", str(root / "prefix"),
+                ],
+                check=True,
+            )
 
     def test_package_roles_identities_and_action_order_fail_closed(self):
         """Reject forged package metadata before deployment staging can begin."""
@@ -71,7 +120,9 @@ class DeploymentContractTests(unittest.TestCase):
             lambda value: value["artifacts"]["container-tools-package"].pop(),
             lambda value: value["artifacts"]["container-tools-package"][1].__setitem__("role", "host"),
             lambda value: value["artifacts"]["container-tools-package"][0].__setitem__("version", "v1"),
+            lambda value: value["artifacts"]["container-tools-package"][0].__setitem__("version", "01.0.0"),
             lambda value: value["artifacts"]["container-tools-package"][0].__setitem__("product_major", 2),
+            lambda value: value["artifacts"]["nvim-image"].append({"architecture": "aarch64", "sha256": "a" * 64, "source_filename_class": "raw-nvim-container"}),
             lambda value: value["components"][2].__setitem__("name", "host-bridge"),
             lambda value: value["components"][2].__setitem__("actions", list(reversed(value["components"][2]["actions"]))),
         )
@@ -87,10 +138,31 @@ class DeploymentContractTests(unittest.TestCase):
         release_schema = json.loads((ROOT / "deploy/release-v2.schema.json").read_text(encoding="utf-8"))
         result_schema = json.loads((ROOT / "deploy/result-v2.schema.json").read_text(encoding="utf-8"))
         self.assertEqual((release_schema["properties"]["components"]["minItems"], release_schema["properties"]["components"]["maxItems"]), (9, 9))
+        release_packages = release_schema["properties"]["artifacts"]["properties"]["container-tools-package"]
+        self.assertEqual((release_packages["minItems"], release_packages["maxItems"]), (2, 6))
         self.assertEqual((result_schema["properties"]["components"]["minItems"], result_schema["properties"]["components"]["maxItems"]), (9, 9))
         packages = result_schema["$defs"]["packages"]
         self.assertEqual((packages["properties"]["expected"]["minItems"], packages["properties"]["expected"]["maxItems"]), (2, 2))
         self.assertEqual(result_schema["$defs"]["identity"]["properties"]["role"]["enum"], ["host", "container"])
+
+    def test_release_schema_enforces_package_pairs_per_image_architecture(self):
+        """Keep schema-only release consumers aligned with semantic validation."""
+        schema = json.loads((ROOT / "deploy/release-v2.schema.json").read_text(encoding="utf-8"))
+        validator = jsonschema.Draft202012Validator(schema)
+        self.assertEqual(list(validator.iter_errors(self.release)), [])
+        host = next(package for package in self.release["artifacts"]["container-tools-package"] if package["role"] == "host")
+        container = next(package for package in self.release["artifacts"]["container-tools-package"] if package["role"] == "container")
+        mutations = (
+            lambda value: value["artifacts"]["container-tools-package"].pop(),
+            lambda value: value["artifacts"]["container-tools-package"].append(copy.deepcopy(host)),
+            lambda value: value["artifacts"]["nvim-image"].append({"architecture": "aarch64", "sha256": "a" * 64, "source_filename_class": "raw-nvim-container"}),
+            lambda value: value["artifacts"]["container-tools-package"].extend(({**host, "architecture": "aarch64"}, {**container, "architecture": "aarch64"})),
+        )
+        for mutate in mutations:
+            with self.subTest(mutate=mutate):
+                malformed = copy.deepcopy(self.release)
+                mutate(malformed)
+                self.assertTrue(list(validator.iter_errors(malformed)))
 
     def test_schema_1_and_unknown_fields_are_rejected(self):
         schema_1 = copy.deepcopy(self.release)
@@ -154,6 +226,13 @@ class DeploymentContractTests(unittest.TestCase):
             "log_path": "/tmp/mkchad-v1/result.log",
         }
         self.assertEqual(self.deploy.validate_result_v2_document(result), result)
+        result_schema = json.loads((ROOT / "deploy/result-v2.schema.json").read_text(encoding="utf-8"))
+        result_validator = jsonschema.Draft202012Validator(result_schema)
+        self.assertEqual(list(result_validator.iter_errors(result)), [])
+        leading_zero = copy.deepcopy(result)
+        leading_zero["packages"]["expected"][0]["version"] = "01.0.0"
+        leading_zero["packages"]["observed"][0]["version"] = "01.0.0"
+        self.assertTrue(list(result_validator.iter_errors(leading_zero)))
         for mutate in (
             lambda value: value["artifact"].__setitem__("environment", {}),
             lambda value: value["components"][0].__setitem__("requested_commit", "bad"),
@@ -213,14 +292,31 @@ class DeploymentExecutionTests(unittest.TestCase):
             if component["name"] in self.commits:
                 component["commit"] = self.commits[component["name"]]
         host = next(package for package in self.manifest["artifacts"]["container-tools-package"] if package["role"] == "host")
-        archive_metadata = {key: value for key, value in host.items() if key != "sha256"}
+        archive_metadata = {
+            "schema": "container-tools.archive/v1",
+            "version": host["version"],
+            "architecture": host["architecture"],
+            "libc": host["libc"],
+            "source_commit": host["source_commit"],
+        }
         payload = json.dumps(archive_metadata, sort_keys=True, separators=(",", ":")).encode("ascii")
+        package_root = f"container-tools-{host['version']}-{host['architecture']}-{host['libc']}-{host['source_commit']}"
         with tarfile.open(self.package, "w:gz", format=tarfile.PAX_FORMAT) as archive:
-            member = tarfile.TarInfo("container-tools-package.json")
+            directory = tarfile.TarInfo(package_root)
+            directory.type = tarfile.DIRTYPE
+            directory.mode = 0o755
+            directory.mtime = 0
+            archive.addfile(directory)
+            member = tarfile.TarInfo(f"{package_root}/archive.json")
             member.size = len(payload)
             member.mode = 0o644
             member.mtime = 0
             archive.addfile(member, io.BytesIO(payload))
+            readme = tarfile.TarInfo(f"{package_root}/README.md")
+            readme.size = len(b"fixture\n")
+            readme.mode = 0o644
+            readme.mtime = 0
+            archive.addfile(readme, io.BytesIO(b"fixture\n"))
         host["sha256"] = hashlib.sha256(self.package.read_bytes()).hexdigest()
         self.image = self.root / "image.sif"
         container = next(package for package in self.manifest["artifacts"]["container-tools-package"] if package["role"] == "container")
@@ -480,11 +576,17 @@ class DeploymentExecutionTests(unittest.TestCase):
     def test_forged_archive_package_metadata_stops_before_checkout_mutation(self):
         """Reject an independently forged host archive package claim."""
         host = next(package for package in self.manifest["artifacts"]["container-tools-package"] if package["role"] == "host")
-        forged = {key: value for key, value in host.items() if key != "sha256"}
-        forged["version"] = "2.0.0-dev"
+        forged = {
+            "schema": "container-tools.archive/v1",
+            "version": "2.0.0-dev",
+            "architecture": host["architecture"],
+            "libc": host["libc"],
+            "source_commit": host["source_commit"],
+        }
         payload = json.dumps(forged, sort_keys=True, separators=(",", ":")).encode("ascii")
+        package_root = f"container-tools-{forged['version']}-{forged['architecture']}-{forged['libc']}-{forged['source_commit']}"
         with tarfile.open(self.package, "w:gz", format=tarfile.PAX_FORMAT) as archive:
-            member = tarfile.TarInfo("container-tools-package.json")
+            member = tarfile.TarInfo(f"{package_root}/archive.json")
             member.size = len(payload)
             member.mode = 0o644
             member.mtime = 0

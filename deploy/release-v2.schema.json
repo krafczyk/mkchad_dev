@@ -27,15 +27,38 @@
       "type": "object",
       "required": ["container-tools-package", "nvim-image"],
       "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {"properties": {"nvim-image": {"contains": {"required": ["architecture"], "properties": {"architecture": {"const": "x86_64"}}}}}},
+          "then": {"properties": {"container-tools-package": {"allOf": [
+            {"contains": {"required": ["architecture", "role"], "properties": {"architecture": {"const": "x86_64"}, "role": {"const": "host"}}}, "minContains": 1, "maxContains": 1},
+            {"contains": {"required": ["architecture", "role"], "properties": {"architecture": {"const": "x86_64"}, "role": {"const": "container"}}}, "minContains": 1, "maxContains": 1}
+          ]}}},
+          "else": {"properties": {"container-tools-package": {"not": {"contains": {"required": ["architecture"], "properties": {"architecture": {"const": "x86_64"}}}}}}}
+        },
+        {
+          "if": {"properties": {"nvim-image": {"contains": {"required": ["architecture"], "properties": {"architecture": {"const": "aarch64"}}}}}},
+          "then": {"properties": {"container-tools-package": {"allOf": [
+            {"contains": {"required": ["architecture", "role"], "properties": {"architecture": {"const": "aarch64"}, "role": {"const": "host"}}}, "minContains": 1, "maxContains": 1},
+            {"contains": {"required": ["architecture", "role"], "properties": {"architecture": {"const": "aarch64"}, "role": {"const": "container"}}}, "minContains": 1, "maxContains": 1}
+          ]}}},
+          "else": {"properties": {"container-tools-package": {"not": {"contains": {"required": ["architecture"], "properties": {"architecture": {"const": "aarch64"}}}}}}}
+        },
+        {
+          "if": {"properties": {"nvim-image": {"contains": {"required": ["architecture"], "properties": {"architecture": {"const": "ppc64le"}}}}}},
+          "then": {"properties": {"container-tools-package": {"allOf": [
+            {"contains": {"required": ["architecture", "role"], "properties": {"architecture": {"const": "ppc64le"}, "role": {"const": "host"}}}, "minContains": 1, "maxContains": 1},
+            {"contains": {"required": ["architecture", "role"], "properties": {"architecture": {"const": "ppc64le"}, "role": {"const": "container"}}}, "minContains": 1, "maxContains": 1}
+          ]}}},
+          "else": {"properties": {"container-tools-package": {"not": {"contains": {"required": ["architecture"], "properties": {"architecture": {"const": "ppc64le"}}}}}}}
+        }
+      ],
       "properties": {
         "container-tools-package": {
           "type": "array",
           "minItems": 2,
-          "items": {"$ref": "#/$defs/container_tools_package"},
-          "allOf": [
-            {"contains": {"properties": {"role": {"const": "host"}}}, "minContains": 1, "maxContains": 1},
-            {"contains": {"properties": {"role": {"const": "container"}}}, "minContains": 1, "maxContains": 1}
-          ]
+          "maxItems": 6,
+          "items": {"$ref": "#/$defs/container_tools_package"}
         },
         "nvim-image": {
           "type": "array",
@@ -108,7 +131,7 @@
       "properties": {
         "role": {"enum": ["host", "container"]},
         "architecture": {"enum": ["x86_64", "aarch64", "ppc64le"]},
-        "version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?$"},
+        "version": {"type": "string", "pattern": "^(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?$"},
         "product_major": {"type": "integer", "minimum": 0},
         "source_commit": {"$ref": "#/$defs/commit"},
         "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},

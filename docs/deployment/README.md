@@ -125,10 +125,11 @@ wheel and virtual-environment installation remains independently supported.
 
 `container_tools` is one product, not a host-bridge component. Release and
 developer deployment require one explicit host archive. The deployer privately
-stages its exact bytes, verifies the closed host metadata in
-`container-tools-package.json`, and resolves action arguments only from the
-selected release/developer identity; callers cannot supply internal action
-tokens. Before mutation, a supplied or reused image must expose the separately
+stages its exact bytes, reads `archive.json` from the versioned package root,
+binds the outer archive digest as the closed host identity, and resolves action
+arguments only from the selected release/developer identity; callers cannot
+supply internal action tokens. The pinned package verifier then checks the full
+archive before mutation. A supplied or reused image must expose the separately
 verified container identity at `/etc/mkchad/container-tools-package.json`.
 Both metadata documents must exactly match their selected identities.
 
@@ -142,14 +143,15 @@ The ordered package actions are `container-tools-package-preflight`,
 `container-tools-package-install`, and `container-tools-package-verify`.
 Preflight runs before host-tool and image mutation, package install precedes
 host-tool installation, and package verification completes before terminal
-success. Host-tool actions receive the archive, SHA-256, version, product
-major, source commit, architecture, libc, and private recovery directory as a
-fixed argv. The image installer receives the corresponding in-container
-identity. The package installer records interrupted replacement state only in a
-private recovery directory; repair the reported condition and rerun with the
-same archive identity. Terminal schema-2 results report expected and observed
-host/container identities without archive contents, environment values, or
-prefix inventories.
+success. Host-tool actions receive the archive, SHA-256, version, source commit,
+architecture, libc, and private recovery directory as a fixed
+argv. Generated compatibility scripts remain package-owned and are verified as
+one configured package identity rather than compared with source templates. The
+image installer receives the corresponding in-container identity. The package
+installer records interrupted replacement state only in a private recovery
+directory; repair the reported condition and rerun with the same archive
+identity. Terminal schema-2 results report expected and observed host/container
+identities without archive contents, environment values, or prefix inventories.
 
 An existing clean component checkout does not require the lifecycle launcher to
 be preinstalled when no managed host tool or image exists yet. Deployment treats
@@ -188,8 +190,8 @@ bash tests/container_tools_release_runtime_test.sh --self-test
 The fixture creates a temporary package archive, image metadata document,
 runtime report, terminal schema-2 result, and root binding document beneath
 `/tmp/mkchad-v1`. It verifies the selected workspace `HEAD`, finalized
-`msk_containers` commit `c954465f9ce10b0552686ee811d3fec48993c80f`, and nested
-`container_tools` commit `22c803fb981a61db4cdeb5310df0301f238458ba`. It then
+`msk_containers` commit `cb834dbea46ded29ba812085902102dd79a5371f`, and nested
+`container_tools` commit `0c806b4c3fafdc11d9ee16e66d4ba4805953241c`. It then
 binds the release manifest's host and container identities to the archive
 digest and metadata, the image digest and metadata, the report source and
 manifest digests, schema-2 expected/observed package identities, exact cleanup,

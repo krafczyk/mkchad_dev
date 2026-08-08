@@ -150,11 +150,6 @@
         "architecture": "x86_64",
         "sha256": "8adc7ce8fb7a6f91ee9fb38a5cda3b71dbe4d589508192c74123c1fe100b9c03",
         "source_filename_class": "raw-nvim-container"
-      },
-      {
-        "architecture": "aarch64",
-        "sha256": "98054fd3e189a178cc6346599339fe260439b3e5e0bc806b0280fd8af6ec978a",
-        "source_filename_class": "raw-nvim-container"
       }
     ]
   },

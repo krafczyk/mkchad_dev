@@ -265,6 +265,14 @@ raise SystemExit(child_exit)
         self.assertIn("deployer", result["diagnostic"])
         self.assertFalse(list(self.deploy_root.glob(".latest-result-*")))
 
+    def test_child_result_rejects_leading_zero_package_versions(self):
+        """Keep launcher-side result validation aligned with package admission."""
+        _, remote, _ = self.remote_with_release()
+        self.assertEqual(self.invoke(remote)[0], 0)
+        result = self.latest_result()
+        result["packages"]["expected"][0]["version"] = "01.0.0"
+        self.assertFalse(self.launcher._valid_result_document(result))
+
     def test_child_status_and_missing_or_mismatched_results_use_the_right_terminal_result(self):
         _, remote, _ = self.remote_with_release()
         self.assertEqual(self.invoke(remote, child_exit=7)[0], 7)

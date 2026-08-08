@@ -6,8 +6,8 @@ umask 077
 
 readonly evidence_schema='container-tools.runtime-evidence/v1'
 readonly binding_schema='mkchad.container-tools-release-evidence/v1'
-readonly final_parent_commit='c954465f9ce10b0552686ee811d3fec48993c80f'
-readonly final_child_commit='22c803fb981a61db4cdeb5310df0301f238458ba'
+readonly final_parent_commit='cb834dbea46ded29ba812085902102dd79a5371f'
+readonly final_child_commit='0c806b4c3fafdc11d9ee16e66d4ba4805953241c'
 readonly work_root='/tmp/mkchad-v1/container-tools-release-runtime'
 
 script_dir=$(dirname "$(realpath "$0")")
@@ -72,9 +72,12 @@ release_inputs_match() {
     $image.sha256 == $image_digest
   ' "$manifest" >/dev/null || { unavailable 'the package or image digest does not match the release manifest'; return $?; }
 
-  tar -xOzf "$package" container-tools-package.json |
-    jq -e --slurpfile manifest "$manifest" '
-      . == ([ $manifest[0].artifacts["container-tools-package"][] | select(.role == "host") ][0] | del(.sha256))
+  tar -xOzf "$package" --wildcards '*/archive.json' |
+    jq -e --slurpfile manifest "$manifest" --arg digest "$package_digest" '
+      .schema == "container-tools.archive/v1" and
+      ({role:"host", architecture, version, product_major:(.version | split(".")[0] | tonumber),
+        source_commit, sha256:$digest, libc, source_filename_class:"container-tools-package"} ==
+       [ $manifest[0].artifacts["container-tools-package"][] | select(.role == "host") ][0])
     ' >/dev/null || return 1
   jq -e --slurpfile manifest "$manifest" '
     . == ([ $manifest[0].artifacts["container-tools-package"][] | select(.role == "container") ][0])
@@ -158,16 +161,25 @@ make_fixture_archive() {
   python3 - "$archive" "$metadata" <<'PY'
 import gzip
 import io
+import json
 import pathlib
 import tarfile
 import sys
 
 archive = pathlib.Path(sys.argv[1])
-payload = pathlib.Path(sys.argv[2]).read_bytes()
+metadata = pathlib.Path(sys.argv[2]).read_text()
+payload = metadata.encode()
+identity = json.loads(metadata)
+root = f"container-tools-{identity['version']}-{identity['architecture']}-{identity['libc']}-{identity['source_commit']}"
 with archive.open("wb") as raw:
     with gzip.GzipFile(fileobj=raw, mode="wb", mtime=0) as compressed:
         with tarfile.open(fileobj=compressed, mode="w", format=tarfile.PAX_FORMAT) as package:
-            member = tarfile.TarInfo("container-tools-package.json")
+            directory = tarfile.TarInfo(root)
+            directory.type = tarfile.DIRTYPE
+            directory.mode = 0o755
+            directory.mtime = 0
+            package.addfile(directory)
+            member = tarfile.TarInfo(f"{root}/archive.json")
             member.mode = 0o644
             member.mtime = 0
             member.size = len(payload)
@@ -197,8 +209,8 @@ self_test() {
   # Consume the parent harness first; it in turn consumes the child report validator.
   bash "$selected_root_runner" --self-test
   jq -n --arg child "$final_child_commit" '
-    {role:"host", architecture:"x86_64", version:"1.0.0-fixture", product_major:1,
-     source_commit:$child, libc:"musl", source_filename_class:"container-tools-package"}
+    {schema:"container-tools.archive/v1", version:"1.0.0-fixture",
+     architecture:"x86_64", libc:"musl", source_commit:$child}
   ' > "$metadata"
   make_fixture_archive "$package" "$metadata"
   jq --arg parent "$final_parent_commit" --arg child "$final_child_commit" --arg package "$(sha256 "$package")" '

@@ -130,12 +130,26 @@ packages = {entry["role"]: entry for entry in manifest["artifacts"]["container-t
 tools_commit = next(component["commit"] for component in manifest["components"] if component["name"] == "container_tools")
 for entry in packages.values():
     entry["source_commit"] = tools_commit
-host_metadata = {key: value for key, value in packages["host"].items() if key != "sha256"}
-payload = json.dumps(host_metadata, sort_keys=True, separators=(",", ":")).encode()
+host = packages["host"]
+archive_metadata = {
+    "schema": "container-tools.archive/v1",
+    "version": host["version"],
+    "architecture": host["architecture"],
+    "libc": host["libc"],
+    "source_commit": host["source_commit"],
+}
+payload = json.dumps(archive_metadata, sort_keys=True, separators=(",", ":")).encode()
+package_root = f"container-tools-{host['version']}-{host['architecture']}-{host['libc']}-{host['source_commit']}"
 with tarfile.open(package_path, "w:gz", format=tarfile.PAX_FORMAT) as archive:
-    member = tarfile.TarInfo("container-tools-package.json")
+    directory = tarfile.TarInfo(package_root)
+    directory.type, directory.mode, directory.mtime = tarfile.DIRTYPE, 0o755, 0
+    archive.addfile(directory)
+    member = tarfile.TarInfo(f"{package_root}/archive.json")
     member.size, member.mode, member.mtime = len(payload), 0o644, 0
     archive.addfile(member, io.BytesIO(payload))
+    readme = tarfile.TarInfo(f"{package_root}/README.md")
+    readme.size, readme.mode, readme.mtime = len(b"fixture\n"), 0o644, 0
+    archive.addfile(readme, io.BytesIO(b"fixture\n"))
 packages["host"]["sha256"] = hashlib.sha256(package_path.read_bytes()).hexdigest()
 image.write_text(json.dumps(packages["container"], sort_keys=True, separators=(",", ":")))
 manifest["artifacts"]["nvim-image"][0]["sha256"] = hashlib.sha256(image.read_bytes()).hexdigest()
@@ -265,12 +279,17 @@ import sys
 import tarfile
 
 package, image, commit = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), sys.argv[3]
-identity = {"role": "host", "architecture": "x86_64", "version": "1.0.0-dev", "product_major": 1, "source_commit": commit, "libc": "glibc", "source_filename_class": "container-tools-package"}
-payload = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+archive_identity = {"schema": "container-tools.archive/v1", "architecture": "x86_64", "version": "1.0.0-dev", "source_commit": commit, "libc": "glibc"}
+payload = json.dumps(archive_identity, sort_keys=True, separators=(",", ":")).encode()
+package_root = f"container-tools-{archive_identity['version']}-{archive_identity['architecture']}-{archive_identity['libc']}-{archive_identity['source_commit']}"
 with tarfile.open(package, "w:gz", format=tarfile.PAX_FORMAT) as archive:
-    member = tarfile.TarInfo("container-tools-package.json")
+    directory = tarfile.TarInfo(package_root)
+    directory.type, directory.mode, directory.mtime = tarfile.DIRTYPE, 0o755, 0
+    archive.addfile(directory)
+    member = tarfile.TarInfo(f"{package_root}/archive.json")
     member.size, member.mode, member.mtime = len(payload), 0o644, 0
     archive.addfile(member, io.BytesIO(payload))
+identity = {"role": "host", "architecture": "x86_64", "version": "1.0.0-dev", "product_major": 1, "source_commit": commit, "libc": "glibc", "source_filename_class": "container-tools-package"}
 identity["sha256"] = hashlib.sha256(package.read_bytes()).hexdigest()
 image.write_text(json.dumps({**identity, "role": "container"}, sort_keys=True, separators=(",", ":")))
 PY

@@ -80,10 +80,16 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         self.mkchad = self.workspace / "mkchad"
         self.database = self.workspace / "opencode-db"
         self.package = self.root / "container-tools-host.tar.gz"
-        archive_metadata = {"role": "host", "architecture": self.deploy._native_architecture(), "version": "1.0.0-dev", "product_major": 1, "source_commit": self._commit_value(self.tools), "libc": "glibc", "source_filename_class": "container-tools-package"}
+        archive_metadata = {"schema": "container-tools.archive/v1", "architecture": self.deploy._native_architecture(), "version": "1.0.0-dev", "source_commit": self._commit_value(self.tools), "libc": "glibc"}
         payload = json.dumps(archive_metadata, sort_keys=True, separators=(",", ":")).encode("ascii")
+        package_root = f"container-tools-{archive_metadata['version']}-{archive_metadata['architecture']}-{archive_metadata['libc']}-{archive_metadata['source_commit']}"
         with tarfile.open(self.package, "w:gz", format=tarfile.PAX_FORMAT) as archive:
-            member = tarfile.TarInfo("container-tools-package.json")
+            directory = tarfile.TarInfo(package_root)
+            directory.type = tarfile.DIRTYPE
+            directory.mode = 0o755
+            directory.mtime = 0
+            archive.addfile(directory)
+            member = tarfile.TarInfo(f"{package_root}/archive.json")
             member.size = len(payload)
             member.mode = 0o644
             member.mtime = 0

@@ -49,7 +49,7 @@ PACKAGE_TOKENS = frozenset({
     "container_tools_host_source_commit", "container_tools_host_prefix",
     "container_tools_host_libc", "native_architecture",
 })
-PACKAGE_VERSION = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?$")
+PACKAGE_VERSION = re.compile(r"^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?$")
 REDACT = re.compile(r"(?i)\b([A-Za-z0-9_-]*(?:password|token|secret|api[_-]?key)[A-Za-z0-9_-]*)=[^\s]+")
 MANAGED_IMAGE = re.compile(r"neovim_[0-9]+\.[0-9]+\.[0-9]+_g[0-9a-fA-F]{7,40}_[0-9a-fA-F]{8,64}_(?:x86|x86_64|aarch64|ppc64le)\.sif")
 DEVELOPER_REPOSITORIES = {
@@ -191,14 +191,18 @@ def validate_release_v2_document(document: dict) -> dict:
             raise DeploymentError("invalid image artifact")
         architectures.add(artifact["architecture"])
     packages = artifacts["container-tools-package"]
-    roles = set()
+    package_keys = set()
+    package_roles: dict[str, set[str]] = {}
+    package_majors: dict[str, set[int]] = {}
     for package in packages:
+        key = (package.get("architecture"), package.get("role")) if isinstance(package, dict) else None
         if (
             not isinstance(package, dict)
             or set(package) != {"role", "architecture", "version", "product_major", "source_commit", "sha256", "libc", "source_filename_class"}
             or package.get("role") not in {"host", "container"}
-            or package["role"] in roles
-            or package.get("architecture") not in ARCHITECTURES
+            or not isinstance(package.get("architecture"), str)
+            or package["architecture"] not in ARCHITECTURES
+            or key in package_keys
             or not isinstance(package.get("version"), str) or not PACKAGE_VERSION.fullmatch(package["version"])
             or not isinstance(package.get("product_major"), int) or package["product_major"] < 0
             or not SHA1.fullmatch(package.get("source_commit", ""))
@@ -208,11 +212,12 @@ def validate_release_v2_document(document: dict) -> dict:
             or package.get("source_filename_class") != "container-tools-package"
         ):
             raise DeploymentError("invalid container-tools package artifact")
-        roles.add(package["role"])
-    if roles != {"host", "container"}:
-        raise DeploymentError("container-tools package roles must be complete and unique")
-    host, container = (next(package for package in packages if package["role"] == role) for role in ("host", "container"))
-    if host["product_major"] != container["product_major"]:
+        package_keys.add(key)
+        package_roles.setdefault(package["architecture"], set()).add(package["role"])
+        package_majors.setdefault(package["architecture"], set()).add(package["product_major"])
+    if set(package_roles) != architectures or any(roles != {"host", "container"} for roles in package_roles.values()):
+        raise DeploymentError("each image architecture requires one complete container-tools package pair")
+    if any(len(majors) != 1 for majors in package_majors.values()):
         raise DeploymentError("container-tools host and container package majors differ")
     container_actions = next(component["actions"] for component in components if component["name"] == "container_tools")
     if container_actions != PACKAGE_ACTIONS:
@@ -668,11 +673,16 @@ def _package_identity(value: object, *, role: str) -> dict:
 
 
 def _archive_package_identity(path: pathlib.Path, expected_sha256: str) -> dict:
-    """Read the host metadata embedded in a staged archive and bind its digest."""
+    """Read one real package archive identity and bind its outer digest."""
     try:
         with tarfile.open(path, "r:*") as archive:
-            members = archive.getmembers()
-            if len(members) != 1 or members[0].name != "container-tools-package.json" or not members[0].isfile() or members[0].size > 4096:
+            members = [
+                member
+                for member in archive.getmembers()
+                if len(pathlib.PurePosixPath(member.name).parts) == 2
+                and pathlib.PurePosixPath(member.name).name == "archive.json"
+            ]
+            if len(members) != 1 or not members[0].isfile() or members[0].size > 4096:
                 raise DeploymentError("container-tools package archive has invalid metadata")
             handle = archive.extractfile(members[0])
             if handle is None:
@@ -680,9 +690,33 @@ def _archive_package_identity(path: pathlib.Path, expected_sha256: str) -> dict:
             metadata = json.loads(handle.read().decode("utf-8"), object_pairs_hook=_reject_duplicates)
     except (OSError, tarfile.TarError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise DeploymentError("container-tools package archive has invalid metadata") from exc
-    if not isinstance(metadata, dict) or "sha256" in metadata:
+    if (
+        not isinstance(metadata, dict)
+        or set(metadata) != {"schema", "version", "architecture", "libc", "source_commit"}
+        or metadata.get("schema") != "container-tools.archive/v1"
+        or not isinstance(metadata.get("version"), str)
+        or not PACKAGE_VERSION.fullmatch(metadata["version"])
+        or metadata.get("architecture") not in ARCHITECTURES
+        or metadata.get("libc") not in {"musl", "glibc"}
+        or not SHA1.fullmatch(metadata.get("source_commit", ""))
+    ):
         raise DeploymentError("container-tools package archive has invalid metadata")
-    return _package_identity({**metadata, "sha256": expected_sha256}, role="host")
+    root = f"container-tools-{metadata['version']}-{metadata['architecture']}-{metadata['libc']}-{metadata['source_commit']}"
+    if pathlib.PurePosixPath(members[0].name).parts[0] != root:
+        raise DeploymentError("container-tools package archive has invalid metadata")
+    return _package_identity(
+        {
+            "role": "host",
+            "architecture": metadata["architecture"],
+            "version": metadata["version"],
+            "product_major": int(metadata["version"].split(".", 1)[0]),
+            "source_commit": metadata["source_commit"],
+            "sha256": expected_sha256,
+            "libc": metadata["libc"],
+            "source_filename_class": "container-tools-package",
+        },
+        role="host",
+    )
 
 
 def _stage_package(source: pathlib.Path, staging: pathlib.Path, package: dict) -> tuple[pathlib.Path, dict]:
@@ -816,9 +850,8 @@ def _run_action(action: dict, component: dict, image: pathlib.Path | None, recov
 
 def _installer_sources(msk_checkout: pathlib.Path) -> list[pathlib.Path]:
     """Return the exact host-tool files owned by the pinned installer checkout."""
-    paths = set((msk_checkout / "container_tools").glob("*.sh"))
     bin_dir = msk_checkout / "nvim" / "bin"
-    paths.update(bin_dir.glob("*.sh"))
+    paths = set(bin_dir.glob("*.sh"))
     paths.update(path for path in (bin_dir / name for name in ("nvim", "nvim_shell", "nvim_clear_data", "nvim_clear_npm_global", "mkchad", "mkchad-container-bootstrap", "mkchad-status-host-evidence", "mkchad-opencode-server-image", "mkchad-opencode-server", "install_nvim_container")) if path.is_file())
     return sorted(paths, key=lambda path: path.name)
 
