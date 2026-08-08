@@ -9,7 +9,8 @@ install -Dm755 deploy/mkchad_release.py ~/.local/bin/mkchad-release
 ```
 
 ```bash
-mkchad-release --release TAG --image /absolute/path/to/nvim_container_x86.sif
+mkchad-release --release TAG --image /absolute/path/to/nvim_container_x86.sif \
+  --container-tools-host-package /absolute/path/to/container-tools-host.tar.gz
 ```
 
 The caller-owned image may be stored directly under the managed container
@@ -29,7 +30,10 @@ development, validation, supervisor, or recovery option.
 
 `deploy/release.json` is schema 2 and is the deployment authority. It records
 every component repository, full commit, disposition, destination, ordered
-actions, preserved paths, image digest, and configuration handoff pin. These
+actions, preserved paths, image digest, role-keyed `container-tools-package`
+identities, and configuration handoff pin. Each identity has a role,
+architecture, semantic version/product major, source commit, SHA-256, libc
+family, and filename class. These
 explicit pins are independent of parent or nested Git links; a manifest pin may
 intentionally differ from a development checkout's gitlink.
 
@@ -49,7 +53,11 @@ Run the repository-local developer command only from the canonical parent Git
 top level:
 
 ```bash
-./deploy/mkchad_develop.py [--image PATH] [--replace-partial]
+./deploy/mkchad_develop.py [--image PATH] --container-tools-host-package PATH \
+  --container-tools-host-sha256 SHA256 --container-tools-host-version VERSION \
+  --container-tools-host-source-commit COMMIT \
+  --container-tools-host-architecture ARCH --container-tools-host-libc musl|glibc \
+  [--replace-partial]
 ```
 
 It is a developer workflow, not a release. The source authority is the exact
@@ -58,7 +66,9 @@ clean committed `HEAD` of the checked-out `msk_containers`, its nested
 dirty. Child origins may be forked or missing, and unpublished local commits
 work without network access. Parent and nested gitlink revisions are not
 authority. Any dirty, staged, untracked, unmerged, renamed, or type-changing
-child bytes are rejected before target mutation.
+child bytes are rejected before target mutation. The supplied archive must hash
+to the supplied identity and its source commit must equal the admitted pinned
+`container_tools` child; the nested gitlink is never used as a fallback.
 
 The command stages those four local commits and then follows the regular
 deployment procedure. Destinations still require their canonical origins and
@@ -85,7 +95,7 @@ Developer runs atomically publish a mode-tagged result at the shared
 `latest-result.json` path with local workspace, selected-commit, action, image,
 failure, and log evidence. That result is diagnostic evidence, not release
 authority. The release manifest, release CLI and launcher handoff, and
-schema-1 release result remain unchanged.
+schema-2 release result remain unchanged.
 
 ## Deployment Flow
 
@@ -111,6 +121,36 @@ newer is required. This managed launcher installation builds no wheel, contacts
 no package index, and adds no dependency. The child repository's standalone
 wheel and virtual-environment installation remains independently supported.
 
+## Container Tools Packages
+
+`container_tools` is one product, not a host-bridge component. Release and
+developer deployment require one explicit host archive. The deployer privately
+stages its exact bytes, verifies the closed host metadata in
+`container-tools-package.json`, and resolves action arguments only from the
+selected release/developer identity; callers cannot supply internal action
+tokens. Before mutation, a supplied or reused image must expose the separately
+verified container identity at `/etc/mkchad/container-tools-package.json`.
+Both metadata documents must exactly match their selected identities.
+
+Host and in-container package identities may use different exact versions and
+source commits only when their `product_major` values match. A cross-major pair
+is rejected during preflight, before checkouts, host tools, or images mutate.
+An architecture without both closed role entries is unavailable rather than
+falling back to another archive.
+
+The ordered package actions are `container-tools-package-preflight`,
+`container-tools-package-install`, and `container-tools-package-verify`.
+Preflight runs before host-tool and image mutation, package install precedes
+host-tool installation, and package verification completes before terminal
+success. Host-tool actions receive the archive, SHA-256, version, product
+major, source commit, architecture, libc, and private recovery directory as a
+fixed argv. The image installer receives the corresponding in-container
+identity. The package installer records interrupted replacement state only in a
+private recovery directory; repair the reported condition and rerun with the
+same archive identity. Terminal schema-2 results report expected and observed
+host/container identities without archive contents, environment values, or
+prefix inventories.
+
 An existing clean component checkout does not require the lifecycle launcher to
 be preinstalled when no managed host tool or image exists yet. Deployment treats
 that configuration-only state as inactive, installs the pinned host tools, and
@@ -122,7 +162,9 @@ running, pass `--replace-partial` to assert that the service is inactive and
 replace that legacy partial state through the normal verified installers:
 
 ```bash
-mkchad-release --release TAG --image /absolute/path/to/image.sif --replace-partial
+mkchad-release --release TAG --image /absolute/path/to/image.sif \
+  --container-tools-host-package /absolute/path/to/container-tools-host.tar.gz \
+  --replace-partial
 ```
 
 The option bypasses only the missing-lifecycle guard. A lifecycle launcher that

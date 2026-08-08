@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tarfile
 import uuid
 
 
@@ -42,6 +43,13 @@ CONFIGURATION_COMPONENTS = frozenset(name for name, disposition in COMPONENTS.it
 PHASES = ("preflight", "apply", "verify")
 TOKENS = frozenset({"recovery_dir", "staged_image", "component_revision"})
 ARCHITECTURES = frozenset({"x86_64", "aarch64", "ppc64le"})
+PACKAGE_TOKENS = frozenset({
+    "staged_container_tools_host_package", "container_tools_host_sha256",
+    "container_tools_host_version",
+    "container_tools_host_source_commit", "container_tools_host_prefix",
+    "container_tools_host_libc", "native_architecture",
+})
+PACKAGE_VERSION = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?$")
 REDACT = re.compile(r"(?i)\b([A-Za-z0-9_-]*(?:password|token|secret|api[_-]?key)[A-Za-z0-9_-]*)=[^\s]+")
 MANAGED_IMAGE = re.compile(r"neovim_[0-9]+\.[0-9]+\.[0-9]+_g[0-9a-fA-F]{7,40}_[0-9a-fA-F]{8,64}_(?:x86|x86_64|aarch64|ppc64le)\.sif")
 DEVELOPER_REPOSITORIES = {
@@ -50,12 +58,18 @@ DEVELOPER_REPOSITORIES = {
     "mkchad": "git@github.com:krafczyk/mkchad",
     "opencode-db": "git@github.com:krafczyk/opencode-db.git",
 }
+HOST_PACKAGE_ARGS = ["--container-tools-archive", {"token": "staged_container_tools_host_package"}, "--container-tools-sha256", {"token": "container_tools_host_sha256"}, "--container-tools-version", {"token": "container_tools_host_version"}, "--container-tools-source-commit", {"token": "container_tools_host_source_commit"}, "--container-tools-architecture", {"token": "native_architecture"}, "--container-tools-libc", {"token": "container_tools_host_libc"}]
+PACKAGE_ACTIONS = [
+    {"id": "container-tools-package-preflight", "phase": "preflight", "path": "scripts/install-package.sh", "args": ["--check", "--archive", {"token": "staged_container_tools_host_package"}, "--sha256", {"token": "container_tools_host_sha256"}, "--version", {"token": "container_tools_host_version"}, "--source-commit", {"token": "container_tools_host_source_commit"}, "--architecture", {"token": "native_architecture"}, "--libc", {"token": "container_tools_host_libc"}, "--prefix", {"token": "container_tools_host_prefix"}]},
+    {"id": "container-tools-package-install", "phase": "apply", "path": "scripts/install-package.sh", "args": ["--apply", "--archive", {"token": "staged_container_tools_host_package"}, "--sha256", {"token": "container_tools_host_sha256"}, "--version", {"token": "container_tools_host_version"}, "--source-commit", {"token": "container_tools_host_source_commit"}, "--architecture", {"token": "native_architecture"}, "--libc", {"token": "container_tools_host_libc"}, "--prefix", {"token": "container_tools_host_prefix"}, "--recovery-dir", {"token": "recovery_dir"}]},
+    {"id": "container-tools-package-verify", "phase": "verify", "path": "scripts/install-package.sh", "args": ["--verify", "--archive", {"token": "staged_container_tools_host_package"}, "--sha256", {"token": "container_tools_host_sha256"}, "--version", {"token": "container_tools_host_version"}, "--source-commit", {"token": "container_tools_host_source_commit"}, "--architecture", {"token": "native_architecture"}, "--libc", {"token": "container_tools_host_libc"}, "--prefix", {"token": "container_tools_host_prefix"}]},
+]
 DEVELOPER_ACTIONS = [
-    {"id": "host-tools-preflight", "phase": "preflight", "path": "bin/install_nvim.sh", "args": ["--check", "--recovery-dir", {"token": "recovery_dir"}]},
+    {"id": "host-tools-preflight", "phase": "preflight", "path": "bin/install_nvim.sh", "args": ["--check", "--recovery-dir", {"token": "recovery_dir"}, *HOST_PACKAGE_ARGS]},
     {"id": "image-install-preflight", "phase": "preflight", "path": "nvim/bin/install_nvim_container", "args": ["--dry-run", "--source-revision", {"token": "component_revision"}, {"token": "staged_image"}]},
-    {"id": "host-tools-install", "phase": "apply", "path": "bin/install_nvim.sh", "args": ["--recovery-dir", {"token": "recovery_dir"}]},
+    {"id": "host-tools-install", "phase": "apply", "path": "bin/install_nvim.sh", "args": ["--recovery-dir", {"token": "recovery_dir"}, *HOST_PACKAGE_ARGS]},
     {"id": "image-install", "phase": "apply", "path": "nvim/bin/install_nvim_container", "args": ["--source-revision", {"token": "component_revision"}, {"token": "staged_image"}]},
-    {"id": "host-tools-verify", "phase": "verify", "path": "bin/install_nvim.sh", "args": ["--check"]},
+    {"id": "host-tools-verify", "phase": "verify", "path": "bin/install_nvim.sh", "args": ["--check", "--recovery-dir", {"token": "recovery_dir"}, *HOST_PACKAGE_ARGS]},
 ]
 OPENCODE_DB_ACTIONS = [
     {"id": "opencode-db-preflight", "phase": "preflight", "path": "bin/install_opencode_db.sh", "args": ["--check", "--recovery-dir", {"token": "recovery_dir"}]},
@@ -150,7 +164,7 @@ def validate_release_v2_document(document: dict) -> dict:
                     if isinstance(argument, str):
                         if not argument or argument.startswith("/") or "\x00" in argument or "{" in argument or "}" in argument:
                             raise DeploymentError("invalid action argument")
-                    elif not isinstance(argument, dict) or set(argument) != {"token"} or argument.get("token") not in TOKENS:
+                    elif not isinstance(argument, dict) or set(argument) != {"token"} or argument.get("token") not in TOKENS | PACKAGE_TOKENS:
                         raise DeploymentError("unknown action token")
             if "preserved_paths" in component:
                 if name != "mkchad" or component["preserved_paths"] != ["opencode-server.json", "lazy-lock.json"]:
@@ -169,13 +183,53 @@ def validate_release_v2_document(document: dict) -> dict:
             if not allowed_nested and root == other_root and (path == other_path or path.startswith(other_path + "/") or other_path.startswith(path + "/")):
                 raise DeploymentError("components have overlapping destinations")
     artifacts = document.get("artifacts")
-    if not isinstance(artifacts, dict) or set(artifacts) != {"nvim-image"} or not isinstance(artifacts["nvim-image"], list) or not artifacts["nvim-image"]:
+    if not isinstance(artifacts, dict) or set(artifacts) != {"nvim-image", "container-tools-package"} or not isinstance(artifacts["nvim-image"], list) or not artifacts["nvim-image"] or not isinstance(artifacts["container-tools-package"], list):
         raise DeploymentError("malformed artifacts")
     architectures = set()
     for artifact in artifacts["nvim-image"]:
         if not isinstance(artifact, dict) or set(artifact) != {"architecture", "sha256", "source_filename_class"} or artifact.get("architecture") not in ARCHITECTURES or artifact["architecture"] in architectures or not SHA256.fullmatch(artifact.get("sha256", "")) or artifact.get("source_filename_class") != "raw-nvim-container":
             raise DeploymentError("invalid image artifact")
         architectures.add(artifact["architecture"])
+    packages = artifacts["container-tools-package"]
+    roles = set()
+    for package in packages:
+        if (
+            not isinstance(package, dict)
+            or set(package) != {"role", "architecture", "version", "product_major", "source_commit", "sha256", "libc", "source_filename_class"}
+            or package.get("role") not in {"host", "container"}
+            or package["role"] in roles
+            or package.get("architecture") not in ARCHITECTURES
+            or not isinstance(package.get("version"), str) or not PACKAGE_VERSION.fullmatch(package["version"])
+            or not isinstance(package.get("product_major"), int) or package["product_major"] < 0
+            or not SHA1.fullmatch(package.get("source_commit", ""))
+            or not SHA256.fullmatch(package.get("sha256", ""))
+            or package["sha256"] == "0" * 64
+            or package.get("libc") not in {"musl", "glibc"}
+            or package.get("source_filename_class") != "container-tools-package"
+        ):
+            raise DeploymentError("invalid container-tools package artifact")
+        roles.add(package["role"])
+    if roles != {"host", "container"}:
+        raise DeploymentError("container-tools package roles must be complete and unique")
+    host, container = (next(package for package in packages if package["role"] == role) for role in ("host", "container"))
+    if host["product_major"] != container["product_major"]:
+        raise DeploymentError("container-tools host and container package majors differ")
+    container_actions = next(component["actions"] for component in components if component["name"] == "container_tools")
+    if container_actions != PACKAGE_ACTIONS:
+        raise DeploymentError("container-tools package actions are incomplete or out of order")
+    msk_actions = next(component["actions"] for component in components if component["name"] == "msk_containers")
+    expected_msk_actions = [
+        {"id": "host-tools-preflight", "phase": "preflight", "path": "bin/install_nvim.sh", "args": ["--check", "--recovery-dir", {"token": "recovery_dir"}, *HOST_PACKAGE_ARGS]},
+        {"id": "image-install-preflight", "phase": "preflight", "path": "nvim/bin/install_nvim_container", "args": ["--dry-run", "--source-revision", {"token": "component_revision"}, {"token": "staged_image"}]},
+        {"id": "host-tools-install", "phase": "apply", "path": "bin/install_nvim.sh", "args": ["--recovery-dir", {"token": "recovery_dir"}, *HOST_PACKAGE_ARGS]},
+        {"id": "image-install", "phase": "apply", "path": "nvim/bin/install_nvim_container", "args": ["--source-revision", {"token": "component_revision"}, {"token": "staged_image"}]},
+        {"id": "host-tools-verify", "phase": "verify", "path": "bin/install_nvim.sh", "args": ["--check", "--recovery-dir", {"token": "recovery_dir"}, *HOST_PACKAGE_ARGS]},
+    ]
+    if msk_actions != expected_msk_actions:
+        raise DeploymentError("msk container-tools actions are incomplete or out of order")
+    serialized = json.dumps(document, sort_keys=True)
+    if "host-bridge" in serialized or "host_bridge" in serialized:
+        raise DeploymentError("legacy host-bridge deployment surface is forbidden")
     configuration = document.get("configuration")
     if not isinstance(configuration, dict) or set(configuration) != {"contract_version", "guidance"} or configuration.get("contract_version") != 1:
         raise DeploymentError("malformed configuration handoff")
@@ -183,15 +237,15 @@ def validate_release_v2_document(document: dict) -> dict:
     return document
 
 
-def validate_result_v1_document(document: dict) -> dict:
+def validate_result_v2_document(document: dict) -> dict:
     """Validate and return one closed terminal deployment result.
 
     Raises:
         DeploymentError: If the document is incomplete, future-versioned, or
             contains malformed component, action, artifact, or handoff data.
     """
-    fields = {"schema", "run_id", "release", "started_at", "completed_at", "outcome", "phase", "components", "artifact", "actions", "configuration_handoff", "failed_step", "diagnostic", "log_path"}
-    if not isinstance(document, dict) or set(document) != fields or document.get("schema") != 1 or not UUID.fullmatch(document.get("run_id", "")):
+    fields = {"schema", "run_id", "release", "started_at", "completed_at", "outcome", "phase", "components", "artifact", "packages", "actions", "configuration_handoff", "failed_step", "diagnostic", "log_path"}
+    if not isinstance(document, dict) or set(document) != fields or document.get("schema") != 2 or not UUID.fullmatch(document.get("run_id", "")):
         raise DeploymentError("malformed terminal result")
     timestamp = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
     if (
@@ -228,6 +282,21 @@ def validate_result_v1_document(document: dict) -> dict:
         or artifact.get("observed_sha256") is not None and not SHA256.fullmatch(artifact["observed_sha256"])
     ):
         raise DeploymentError("malformed terminal result artifact")
+    packages = document.get("packages")
+    if not isinstance(packages, dict) or set(packages) != {"expected", "observed"}:
+        raise DeploymentError("malformed terminal result packages")
+    expected, observed = packages["expected"], packages["observed"]
+    if not isinstance(expected, list) or not isinstance(observed, list) or len(expected) != 2 or len(observed) != 2:
+        raise DeploymentError("malformed terminal result packages")
+    package_roles = set()
+    for requested, actual in zip(expected, observed, strict=True):
+        if not isinstance(requested, dict) or set(requested) != {"role", "architecture", "version", "product_major", "source_commit", "sha256", "libc", "source_filename_class"} or requested.get("role") not in {"host", "container"} or requested["role"] in package_roles or requested.get("architecture") not in ARCHITECTURES or not isinstance(requested.get("version"), str) or not PACKAGE_VERSION.fullmatch(requested["version"]) or not isinstance(requested.get("product_major"), int) or requested["product_major"] < 0 or not SHA1.fullmatch(requested.get("source_commit", "")) or not SHA256.fullmatch(requested.get("sha256", "")) or requested.get("libc") not in {"musl", "glibc"} or requested.get("source_filename_class") != "container-tools-package":
+            raise DeploymentError("malformed terminal result packages")
+        if actual is not None and actual != requested:
+            raise DeploymentError("malformed terminal result packages")
+        package_roles.add(requested["role"])
+    if package_roles != {"host", "container"} or expected[0]["product_major"] != expected[1]["product_major"]:
+        raise DeploymentError("malformed terminal result packages")
     actions = document.get("actions")
     if not isinstance(actions, list):
         raise DeploymentError("malformed terminal result")
@@ -261,6 +330,10 @@ def validate_result_v1_document(document: dict) -> dict:
     if not isinstance(document.get("log_path"), str) or not document["log_path"].startswith("/") or any(part in {"", ".", ".."} for part in pathlib.PurePosixPath(document["log_path"]).parts[1:]):
         raise DeploymentError("malformed terminal result log path")
     return document
+
+
+# Schema-1 callers were removed with schema-2 package identity reporting.
+validate_result_v1_document = validate_result_v2_document
 
 
 def _roots() -> dict[str, pathlib.Path]:
@@ -576,6 +649,71 @@ def _stage_image(source: pathlib.Path, staging: pathlib.Path, artifact: dict, ex
     return target
 
 
+def _native_architecture() -> str:
+    """Return the release architecture name for the running host."""
+    return {"amd64": "x86_64", "arm64": "aarch64"}.get(os.uname().machine.lower(), os.uname().machine.lower())
+
+
+def _select_container_tools_packages(artifacts: dict, architecture: str) -> dict[str, dict]:
+    """Select one complete same-major package pair for a native architecture.
+
+    Raises:
+        DeploymentError: If either closed role is unavailable or the selected
+            host and in-container package majors differ.
+    """
+    selected = {item["role"]: item for item in artifacts["container-tools-package"] if item["architecture"] == architecture}
+    if set(selected) != {"host", "container"}:
+        raise DeploymentError("release has no complete container-tools package pair for this architecture")
+    if selected["host"]["product_major"] != selected["container"]["product_major"]:
+        raise DeploymentError("container-tools host and container package majors differ")
+    return selected
+
+
+def _package_identity(value: object, *, role: str) -> dict:
+    """Validate one package metadata document for its fixed deployment role."""
+    if not isinstance(value, dict) or set(value) != {"role", "architecture", "version", "product_major", "source_commit", "sha256", "libc", "source_filename_class"}:
+        raise DeploymentError("malformed container-tools package metadata")
+    if value.get("role") != role or value.get("architecture") not in ARCHITECTURES or not isinstance(value.get("version"), str) or not PACKAGE_VERSION.fullmatch(value["version"]) or not isinstance(value.get("product_major"), int) or value["product_major"] < 0 or not SHA1.fullmatch(value.get("source_commit", "")) or not SHA256.fullmatch(value.get("sha256", "")) or value.get("libc") not in {"musl", "glibc"} or value.get("source_filename_class") != "container-tools-package":
+        raise DeploymentError("malformed container-tools package metadata")
+    return value
+
+
+def _archive_package_identity(path: pathlib.Path, expected_sha256: str) -> dict:
+    """Read the host metadata embedded in a staged archive and bind its digest."""
+    try:
+        with tarfile.open(path, "r:*") as archive:
+            members = archive.getmembers()
+            if len(members) != 1 or members[0].name != "container-tools-package.json" or not members[0].isfile() or members[0].size > 4096:
+                raise DeploymentError("container-tools package archive has invalid metadata")
+            handle = archive.extractfile(members[0])
+            if handle is None:
+                raise DeploymentError("container-tools package archive has invalid metadata")
+            metadata = json.loads(handle.read().decode("utf-8"), object_pairs_hook=_reject_duplicates)
+    except (OSError, tarfile.TarError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise DeploymentError("container-tools package archive has invalid metadata") from exc
+    if not isinstance(metadata, dict) or "sha256" in metadata:
+        raise DeploymentError("container-tools package archive has invalid metadata")
+    return _package_identity({**metadata, "sha256": expected_sha256}, role="host")
+
+
+def _stage_package(source: pathlib.Path, staging: pathlib.Path, package: dict) -> tuple[pathlib.Path, dict]:
+    """Privately copy and independently verify a caller archive before mutation."""
+    target = staging / "container-tools-host-package.tar.gz"
+    if _stable_regular_digest(source, "caller container-tools package") != package["sha256"]:
+        raise DeploymentError("caller container-tools package digest does not match the release artifact")
+    try:
+        shutil.copyfile(source, target)
+    except OSError as exc:
+        raise DeploymentError("caller container-tools package could not be staged") from exc
+    if _stable_regular_digest(target, "staged container-tools package") != package["sha256"]:
+        target.unlink(missing_ok=True)
+        raise DeploymentError("caller container-tools package changed while staging")
+    identity = _archive_package_identity(target, package["sha256"])
+    if identity != package:
+        raise DeploymentError("container-tools package metadata does not match the selected identity")
+    return target, identity
+
+
 def _runtime_image(image: pathlib.Path, architecture: str):
     """Verify the staged image architecture with Apptainer or Singularity."""
     runtime = shutil.which("apptainer") or shutil.which("singularity")
@@ -585,6 +723,27 @@ def _runtime_image(image: pathlib.Path, architecture: str):
     observed = {"amd64": "x86_64", "x86": "x86_64", "arm64": "aarch64"}.get(result.stdout.strip().lower(), result.stdout.strip().lower())
     if result.returncode or observed != architecture:
         raise DeploymentError("staged image architecture does not match the release artifact")
+
+
+def _runtime_image_package_identity(image: pathlib.Path, package: dict):
+    """Read and require the exact closed package metadata from one image."""
+    runtime = shutil.which("apptainer") or shutil.which("singularity")
+    if not runtime:
+        raise DeploymentError("no Apptainer or Singularity runtime is available")
+    result = _capture([runtime, "exec", str(image), "cat", "/etc/mkchad/container-tools-package.json"], timeout=40)
+    if result.returncode or len(result.stdout) > 4096:
+        raise DeploymentError("image container-tools metadata is unavailable")
+    try:
+        metadata = json.loads(result.stdout, object_pairs_hook=_reject_duplicates)
+    except (json.JSONDecodeError, DeploymentError) as exc:
+        raise DeploymentError("image container-tools metadata is malformed") from exc
+    try:
+        identity = _package_identity(metadata, role="container")
+    except DeploymentError as exc:
+        raise DeploymentError("image container-tools metadata is malformed") from exc
+    if identity != package:
+        raise DeploymentError("image container-tools metadata does not match the selected identity")
+    return identity
 
 
 def _existing(destination: pathlib.Path, component: dict, staged: pathlib.Path) -> dict:
@@ -610,9 +769,20 @@ def _existing(destination: pathlib.Path, component: dict, staged: pathlib.Path) 
     return {"kind": "existing", "head": head, "compliant": head == component["commit"]}
 
 
-def _run_action(action: dict, component: dict, image: pathlib.Path, recovery: pathlib.Path, checkout: pathlib.Path):
+def _run_action(action: dict, component: dict, image: pathlib.Path | None, recovery: pathlib.Path, checkout: pathlib.Path, packages: dict | None = None, archive: pathlib.Path | None = None):
     """Run one fixed action argv from its pinned checkout with a finite timeout."""
-    values = {"recovery_dir": str(recovery), "staged_image": str(image), "component_revision": component["commit"]}
+    values = {"recovery_dir": str(recovery), "staged_image": str(image) if image is not None else "", "component_revision": component["commit"]}
+    if packages is not None and archive is not None:
+        host = packages["host"]
+        values.update({
+            "staged_container_tools_host_package": str(archive),
+            "container_tools_host_sha256": host["sha256"],
+            "container_tools_host_version": host["version"],
+            "container_tools_host_source_commit": host["source_commit"],
+            "container_tools_host_prefix": str(_roots()["home"] / ".local"),
+            "container_tools_host_libc": host["libc"],
+            "native_architecture": host["architecture"],
+        })
     argv = [str(checkout / action["path"]), *(item if isinstance(item, str) else values[item["token"]] for item in action["args"])]
     environment = os.environ.copy()
     environment.pop("MKCHAD_TRUST_GROUP_WRITABLE_ROOTS", None)
@@ -702,9 +872,9 @@ def _active_image_observation(home: pathlib.Path) -> dict:
     try:
         os.lstat(selector)
     except FileNotFoundError:
-        return {"state": "absent", "digest": None}
+        return {"state": "absent", "digest": None, "path": None}
     except OSError:
-        return {"state": "unsafe", "digest": None}
+        return {"state": "unsafe", "digest": None, "path": None}
     try:
         selector_before = os.lstat(selector)
         if not stat.S_ISLNK(selector_before.st_mode) or not stat.S_ISDIR(os.lstat(container_dir).st_mode):
@@ -726,9 +896,9 @@ def _active_image_observation(home: pathlib.Path) -> dict:
         selector_after = os.lstat(selector)
         if _stat_identity(selector_before) != _stat_identity(selector_after) or os.readlink(selector) != target_value:
             raise OSError
-        return {"state": "valid", "digest": digest}
+        return {"state": "valid", "digest": digest, "path": candidate}
     except (OSError, DeploymentError):
-        return {"state": "unsafe", "digest": None}
+        return {"state": "unsafe", "digest": None, "path": None}
 
 
 def _active_image_digest(home: pathlib.Path) -> str:
@@ -756,7 +926,7 @@ def _consume_caller_image(source: pathlib.Path, roots: dict[str, pathlib.Path], 
         raise DeploymentError("caller image could not be consumed after verified installation") from exc
 
 
-def _result(release: dict, roots: dict[str, pathlib.Path], artifact: dict, run_id: str, tag: str, started_at: str, log_path: pathlib.Path, actions: list[dict], outcome: str, phase: str, failed_step: str | None, diagnostic: str, observed_image: str | None) -> dict:
+def _result(release: dict, roots: dict[str, pathlib.Path], artifact: dict, packages: dict[str, dict], package_observations: dict[str, dict | None], run_id: str, tag: str, started_at: str, log_path: pathlib.Path, actions: list[dict], outcome: str, phase: str, failed_step: str | None, diagnostic: str, observed_image: str | None) -> dict:
     """Build the complete, run-bound terminal result without command data."""
     components = []
     for component in release["components"]:
@@ -765,10 +935,12 @@ def _result(release: dict, roots: dict[str, pathlib.Path], artifact: dict, run_i
             with contextlib.suppress(Exception):
                 observed = _git(["rev-parse", "HEAD"], _destination(roots, component)).stdout.strip()
         components.append({"name": component["name"], "disposition": component["disposition"], "requested_commit": component["commit"], "observed_commit": observed})
-    return {"schema": 1, "run_id": run_id, "release": tag, "started_at": started_at, "completed_at": _timestamp(), "outcome": outcome, "phase": phase, "components": components, "artifact": {"architecture": artifact["architecture"], "expected_sha256": artifact["sha256"], "observed_sha256": observed_image}, "actions": actions, "configuration_handoff": {"state": "configuration-pending", "contract_version": 1, "guidance": release["configuration"]["guidance"], "components": [{"name": item["name"], "repository": item["repository"], "commit": item["commit"]} for item in release["components"] if item["disposition"] == "configuration-owned"]}, "failed_step": failed_step, "diagnostic": REDACT.sub(r"\1=<redacted>", diagnostic)[:4096], "log_path": str(log_path)}
+    expected = [packages["host"], packages["container"]]
+    observed = [package_observations["host"], package_observations["container"]]
+    return {"schema": 2, "run_id": run_id, "release": tag, "started_at": started_at, "completed_at": _timestamp(), "outcome": outcome, "phase": phase, "components": components, "artifact": {"architecture": artifact["architecture"], "expected_sha256": artifact["sha256"], "observed_sha256": observed_image}, "packages": {"expected": expected, "observed": observed}, "actions": actions, "configuration_handoff": {"state": "configuration-pending", "contract_version": 1, "guidance": release["configuration"]["guidance"], "components": [{"name": item["name"], "repository": item["repository"], "commit": item["commit"]} for item in release["components"] if item["disposition"] == "configuration-owned"]}, "failed_step": failed_step, "diagnostic": REDACT.sub(r"\1=<redacted>", diagnostic)[:4096], "log_path": str(log_path)}
 
 
-def developer_result(admission: dict, *, actions: list[dict], artifact: dict, image: dict, run_id: str, started_at: str, log_path: pathlib.Path, outcome: str, phase: str, failed_step: str | None, diagnostic: str) -> dict:
+def developer_result(admission: dict, *, actions: list[dict], artifact: dict, image: dict, packages: dict[str, dict], package_observations: dict[str, dict | None], run_id: str, started_at: str, log_path: pathlib.Path, outcome: str, phase: str, failed_step: str | None, diagnostic: str) -> dict:
     """Build the mode-tagged developer result from local-workspace evidence.
 
     Args:
@@ -801,7 +973,7 @@ def developer_result(admission: dict, *, actions: list[dict], artifact: dict, im
         "mode": "developer", "run_id": run_id, "workspace": admission["parent"], "started_at": started_at, "completed_at": _timestamp(),
         "outcome": outcome, "phase": phase, "components": components,
         "artifact": {"architecture": artifact["architecture"], "requested_sha256": image["supplied_sha256"], "observed_sha256": image["active_sha256"]},
-        "image": image,
+        "image": image, "packages": {"expected": [packages["host"], packages["container"]], "observed": [package_observations["host"], package_observations["container"]]},
         "actions": actions, "failed_step": failed_step, "diagnostic": REDACT.sub(r"\1=<redacted>", diagnostic)[:4096], "log_path": str(log_path),
     }
 
@@ -814,23 +986,25 @@ def _timestamp() -> str:
 def _publish(path: pathlib.Path, document: dict, *, validate=True):
     """Atomically replace the launcher-owned result path for this admitted run."""
     if validate:
-        validate_result_v1_document(document)
+        validate_result_v2_document(document)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}-{uuid.uuid4().hex}")
     temporary.write_text(json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
     os.replace(temporary, path)
 
 
-def _execute_components(deployed: dict[str, dict], artifact: dict, image: pathlib.Path | None, *, developer: bool, log_path: pathlib.Path, result_path: pathlib.Path, run_id: str, replace_partial: bool, stage_sources, recheck_sources, result_builder) -> int:
+def _execute_components(deployed: dict[str, dict], artifact: dict, image: pathlib.Path | None, packages: dict[str, dict], host_package: pathlib.Path, *, developer: bool, log_path: pathlib.Path, result_path: pathlib.Path, run_id: str, replace_partial: bool, stage_sources, recheck_sources, result_builder) -> int:
     """Run the shared target procedure from already-selected component sources.
 
     Source selection differs between release and developer modes; destination
     validation, lifecycle checks, apply order, and failure handling do not.
     """
     started_at, roots, current, phase, failure_step = _timestamp(), _roots(), None, "preflight", "preflight"
+    action_component_order = ("container_tools", "msk_containers", "opencode-db", "mkchad")
     action_specs = {
         (component["name"], action["id"]): action
-        for component in deployed.values()
+        for name in action_component_order if name in deployed
+        for component in (deployed[name],)
         for action in component["actions"]
     }
     image_action_keys = {
@@ -845,8 +1019,10 @@ def _execute_components(deployed: dict[str, dict], artifact: dict, image: pathli
     ]
     action_results = {(item["component"], item["id"]): item for item in actions}
     image_info = {"choice": "omitted" if image is None else "install", "supplied_sha256": None, "active_sha256": None, "decision": "preserved" if image is None else "pending"}
+    package_observations = {"host": None, "container": None}
     staging = pathlib.Path(tempfile.mkdtemp(prefix="mkchad-deploy-"))
     try:
+        staged_package, package_observations["host"] = _stage_package(host_package, staging, packages["host"])
         if image is not None:
             image_info["supplied_sha256"] = _stable_regular_digest(image, "caller image")
             if not developer and image_info["supplied_sha256"] != artifact["sha256"]:
@@ -912,16 +1088,22 @@ def _execute_components(deployed: dict[str, dict], artifact: dict, image: pathli
                 assert image is not None and image_info["supplied_sha256"] is not None
                 staged_image = _stage_image(image, staging, artifact, image_info["supplied_sha256"])
                 _runtime_image(staged_image, artifact["architecture"])
+                package_observations["container"] = _runtime_image_package_identity(staged_image, packages["container"])
+            elif image_info["choice"] == "reused":
+                package_observations["container"] = _runtime_image_package_identity(active_image["path"], packages["container"])
             if image_info["choice"] == "reused":
                 for item in actions:
                     if (item["component"], item["id"]) in image_action_keys:
                         item["status"] = "skipped-compliant"
-            for component in deployed.values():
+            for name in action_component_order:
+                if name not in deployed:
+                    continue
+                component = deployed[name]
                 for action in component["actions"]:
                     key = component["name"], action["id"]
                     if action["phase"] == "preflight" and (key not in image_action_keys or image_info["choice"] == "install"):
                         current = action_results[key]
-                        _run_action(action, component, staged_image, recovery, staged[component["name"]][1])
+                        _run_action(action, component, staged_image, recovery, staged[component["name"]][1], packages, staged_package)
                         current["status"] = "succeeded"
                         current = None
             phase = "apply"
@@ -964,12 +1146,12 @@ def _execute_components(deployed: dict[str, dict], artifact: dict, image: pathli
                         continue
                     if key in image_action_keys and image_info["choice"] != "install":
                         item["status"] = "skipped-compliant"
-                    elif key not in image_action_keys and host_mismatches.get(item["component"]) is None:
+                    elif key not in image_action_keys and item["id"] != "container-tools-package-install" and host_mismatches.get(item["component"]) is None:
                         item["status"] = "skipped-compliant"
                     else:
                         current = item
                         failure_step = f"{item['component']}:{item['id']}"
-                        _run_action(action, component, staged_image, recovery, plans[item["component"]][0])
+                        _run_action(action, component, staged_image, recovery, plans[item["component"]][0], packages, staged_package)
                         item["status"] = "succeeded"
                         current = None
             phase = "verify"
@@ -979,7 +1161,7 @@ def _execute_components(deployed: dict[str, dict], artifact: dict, image: pathli
                     failure_step = f"{item['component']}:{item['id']}"
                     component = deployed[item["component"]]
                     action = action_specs[(item["component"], item["id"])]
-                    _run_action(action, component, staged_image, recovery, plans[item["component"]][0])
+                    _run_action(action, component, staged_image, recovery, plans[item["component"]][0], packages, staged_package)
                     item["status"] = "succeeded"
                     current = None
             for name, component in deployed.items():
@@ -999,32 +1181,33 @@ def _execute_components(deployed: dict[str, dict], artifact: dict, image: pathli
                     failure_step = "caller-image-consumption"
                     _consume_caller_image(image, roots, artifact["sha256"])
             diagnostic = "developer deployment verified" if developer else "deployment verified; configuration is pending"
-            _publish(result_path, result_builder(roots, actions, "succeeded", phase, None, diagnostic, started_at, image_info), validate=not developer)
+            _publish(result_path, result_builder(roots, actions, "succeeded", phase, None, diagnostic, started_at, image_info, package_observations), validate=not developer)
             return 0
     except KeyboardInterrupt:
         image_info["active_sha256"] = _active_image_observation(roots["home"])["digest"]
-        _publish(result_path, result_builder(roots, actions, "interrupted", phase, f"{current['component']}:{current['id']}" if current else failure_step, "deployment interrupted; repair or inspect and rerun", started_at, image_info), validate=not developer)
+        _publish(result_path, result_builder(roots, actions, "interrupted", phase, f"{current['component']}:{current['id']}" if current else failure_step, "deployment interrupted; repair or inspect and rerun", started_at, image_info, package_observations), validate=not developer)
         return 2
     except (DeploymentError, OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
         if current is not None:
             current["status"] = "failed"
         image_info["active_sha256"] = _active_image_observation(roots["home"])["digest"]
-        _publish(result_path, result_builder(roots, actions, "failed", phase, f"{current['component']}:{current['id']}" if current else failure_step, str(exc), started_at, image_info), validate=not developer)
+        _publish(result_path, result_builder(roots, actions, "failed", phase, f"{current['component']}:{current['id']}" if current else failure_step, str(exc), started_at, image_info, package_observations), validate=not developer)
         print("mkchad-deploy: " + REDACT.sub(r"\1=<redacted>", str(exc)), file=sys.stderr)
         return 2
     finally:
         shutil.rmtree(staging, ignore_errors=True)
 
 
-def execute_deployment(repo: pathlib.Path, image: pathlib.Path, *, release_tag: str, log_path: pathlib.Path, result_path: pathlib.Path, run_id: str, replace_partial: bool = False) -> int:
+def execute_deployment(repo: pathlib.Path, image: pathlib.Path, host_package: pathlib.Path, *, release_tag: str, log_path: pathlib.Path, result_path: pathlib.Path, run_id: str, replace_partial: bool = False) -> int:
     """Run one manifest-authorized release deployment synchronously.
 
     Args:
         repo: Checked-out release repository containing ``deploy/release.json``.
         image: Caller-supplied image artifact.
+        host_package: Caller-supplied host container-tools package archive.
         release_tag: Validated release identity for the result.
         log_path: Absolute launcher-owned log path.
-        result_path: Path receiving the terminal schema-1 result.
+        result_path: Path receiving the terminal schema-2 result.
         run_id: Invocation UUID.
         replace_partial: Whether the operator asserted a legacy partial target
             without lifecycle tooling is inactive.
@@ -1041,23 +1224,27 @@ def execute_deployment(repo: pathlib.Path, image: pathlib.Path, *, release_tag: 
     if not TAG.fullmatch(release_tag) or ".." in release_tag or not UUID.fullmatch(run_id):
         raise DeploymentError("invalid launcher handoff")
     manifest = validate_release_v2_document(_load(repo / "deploy" / "release.json", "release manifest"))
-    artifact = next((item for item in manifest["artifacts"]["nvim-image"] if item["architecture"] == {"amd64": "x86_64", "arm64": "aarch64"}.get(os.uname().machine.lower(), os.uname().machine.lower())), None)
+    architecture = _native_architecture()
+    artifact = next((item for item in manifest["artifacts"]["nvim-image"] if item["architecture"] == architecture), None)
     if artifact is None:
         raise DeploymentError("release has no image for this architecture")
     deployed = {item["name"]: dict(item) for item in manifest["components"] if item["disposition"] == "deployed"}
+    packages = _select_container_tools_packages(manifest["artifacts"], architecture)
     return _execute_components(
-        deployed, artifact, image, developer=False, log_path=log_path, result_path=result_path, run_id=run_id, replace_partial=replace_partial,
+        deployed, artifact, image, packages, host_package, developer=False, log_path=log_path, result_path=result_path, run_id=run_id, replace_partial=replace_partial,
         stage_sources=_stage_release_sources, recheck_sources=lambda: None,
-        result_builder=lambda roots, actions, outcome, phase, failed_step, diagnostic, started_at, image_info: _result(manifest, roots, artifact, run_id, release_tag, started_at, log_path, actions, outcome, phase, failed_step, diagnostic, image_info["active_sha256"]),
+        result_builder=lambda roots, actions, outcome, phase, failed_step, diagnostic, started_at, image_info, package_observations: _result(manifest, roots, artifact, packages, package_observations, run_id, release_tag, started_at, log_path, actions, outcome, phase, failed_step, diagnostic, image_info["active_sha256"]),
     )
 
 
-def execute_developer_deployment(workspace: pathlib.Path, image: pathlib.Path | None, *, log_path: pathlib.Path, result_path: pathlib.Path, run_id: str, replace_partial: bool = False) -> int:
+def execute_developer_deployment(workspace: pathlib.Path, image: pathlib.Path | None, host_package: pathlib.Path, *, host_package_identity: dict, log_path: pathlib.Path, result_path: pathlib.Path, run_id: str, replace_partial: bool = False) -> int:
     """Deploy clean local child commits through the regular target procedure.
 
     Args:
         workspace: Canonical parent workspace with four clean child checkouts.
         image: Optional caller-owned image; omission preserves active image state.
+        host_package: Caller-owned package archive selected for host installation.
+        host_package_identity: Independently verified closed identity for the archive.
         log_path: Absolute launcher-owned log path.
         result_path: Path receiving the terminal developer result.
         run_id: Invocation UUID.
@@ -1077,15 +1264,22 @@ def execute_developer_deployment(workspace: pathlib.Path, image: pathlib.Path | 
     if not UUID.fullmatch(run_id):
         raise DeploymentError("invalid developer handoff")
     admission = admit_developer_workspace(workspace)
-    architecture = {"amd64": "x86_64", "arm64": "aarch64"}.get(os.uname().machine.lower(), os.uname().machine.lower())
+    architecture = _native_architecture()
     if architecture not in ARCHITECTURES:
         raise DeploymentError("developer deployment has no image for this architecture")
     artifact = {"architecture": architecture, "sha256": None}
+    package = dict(host_package_identity)
+    if package.get("role") != "host" or package.get("architecture") != architecture or package.get("source_commit") != admission["commits"]["container_tools"]:
+        raise DeploymentError("developer container-tools package does not match the pinned child")
+    if not PACKAGE_VERSION.fullmatch(package.get("version", "")) or not SHA256.fullmatch(package.get("sha256", "")) or package.get("libc") not in {"musl", "glibc"}:
+        raise DeploymentError("invalid developer container-tools package identity")
+    package.update(product_major=int(package["version"].split(".", 1)[0]), source_filename_class="container-tools-package")
+    packages = {"host": package, "container": {**package, "role": "container"}}
     deployed = _developer_components(admission["commits"])
     return _execute_components(
-        deployed, artifact, image, developer=True, log_path=log_path, result_path=result_path, run_id=run_id, replace_partial=replace_partial,
+        deployed, artifact, image, packages, host_package, developer=True, log_path=log_path, result_path=result_path, run_id=run_id, replace_partial=replace_partial,
         stage_sources=lambda _components, staging: stage_developer_sources(admission, staging), recheck_sources=lambda: recheck_developer_workspace(admission),
-        result_builder=lambda _roots, actions, outcome, phase, failed_step, diagnostic, started, image_info: developer_result(admission, actions=actions, artifact=artifact, image=image_info, run_id=run_id, started_at=started, log_path=log_path, outcome=outcome, phase=phase, failed_step=failed_step, diagnostic=diagnostic),
+        result_builder=lambda _roots, actions, outcome, phase, failed_step, diagnostic, started, image_info, package_observations: developer_result(admission, actions=actions, artifact=artifact, image=image_info, packages=packages, package_observations=package_observations, run_id=run_id, started_at=started, log_path=log_path, outcome=outcome, phase=phase, failed_step=failed_step, diagnostic=diagnostic),
     )
 
 
@@ -1105,6 +1299,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("deploy")
     parser.add_argument("--release", required=True)
     parser.add_argument("--image", type=pathlib.Path, required=True)
+    parser.add_argument("--container-tools-host-package", type=pathlib.Path, required=True)
     parser.add_argument("--replace-partial", action="store_true")
     parser.add_argument("--log-path", type=pathlib.Path, required=True)
     parser.add_argument("--result-path", type=pathlib.Path, required=True)
@@ -1113,7 +1308,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.deploy != "deploy":
             parser.error("only the deploy handoff is supported")
-        return execute_deployment(pathlib.Path.cwd(), args.image, release_tag=args.release, log_path=args.log_path, result_path=args.result_path, run_id=args.run_id, replace_partial=args.replace_partial)
+        return execute_deployment(pathlib.Path.cwd(), args.image, args.container_tools_host_package, release_tag=args.release, log_path=args.log_path, result_path=args.result_path, run_id=args.run_id, replace_partial=args.replace_partial)
     except DeploymentError as exc:
         print("mkchad-deploy: " + str(exc), file=sys.stderr)
         return 2

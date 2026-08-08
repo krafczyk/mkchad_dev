@@ -65,6 +65,12 @@ def main(argv: list[str] | None = None) -> int:
     """
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0], allow_abbrev=False)
     parser.add_argument("--image", type=pathlib.Path)
+    parser.add_argument("--container-tools-host-package", type=pathlib.Path, required=True)
+    parser.add_argument("--container-tools-host-sha256", required=True)
+    parser.add_argument("--container-tools-host-version", required=True)
+    parser.add_argument("--container-tools-host-source-commit", required=True)
+    parser.add_argument("--container-tools-host-architecture", required=True)
+    parser.add_argument("--container-tools-host-libc", required=True)
     parser.add_argument("--replace-partial", action="store_true")
     args = parser.parse_args(argv)
     state_root = release._state_root()
@@ -80,7 +86,8 @@ def main(argv: list[str] | None = None) -> int:
             latest_result = state_root / "latest-result.json"
             with log_path.open("x", encoding="utf-8") as log, contextlib.redirect_stdout(_StreamLog(sys.stdout, log)), contextlib.redirect_stderr(_StreamLog(sys.stderr, log)):
                 try:
-                    status = deploy.execute_developer_deployment(workspace, args.image.absolute() if args.image is not None else None, log_path=log_path, result_path=result_path, run_id=run_id, replace_partial=args.replace_partial)
+                    package = {"role": "host", "sha256": args.container_tools_host_sha256, "version": args.container_tools_host_version, "source_commit": args.container_tools_host_source_commit, "architecture": args.container_tools_host_architecture, "libc": args.container_tools_host_libc}
+                    status = deploy.execute_developer_deployment(workspace, args.image.absolute() if args.image is not None else None, args.container_tools_host_package.absolute(), host_package_identity=package, log_path=log_path, result_path=result_path, run_id=run_id, replace_partial=args.replace_partial)
                     if _matching_result(result_path, run_id, log_path, status):
                         os.replace(result_path, latest_result)
                         return status

@@ -11,6 +11,7 @@ import pathlib
 import shutil
 import subprocess
 import tempfile
+import tarfile
 import unittest
 from unittest import mock
 import sys
@@ -52,7 +53,8 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         self.workspace = self.root / "workspace"
         self._init(self.workspace, {"README": "parent\n"})
         tools = self.root / "tools"
-        self._init(tools, {"tool.sh": "#!/bin/sh\nexit 0\n"})
+        self._init(tools, {"tool.sh": "#!/bin/sh\nexit 0\n", "scripts/install-package.sh": "#!/bin/sh\nexit 0\n"})
+        (tools / "scripts/install-package.sh").chmod(0o755)
         msk = self.root / "msk"
         self._init(msk, {"bin/install_nvim.sh": "#!/bin/sh\nexit 0\n", "nvim/bin/install_nvim_container": "#!/bin/sh\nexit 0\n"})
         (msk / "nvim/bin/install_nvim_container").chmod(0o755)
@@ -77,6 +79,15 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         self.tools = self.msk / "container_tools"
         self.mkchad = self.workspace / "mkchad"
         self.database = self.workspace / "opencode-db"
+        self.package = self.root / "container-tools-host.tar.gz"
+        archive_metadata = {"role": "host", "architecture": self.deploy._native_architecture(), "version": "1.0.0-dev", "product_major": 1, "source_commit": self._commit_value(self.tools), "libc": "glibc", "source_filename_class": "container-tools-package"}
+        payload = json.dumps(archive_metadata, sort_keys=True, separators=(",", ":")).encode("ascii")
+        with tarfile.open(self.package, "w:gz", format=tarfile.PAX_FORMAT) as archive:
+            member = tarfile.TarInfo("container-tools-package.json")
+            member.size = len(payload)
+            member.mode = 0o644
+            member.mtime = 0
+            archive.addfile(member, io.BytesIO(payload))
 
     def _run(self, command):
         return subprocess.run(command, check=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -98,6 +109,21 @@ class DeveloperWorkspaceTests(unittest.TestCase):
 
     def _commit_value(self, path):
         return self._run(["git", "-C", str(path), "rev-parse", "HEAD"]).stdout.strip()
+
+    def _package_kwargs(self):
+        """Return the admitted archive identity for direct deployer tests."""
+        return {"host_package": self.package, "host_package_identity": {"role": "host", "sha256": hashlib.sha256(self.package.read_bytes()).hexdigest(), "version": "1.0.0-dev", "source_commit": self._commit_value(self.tools), "architecture": {"amd64": "x86_64", "arm64": "aarch64"}.get(os.uname().machine.lower(), os.uname().machine.lower()), "libc": "glibc"}}
+
+    def _write_image(self, path):
+        """Write synthetic in-image container package metadata for one test SIF."""
+        identity = dict(self._package_kwargs()["host_package_identity"])
+        identity.update(role="container", product_major=1, source_filename_class="container-tools-package")
+        path.write_text(json.dumps(identity, sort_keys=True, separators=(",", ":")), encoding="ascii")
+
+    def _command_package_args(self):
+        """Return the public CLI representation of the synthetic archive identity."""
+        identity = self._package_kwargs()["host_package_identity"]
+        return ["--container-tools-host-package", str(self.package), "--container-tools-host-sha256", identity["sha256"], "--container-tools-host-version", identity["version"], "--container-tools-host-source-commit", identity["source_commit"], "--container-tools-host-architecture", identity["architecture"], "--container-tools-host-libc", identity["libc"]]
 
     def test_clean_unpublished_heads_are_staged_from_local_objects_with_dirty_parent_allowed(self):
         (self.workspace / "parent-untracked").write_text("allowed\n", encoding="ascii")
@@ -194,6 +220,8 @@ class DeveloperWorkspaceTests(unittest.TestCase):
             actions=[],
             artifact={"architecture": "x86_64", "sha256": "a" * 64},
             image={"choice": "reused", "supplied_sha256": "a" * 64, "active_sha256": "a" * 64, "decision": "reused-active"},
+            packages={"host": {**self._package_kwargs()["host_package_identity"], "product_major": 1, "source_filename_class": "container-tools-package"}, "container": {**self._package_kwargs()["host_package_identity"], "role": "container", "product_major": 1, "source_filename_class": "container-tools-package"}},
+            package_observations={"host": None, "container": None},
             run_id="123e4567-e89b-12d3-a456-426614174000",
             started_at="2026-08-03T00:00:00Z",
             log_path=pathlib.Path("/tmp/mkchad-v1/develop.log"),
@@ -210,7 +238,7 @@ class DeveloperWorkspaceTests(unittest.TestCase):
 
     def test_local_snapshots_reach_the_regular_checkout_procedure(self):
         image = self.root / "image.sif"
-        image.write_bytes(b"developer image")
+        self._write_image(image)
         (self.mkchad / "init.lua").write_text("return { deployed = true }\n", encoding="ascii")
         self._commit(self.mkchad, "local deployment")
         for child in (self.msk, self.tools, self.mkchad, self.database):
@@ -221,8 +249,8 @@ class DeveloperWorkspaceTests(unittest.TestCase):
             "XDG_STATE_HOME": str(self.root / "state"), "NVIM_CONTAINER_DIR": str(home / "containers"),
         }
         result_path = self.root / "developer-result.json"
-        with mock.patch.dict(os.environ, environment, clear=False), mock.patch.object(self.deploy, "_runtime_image"), mock.patch.object(self.deploy, "_run_action"), mock.patch.object(self.deploy, "_host_tool_mismatches", return_value={"msk_containers": None, "opencode-db": None}), mock.patch.object(self.deploy, "_active_image_digest", return_value=hashlib.sha256(image.read_bytes()).hexdigest()):
-            self.assertEqual(self.deploy.execute_developer_deployment(self.workspace, image, log_path=self.root / "developer.log", result_path=result_path, run_id="123e4567-e89b-12d3-a456-426614174000"), 0)
+        with mock.patch.dict(os.environ, environment, clear=False), mock.patch.object(self.deploy, "_runtime_image"), mock.patch.object(self.deploy, "_runtime_image_package_identity", return_value={}), mock.patch.object(self.deploy, "_run_action"), mock.patch.object(self.deploy, "_host_tool_mismatches", return_value={"msk_containers": None, "opencode-db": None}), mock.patch.object(self.deploy, "_active_image_digest", return_value=hashlib.sha256(image.read_bytes()).hexdigest()):
+            self.assertEqual(self.deploy.execute_developer_deployment(self.workspace, image, log_path=self.root / "developer.log", result_path=result_path, run_id="123e4567-e89b-12d3-a456-426614174000", **self._package_kwargs()), 0)
         result = json.loads(result_path.read_text(encoding="utf-8"))
         self.assertEqual(result["mode"], "developer")
         self.assertEqual(result["outcome"], "succeeded")
@@ -244,10 +272,10 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         result_path = self.root / "developer-result.json"
         with mock.patch.dict(os.environ, environment, clear=False), mock.patch.object(self.deploy, "_stage_image", side_effect=AssertionError("image staging")), mock.patch.object(
             self.deploy, "_runtime_image", side_effect=AssertionError("runtime validation")
-        ), mock.patch.object(self.deploy, "_active_image_digest", side_effect=AssertionError("image verification")), mock.patch.object(
+        ), mock.patch.object(self.deploy, "_runtime_image_package_identity", return_value={}), mock.patch.object(self.deploy, "_active_image_digest", side_effect=AssertionError("image verification")), mock.patch.object(
             self.deploy, "_run_action", wraps=self.deploy._run_action
         ) as action, mock.patch.object(self.deploy, "_host_tool_mismatches", return_value={"msk_containers": None, "opencode-db": None}):
-            self.assertEqual(self.deploy.execute_developer_deployment(self.workspace, None, log_path=self.root / "developer.log", result_path=result_path, run_id="123e4567-e89b-12d3-a456-426614174000", replace_partial=True), 0)
+            self.assertEqual(self.deploy.execute_developer_deployment(self.workspace, None, log_path=self.root / "developer.log", result_path=result_path, run_id="123e4567-e89b-12d3-a456-426614174000", replace_partial=True, **self._package_kwargs()), 0)
 
         result = json.loads(result_path.read_text(encoding="utf-8"))
         self.assertEqual(result["image"], {"choice": "omitted", "supplied_sha256": None, "active_sha256": None, "decision": "preserved"})
@@ -267,7 +295,7 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         result_path = self.root / "developer-result.json"
 
         with mock.patch.dict(os.environ, environment, clear=False):
-            self.assertEqual(self.deploy.execute_developer_deployment(self.workspace, None, log_path=self.root / "developer.log", result_path=result_path, run_id="123e4567-e89b-12d3-a456-426614174000"), 2)
+            self.assertEqual(self.deploy.execute_developer_deployment(self.workspace, None, log_path=self.root / "developer.log", result_path=result_path, run_id="123e4567-e89b-12d3-a456-426614174000", **self._package_kwargs()), 2)
 
         self.assertIn("partial target has no lifecycle command", json.loads(result_path.read_text(encoding="utf-8"))["diagnostic"])
         self.assertTrue((container_dir / "neovim.sif").is_symlink())
@@ -276,7 +304,7 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         home = self.root / "home"
         container_dir = home / "containers"
         container_dir.mkdir(parents=True)
-        image_bytes = b"developer image"
+        image_bytes = json.dumps({**self._package_kwargs()["host_package_identity"], "role": "container", "product_major": 1, "source_filename_class": "container-tools-package"}, sort_keys=True, separators=(",", ":")).encode("ascii")
         digest = hashlib.sha256(image_bytes).hexdigest()
         architecture = {"amd64": "x86_64", "arm64": "aarch64"}.get(os.uname().machine.lower(), os.uname().machine.lower())
         image = container_dir / f"neovim_1.2.3_gabcdef0_{digest}_{architecture}.sif"
@@ -289,10 +317,10 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         topology = sorted(path.name for path in container_dir.iterdir())
         with mock.patch.dict(os.environ, environment, clear=False), mock.patch.object(self.deploy, "_stage_image", side_effect=AssertionError("image staging")), mock.patch.object(
             self.deploy, "_runtime_image", side_effect=AssertionError("runtime validation")
-        ), mock.patch.object(self.deploy, "_active_image_digest", side_effect=AssertionError("image verification")), mock.patch.object(
+        ), mock.patch.object(self.deploy, "_runtime_image_package_identity", return_value={}), mock.patch.object(self.deploy, "_active_image_digest", side_effect=AssertionError("image verification")), mock.patch.object(
             self.deploy, "_run_action", wraps=self.deploy._run_action
         ) as action, mock.patch.object(self.deploy, "_host_tool_mismatches", return_value={"msk_containers": None, "opencode-db": None}):
-            self.assertEqual(self.deploy.execute_developer_deployment(self.workspace, image, log_path=self.root / "developer.log", result_path=self.root / "developer-result.json", run_id="123e4567-e89b-12d3-a456-426614174000", replace_partial=True), 0)
+            self.assertEqual(self.deploy.execute_developer_deployment(self.workspace, image, log_path=self.root / "developer.log", result_path=self.root / "developer-result.json", run_id="123e4567-e89b-12d3-a456-426614174000", replace_partial=True, **self._package_kwargs()), 0)
 
         self.assertTrue(image.is_file())
         self.assertEqual(sorted(path.name for path in container_dir.iterdir()), topology)
@@ -302,7 +330,7 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         home = self.root / "home"
         container_dir = home / "containers"
         container_dir.mkdir(parents=True)
-        image_bytes = b"developer image"
+        image_bytes = json.dumps({**self._package_kwargs()["host_package_identity"], "role": "container", "product_major": 1, "source_filename_class": "container-tools-package"}, sort_keys=True, separators=(",", ":")).encode("ascii")
         digest = hashlib.sha256(image_bytes).hexdigest()
         architecture = {"amd64": "x86_64", "arm64": "aarch64"}.get(os.uname().machine.lower(), os.uname().machine.lower())
         image = container_dir / f"neovim_1.2.3_gabcdef0_{digest}_{architecture}.sif"
@@ -314,7 +342,7 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         result_path = self.root / "developer-result.json"
 
         with mock.patch.dict(os.environ, environment, clear=False), mock.patch.object(self.deploy, "_run_action") as action:
-            self.assertEqual(self.deploy.execute_developer_deployment(self.workspace, image, log_path=self.root / "developer.log", result_path=result_path, run_id="123e4567-e89b-12d3-a456-426614174000"), 2)
+            self.assertEqual(self.deploy.execute_developer_deployment(self.workspace, image, log_path=self.root / "developer.log", result_path=result_path, run_id="123e4567-e89b-12d3-a456-426614174000", **self._package_kwargs()), 2)
 
         self.assertTrue(image.is_file())
         action.assert_not_called()
@@ -322,7 +350,7 @@ class DeveloperWorkspaceTests(unittest.TestCase):
 
     def test_supplied_image_rejects_an_unsafe_active_selector_before_target_mutation(self):
         image = self.root / "image.sif"
-        image.write_bytes(b"developer image")
+        self._write_image(image)
         home = self.root / "home"
         container_dir = home / "containers"
         container_dir.mkdir(parents=True)
@@ -334,7 +362,7 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         result_path = self.root / "developer-result.json"
 
         with mock.patch.dict(os.environ, environment, clear=False), mock.patch.object(self.deploy, "_stage_image", side_effect=AssertionError("image staging")):
-            self.assertEqual(self.deploy.execute_developer_deployment(self.workspace, image, log_path=self.root / "developer.log", result_path=result_path, run_id="123e4567-e89b-12d3-a456-426614174000"), 2)
+            self.assertEqual(self.deploy.execute_developer_deployment(self.workspace, image, log_path=self.root / "developer.log", result_path=result_path, run_id="123e4567-e89b-12d3-a456-426614174000", **self._package_kwargs()), 2)
 
         self.assertFalse((self.root / "config" / "mkchad").exists())
         self.assertTrue(image.is_file())
@@ -351,7 +379,7 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         with lock.open("w") as handle:
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
             with mock.patch.dict(os.environ, {"HOME": str(self.root / "home"), "XDG_STATE_HOME": str(state)}, clear=False), contextlib.redirect_stderr(terminal):
-                self.assertEqual(command.main(["--image", str(image)]), 2)
+                self.assertEqual(command.main(["--image", str(image), *self._command_package_args()]), 2)
         self.assertIn("another invocation", terminal.getvalue())
         self.assertFalse((state / "mkchad" / "deploy" / "latest-result.json").exists())
 
@@ -362,7 +390,7 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"HOME": str(self.root / "home"), "XDG_STATE_HOME": str(state)}, clear=False), mock.patch.object(
             command.deploy, "execute_developer_deployment", return_value=2
         ) as execute:
-            self.assertEqual(command.main([]), 2)
+            self.assertEqual(command.main(self._command_package_args()), 2)
 
         self.assertIsNone(execute.call_args.args[1])
 
@@ -373,7 +401,7 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"HOME": str(self.root / "home"), "XDG_STATE_HOME": str(state)}, clear=False), mock.patch.object(
             command.deploy, "execute_developer_deployment", side_effect=OSError("preflight unavailable")
         ):
-            self.assertEqual(command.main([]), 2)
+            self.assertEqual(command.main(self._command_package_args()), 2)
 
         result = json.loads((state / "mkchad" / "deploy" / "latest-result.json").read_text(encoding="utf-8"))
         self.assertEqual(result["mode"], "developer")
@@ -390,7 +418,7 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"HOME": str(self.root / "home"), "XDG_STATE_HOME": str(state)}, clear=False), mock.patch.object(
             command.deploy, "execute_developer_deployment", side_effect=KeyboardInterrupt
         ):
-            self.assertEqual(command.main([]), 2)
+            self.assertEqual(command.main(self._command_package_args()), 2)
 
         result = json.loads((state / "mkchad" / "deploy" / "latest-result.json").read_text(encoding="utf-8"))
         self.assertEqual(result["outcome"], "interrupted")

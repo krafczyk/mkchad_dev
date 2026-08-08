@@ -4,11 +4,13 @@ import copy
 import fcntl
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import pathlib
 import shutil
 import subprocess
+import tarfile
 import tempfile
 import unittest
 from unittest import mock
@@ -57,17 +59,38 @@ class DeploymentContractTests(unittest.TestCase):
             ],
         )
 
+    def test_checked_in_manifest_has_closed_container_tools_package_roles(self):
+        """Require separate host and in-container package identities."""
+        packages = self.release["artifacts"]["container-tools-package"]
+        self.assertEqual({package["role"] for package in packages}, {"host", "container"})
+        self.assertEqual({package["product_major"] for package in packages}, {1})
+
+    def test_package_roles_identities_and_action_order_fail_closed(self):
+        """Reject forged package metadata before deployment staging can begin."""
+        mutations = (
+            lambda value: value["artifacts"]["container-tools-package"].pop(),
+            lambda value: value["artifacts"]["container-tools-package"][1].__setitem__("role", "host"),
+            lambda value: value["artifacts"]["container-tools-package"][0].__setitem__("version", "v1"),
+            lambda value: value["artifacts"]["container-tools-package"][0].__setitem__("product_major", 2),
+            lambda value: value["components"][2].__setitem__("name", "host-bridge"),
+            lambda value: value["components"][2].__setitem__("actions", list(reversed(value["components"][2]["actions"]))),
+        )
+        for mutate in mutations:
+            with self.subTest(mutate=mutate):
+                malformed = copy.deepcopy(self.release)
+                mutate(malformed)
+                with self.assertRaises(self.deploy.DeploymentError):
+                    self.deploy.validate_release_v2_document(malformed)
+
     def test_json_schemas_close_nine_components_and_preserve_three_component_handoff(self):
-        """Keep schema 1 results aligned with the expanded deployed-child set."""
+        """Keep schema-2 results aligned with the expanded deployed-child set."""
         release_schema = json.loads((ROOT / "deploy/release-v2.schema.json").read_text(encoding="utf-8"))
-        result_schema = json.loads((ROOT / "deploy/result-v1.schema.json").read_text(encoding="utf-8"))
+        result_schema = json.loads((ROOT / "deploy/result-v2.schema.json").read_text(encoding="utf-8"))
         self.assertEqual((release_schema["properties"]["components"]["minItems"], release_schema["properties"]["components"]["maxItems"]), (9, 9))
         self.assertEqual((result_schema["properties"]["components"]["minItems"], result_schema["properties"]["components"]["maxItems"]), (9, 9))
-        self.assertIn("opencode-db", result_schema["$defs"]["component"]["properties"]["name"]["enum"])
-        self.assertIn("opencode-db", result_schema["$defs"]["action"]["properties"]["component"]["enum"])
-        handoff = result_schema["$defs"]["configuration_handoff"]["properties"]["components"]
-        self.assertEqual((handoff["minItems"], handoff["maxItems"]), (3, 3))
-        self.assertEqual(set(result_schema["$defs"]["handoff_component"]["properties"]["name"]["enum"]), {"opencode.nvim", "opencode-project-reload", "compound-engineering"})
+        packages = result_schema["$defs"]["packages"]
+        self.assertEqual((packages["properties"]["expected"]["minItems"], packages["properties"]["expected"]["maxItems"]), (2, 2))
+        self.assertEqual(result_schema["$defs"]["identity"]["properties"]["role"]["enum"], ["host", "container"])
 
     def test_schema_1_and_unknown_fields_are_rejected(self):
         schema_1 = copy.deepcopy(self.release)
@@ -85,10 +108,11 @@ class DeploymentContractTests(unittest.TestCase):
         self.assertEqual(self.deploy.validate_release_v2_document(different_pin), different_pin)
 
     def test_only_internal_handoff_is_parsed(self):
-        handoff = ["deploy", "--release", "v2", "--image", "/tmp/image.sif", "--replace-partial", "--log-path", "/tmp/run.log", "--result-path", "/tmp/result.json", "--run-id", "123e4567-e89b-12d3-a456-426614174000"]
+        handoff = ["deploy", "--release", "v2", "--image", "/tmp/image.sif", "--container-tools-host-package", "/tmp/container-tools.tar.gz", "--replace-partial", "--log-path", "/tmp/run.log", "--result-path", "/tmp/result.json", "--run-id", "123e4567-e89b-12d3-a456-426614174000"]
         with mock.patch.object(self.deploy, "execute_deployment", return_value=0) as execute:
             self.assertEqual(self.deploy.main(handoff), 0)
         self.assertEqual(execute.call_args.kwargs["release_tag"], "v2")
+        self.assertEqual(execute.call_args.args[2], pathlib.Path("/tmp/container-tools.tar.gz"))
         self.assertTrue(execute.call_args.kwargs["replace_partial"])
         for old in ("validate-release", "recover", "supervise", "deploy --verified-release x"):
             with self.subTest(old=old), self.assertRaises(SystemExit):
@@ -96,7 +120,7 @@ class DeploymentContractTests(unittest.TestCase):
 
     def test_terminal_result_validation_is_closed(self):
         result = {
-            "schema": 1,
+            "schema": 2,
             "run_id": "123e4567-e89b-12d3-a456-426614174000",
             "release": "v2",
             "started_at": "2026-08-02T00:00:00Z",
@@ -113,6 +137,7 @@ class DeploymentContractTests(unittest.TestCase):
                 for component in self.release["components"]
             ],
             "artifact": {"architecture": "x86_64", "expected_sha256": "a" * 64, "observed_sha256": "a" * 64},
+            "packages": {"expected": self.release["artifacts"]["container-tools-package"], "observed": self.release["artifacts"]["container-tools-package"]},
             "actions": [],
             "configuration_handoff": {
                 "state": "configuration-pending",
@@ -128,7 +153,7 @@ class DeploymentContractTests(unittest.TestCase):
             "diagnostic": "deployment complete",
             "log_path": "/tmp/mkchad-v1/result.log",
         }
-        self.assertEqual(self.deploy.validate_result_v1_document(result), result)
+        self.assertEqual(self.deploy.validate_result_v2_document(result), result)
         for mutate in (
             lambda value: value["artifact"].__setitem__("environment", {}),
             lambda value: value["components"][0].__setitem__("requested_commit", "bad"),
@@ -173,21 +198,33 @@ class DeploymentExecutionTests(unittest.TestCase):
         tempfile.tempdir = str(self.root)
         self.addCleanup(setattr, tempfile, "tempdir", previous_tempdir)
         runtime = self.bin / "apptainer"
-        runtime.write_text("#!/bin/sh\nprintf '%s\\n' \"${FAKE_IMAGE_ARCH:-x86_64}\"\n", encoding="ascii")
+        runtime.write_text("#!/bin/sh\nset -eu\n[ \"$1\" = exec ] || exit 2\nif [ \"$3\" = uname ] && [ \"$4\" = -m ]; then printf '%s\\n' \"${FAKE_IMAGE_ARCH:-x86_64}\"; exit 0; fi\n[ \"$3\" = cat ] && [ \"$4\" = /etc/mkchad/container-tools-package.json ] || exit 2\ncat \"$2\"\n", encoding="ascii")
         runtime.chmod(0o755)
         self.commits = self._sources()
         (self.home / ".gitconfig").write_text(
             f'[url "file://{self.root}/sources/"]\n\tinsteadOf = git@github.com:krafczyk/\n',
             encoding="ascii",
         )
-        self.image = self.root / "image.sif"
-        self.image.write_bytes(b"fixture image\n")
+        self.package = self.root / "container-tools-host.tar.gz"
         self.repo = self.root / "release"
         (self.repo / "deploy").mkdir(parents=True)
         self.manifest = json.loads((ROOT / "deploy" / "release.json").read_text(encoding="utf-8"))
         for component in self.manifest["components"]:
             if component["name"] in self.commits:
                 component["commit"] = self.commits[component["name"]]
+        host = next(package for package in self.manifest["artifacts"]["container-tools-package"] if package["role"] == "host")
+        archive_metadata = {key: value for key, value in host.items() if key != "sha256"}
+        payload = json.dumps(archive_metadata, sort_keys=True, separators=(",", ":")).encode("ascii")
+        with tarfile.open(self.package, "w:gz", format=tarfile.PAX_FORMAT) as archive:
+            member = tarfile.TarInfo("container-tools-package.json")
+            member.size = len(payload)
+            member.mode = 0o644
+            member.mtime = 0
+            archive.addfile(member, io.BytesIO(payload))
+        host["sha256"] = hashlib.sha256(self.package.read_bytes()).hexdigest()
+        self.image = self.root / "image.sif"
+        container = next(package for package in self.manifest["artifacts"]["container-tools-package"] if package["role"] == "container")
+        self.image.write_text(json.dumps(container, sort_keys=True, separators=(",", ":")), encoding="ascii")
         self.manifest["artifacts"]["nvim-image"][0]["sha256"] = hashlib.sha256(self.image.read_bytes()).hexdigest()
         self._write_manifest()
 
@@ -207,6 +244,14 @@ class DeploymentExecutionTests(unittest.TestCase):
 
     def _sources(self):
         tools = self._repo("container_tools", {"tool.sh": "#!/bin/sh\nexit 0\n"}, {"tool.sh"})
+        tools_source = self.root / "sources" / "container_tools"
+        (tools_source / "scripts").mkdir()
+        installer = tools_source / "scripts" / "install-package.sh"
+        installer.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+        installer.chmod(0o755)
+        subprocess.run(["git", "-C", str(tools_source), "add", "scripts/install-package.sh"], check=True)
+        subprocess.run(["git", "-C", str(tools_source), "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-q", "-m", "package installer"], check=True)
+        tools = subprocess.check_output(["git", "-C", str(tools_source), "rev-parse", "HEAD"], text=True).strip()
         msk = self._repo(
             "msk_containers",
             {
@@ -215,10 +260,16 @@ class DeploymentExecutionTests(unittest.TestCase):
                 "nvim/bin/nvim_library.sh": "#!/bin/sh\nreturn 0\n",
                 "nvim/bin/nvim_clear_npm_global": "#!/bin/sh\nexit 0\n",
                 "nvim/bin/mkchad-opencode-server": "#!/bin/sh\nprintf '{\"schema\":1,\"ok\":true,\"command\":\"status\",\"status\":\"%s\"}\\n' \"${LIFECYCLE_STATUS:-inactive}\"\n",
-                "nvim/bin/install_nvim_container": "#!/bin/sh\nset -eu\ndry_run=0\nif [ \"${1:-}\" = --dry-run ]; then dry_run=1; shift; fi\n[ \"$#\" -eq 3 ] && [ \"$1\" = --source-revision ] && [ \"${#2}\" -eq 40 ] && [ \"${3##*/}\" = nvim_container_x86.sif ] || exit 2\n[ \"$dry_run\" -eq 0 ] || exit \"${IMAGE_PREFLIGHT_STATUS:-0}\"\n[ \"${IMAGE_INSTALL_STATUS:-0}\" = 0 ] || exit \"$IMAGE_INSTALL_STATUS\"\nmkdir -p \"$NVIM_CONTAINER_DIR\"\ncp \"$3\" \"$NVIM_CONTAINER_DIR/neovim_fixture.sif\"\nln -sfn neovim_fixture.sif \"$NVIM_CONTAINER_DIR/neovim.sif\"\n",
+                "nvim/bin/install_nvim_container": "#!/bin/sh\nset -eu\ndry_run=0\nif [ \"${1:-}\" = --dry-run ]; then dry_run=1; shift; fi\n[ \"$#\" -eq 3 ] || exit 2\n[ \"$dry_run\" -eq 0 ] || exit \"${IMAGE_PREFLIGHT_STATUS:-0}\"\n[ \"${IMAGE_INSTALL_STATUS:-0}\" = 0 ] || exit \"$IMAGE_INSTALL_STATUS\"\nmkdir -p \"$NVIM_CONTAINER_DIR\"\ncp \"$3\" \"$NVIM_CONTAINER_DIR/neovim_fixture.sif\"\nln -sfn neovim_fixture.sif \"$NVIM_CONTAINER_DIR/neovim.sif\"\n",
             },
             {"bin/install_nvim.sh", "nvim/bin/nvim", "nvim/bin/nvim_library.sh", "nvim/bin/nvim_clear_npm_global", "nvim/bin/mkchad-opencode-server", "nvim/bin/install_nvim_container"},
         )
+        msk_source = self.root / "sources" / "msk_containers"
+        host_installer = msk_source / "bin" / "install_nvim.sh"
+        host_installer.write_text("#!/bin/sh\nset -eu\n[ \"${1:-}\" = --check ] && exit 0\nmkdir -p \"$HOME/.local/bin\"\ncp container_tools/*.sh nvim/bin/* \"$HOME/.local/bin/\"\nchmod 755 \"$HOME/.local/bin/\"*\n", encoding="ascii")
+        subprocess.run(["git", "-C", str(msk_source), "add", "bin/install_nvim.sh"], check=True)
+        subprocess.run(["git", "-C", str(msk_source), "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-q", "-m", "accept package contract"], check=True)
+        msk = subprocess.check_output(["git", "-C", str(msk_source), "rev-parse", "HEAD"], text=True).strip()
         old_mkchad = self._repo("mkchad", {".gitignore": "opencode-server.json\n", "init.lua": "return {}\n"})
         mkchad_source = self.root / "sources" / "mkchad"
         (mkchad_source / ".gitignore").write_text("opencode-server.json\nlazy-lock.json\n", encoding="ascii")
@@ -243,6 +294,7 @@ class DeploymentExecutionTests(unittest.TestCase):
         return self.deploy.execute_deployment(
             self.repo,
             self.image,
+            self.package,
             release_tag="v2-fixture",
             log_path=self.root / "run.log",
             result_path=self.result,
@@ -265,7 +317,8 @@ class DeploymentExecutionTests(unittest.TestCase):
         self.assertEqual(self._execute(), 0)
         first = self._result()
         self.assertEqual(first["outcome"], "succeeded")
-        self.assertEqual([action["status"] for action in first["actions"]], ["succeeded"] * 8)
+        self.assertEqual([action["status"] for action in first["actions"]], ["succeeded"] * 11)
+        self.assertEqual(first["packages"]["observed"], first["packages"]["expected"])
         for name in ("msk_containers", "container_tools", "mkchad", "opencode-db"):
             destination = self._destination(name)
             self.assertEqual(subprocess.check_output(["git", "-C", str(destination), "rev-parse", "HEAD"], text=True).strip(), self.commits[name])
@@ -291,7 +344,7 @@ class DeploymentExecutionTests(unittest.TestCase):
         self.assertEqual({name: (self._destination("mkchad") / name).read_text(encoding="ascii") for name in preserved}, preserved)
         os.environ["LIFECYCLE_STATUS"] = "healthy"
         self.assertEqual(self._execute("323e4567-e89b-12d3-a456-426614174000"), 0)
-        self.assertEqual([action["status"] for action in self._result()["actions"]], ["succeeded", "skipped-compliant", "skipped-compliant", "skipped-compliant", "succeeded", "succeeded", "skipped-compliant", "succeeded"])
+        self.assertEqual([action["status"] for action in self._result()["actions"]], ["succeeded"] * 4 + ["skipped-compliant"] * 3 + ["succeeded"] * 2 + ["skipped-compliant", "succeeded"])
 
     def test_same_active_digest_skips_all_image_work(self):
         self.assertEqual(self._execute(), 0)
@@ -382,14 +435,14 @@ class DeploymentExecutionTests(unittest.TestCase):
         os.environ["LIFECYCLE_STATUS"] = "inactive"
         self.assertEqual(self._execute("323e4567-e89b-12d3-a456-426614174000"), 0)
         self.assertEqual(launcher.read_bytes(), (self._destination("opencode-db") / "bin" / "opencode-db").read_bytes())
-        self.assertEqual([action["status"] for action in self._result()["actions"]], ["succeeded", "skipped-compliant", "skipped-compliant", "skipped-compliant", "succeeded", "succeeded", "succeeded", "succeeded"])
+        self.assertEqual([action["status"] for action in self._result()["actions"]], ["succeeded", "succeeded", "succeeded", "succeeded", "skipped-compliant", "skipped-compliant", "skipped-compliant", "succeeded", "succeeded", "succeeded", "succeeded"])
 
     def test_opencode_db_action_failure_and_unsafe_launcher_are_reported(self):
         os.environ["OPENCODE_DB_INSTALL_STATUS"] = "7"
         self.assertEqual(self._execute(), 2)
         failed = self._result()
         self.assertEqual(failed["failed_step"], "opencode-db:opencode-db-install")
-        self.assertEqual([action["status"] for action in failed["actions"]], ["succeeded"] * 4 + ["pending", "succeeded", "failed", "pending"])
+        self.assertEqual([action["status"] for action in failed["actions"]], ["succeeded", "succeeded", "pending", "succeeded", "succeeded", "succeeded", "succeeded", "pending", "succeeded", "failed", "pending"])
         os.environ.pop("OPENCODE_DB_INSTALL_STATUS")
         launcher = self.home / ".local" / "bin" / "opencode-db"
         launcher.parent.mkdir(parents=True, exist_ok=True)
@@ -424,12 +477,41 @@ class DeploymentExecutionTests(unittest.TestCase):
         self.assertEqual(self._execute("423e4567-e89b-12d3-a456-426614174000"), 2)
         self.assertEqual((self._destination("mkchad") / "dirty").read_text(encoding="ascii"), "user work\n")
 
+    def test_forged_archive_package_metadata_stops_before_checkout_mutation(self):
+        """Reject an independently forged host archive package claim."""
+        host = next(package for package in self.manifest["artifacts"]["container-tools-package"] if package["role"] == "host")
+        forged = {key: value for key, value in host.items() if key != "sha256"}
+        forged["version"] = "2.0.0-dev"
+        payload = json.dumps(forged, sort_keys=True, separators=(",", ":")).encode("ascii")
+        with tarfile.open(self.package, "w:gz", format=tarfile.PAX_FORMAT) as archive:
+            member = tarfile.TarInfo("container-tools-package.json")
+            member.size = len(payload)
+            member.mode = 0o644
+            member.mtime = 0
+            archive.addfile(member, io.BytesIO(payload))
+        host["sha256"] = hashlib.sha256(self.package.read_bytes()).hexdigest()
+        self._write_manifest()
+        self.assertEqual(self._execute(), 2)
+        self.assertIn("metadata does not match", self._result()["diagnostic"])
+        self.assertFalse(self._destination("msk_containers").exists())
+
+    def test_forged_image_package_metadata_stops_before_checkout_mutation(self):
+        """Reject a syntactically valid but unresolved in-image package identity."""
+        container = next(package for package in self.manifest["artifacts"]["container-tools-package"] if package["role"] == "container")
+        container = {**container, "version": "2.0.0-dev"}
+        self.image.write_text(json.dumps(container, sort_keys=True, separators=(",", ":")), encoding="ascii")
+        self.manifest["artifacts"]["nvim-image"][0]["sha256"] = hashlib.sha256(self.image.read_bytes()).hexdigest()
+        self._write_manifest()
+        self.assertEqual(self._execute("223e4567-e89b-12d3-a456-426614174000"), 2)
+        self.assertIn("image container-tools metadata does not match", self._result()["diagnostic"])
+        self.assertFalse(self._destination("msk_containers").exists())
+
     def test_apply_failure_is_repairable_without_recovery_state(self):
         os.environ["IMAGE_INSTALL_STATUS"] = "7"
         self.assertEqual(self._execute(), 2)
         failed = self._result()
         self.assertEqual(failed["failed_step"], "msk_containers:image-install")
-        self.assertEqual([action["status"] for action in failed["actions"]], ["succeeded", "succeeded", "succeeded", "failed", "pending", "succeeded", "pending", "pending"])
+        self.assertEqual([action["status"] for action in failed["actions"]], ["succeeded", "succeeded", "pending", "succeeded", "succeeded", "succeeded", "failed", "pending", "succeeded", "pending", "pending"])
         self.assertFalse(list(self.state.rglob("*journal*")))
         self.assertFalse(list(self.state.rglob("*recovery*")))
         os.environ.pop("IMAGE_INSTALL_STATUS")

@@ -54,6 +54,8 @@ class ReleaseLauncherTests(unittest.TestCase):
         self.addCleanup(setattr, tempfile, "tempdir", previous_tempdir)
         self.image = self.root / "image with spaces.sif"
         self.image.write_bytes(b"image")
+        self.package = self.root / "container-tools-host.tar.gz"
+        self.package.write_bytes(b"package")
 
     def tearDown(self):
         shutil.rmtree(self.root, ignore_errors=True)
@@ -88,7 +90,7 @@ mode = os.environ.get('MKCHAD_RELEASE_CHILD_MODE', 'success')
 child_exit = int(os.environ.get('MKCHAD_RELEASE_CHILD_EXIT', '0'))
 if mode not in ('missing', 'stale'):
     document = {
-        'schema': 1,
+        'schema': 2,
         'run_id': run_id if mode != 'wrong-run' else '123e4567-e89b-12d3-a456-426614174000',
         'release': release,
         'started_at': '2026-08-02T12:00:00Z',
@@ -105,6 +107,7 @@ if mode not in ('missing', 'stale'):
             ]
         ],
         'artifact': {'architecture': 'x86_64', 'expected_sha256': '0' * 64, 'observed_sha256': None},
+        'packages': {'expected': [{'role': role, 'architecture': 'x86_64', 'version': '0.0.0', 'product_major': 0, 'source_commit': '0' * 40, 'sha256': '0' * 64, 'libc': 'glibc', 'source_filename_class': 'container-tools-package'} for role in ('host', 'container')], 'observed': [None, None]},
         'actions': [],
         'configuration_handoff': {
             'state': 'configuration-pending', 'contract_version': 1, 'guidance': 'docs/deployment/README.md',
@@ -152,7 +155,7 @@ raise SystemExit(child_exit)
         if capture:
             environment["MKCHAD_RELEASE_CAPTURE"] = str(capture)
         with mock.patch.dict(os.environ, environment, clear=False), mock.patch.object(self.launcher, "DEFAULT_REMOTE", str(remote)), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-            result = self.launcher.main(["--release", release, "--image", str(self.image), *extra])
+            result = self.launcher.main(["--release", release, "--image", str(self.image), "--container-tools-host-package", str(self.package), *extra])
         return result, stdout.getvalue(), stderr.getvalue()
 
     @property
@@ -225,7 +228,7 @@ raise SystemExit(child_exit)
         _, remote, _ = self.remote_with_release()
         for extra in (("--remote", "elsewhere"), ("--expected-parent-commit", "a" * 40), ("recover",)):
             with self.subTest(extra=extra), mock.patch.object(self.launcher, "DEFAULT_REMOTE", str(remote)), self.assertRaises(SystemExit) as raised:
-                self.launcher.main(["--release", "v1", "--image", str(self.image), *extra])
+                self.launcher.main(["--release", "v1", "--image", str(self.image), "--container-tools-host-package", str(self.package), *extra])
             self.assertEqual(raised.exception.code, 2)
         self.assertFalse(self.deploy_root.exists())
 
@@ -302,7 +305,7 @@ raise SystemExit(child_exit)
         with mock.patch.dict(os.environ, {"HOME": str(self.home), "XDG_STATE_HOME": str(self.state)}, clear=False), mock.patch.object(
             self.launcher, "_checkout_release", return_value=(checkout, deployer)
         ), mock.patch.object(self.launcher, "_run", side_effect=interrupt):
-            self.assertEqual(self.launcher.main(["--release", "v1", "--image", str(self.image)]), 2)
+            self.assertEqual(self.launcher.main(["--release", "v1", "--image", str(self.image), "--container-tools-host-package", str(self.package)]), 2)
         self.assertEqual(self.latest_result()["outcome"], "interrupted")
 
     def test_contention_does_not_rotate_logs_or_replace_the_result(self):
