@@ -174,6 +174,40 @@ checkouts, unsafe installer outputs, and invalid image inputs.
 If an action fails, prior successful changes remain. Repair the reported step
 and rerun the same command; no rollback or recovery command exists.
 
+## Runtime Evidence
+
+The workspace-level release binding gate consumes the finalized child
+`container-tools.runtime-evidence/v1` validator and the parent selected-root
+harness. Run its deterministic, credential-free fixture gate from the workspace
+root:
+
+```bash
+bash tests/container_tools_release_runtime_test.sh --self-test
+```
+
+The fixture creates a temporary package archive, image metadata document,
+runtime report, terminal schema-2 result, and root binding document beneath
+`/tmp/mkchad-v1`. It verifies the selected workspace `HEAD`, finalized
+`msk_containers` commit `c954465f9ce10b0552686ee811d3fec48993c80f`, and nested
+`container_tools` commit `22c803fb981a61db4cdeb5310df0301f238458ba`. It then
+binds the release manifest's host and container identities to the archive
+digest and metadata, the image digest and metadata, the report source and
+manifest digests, schema-2 expected/observed package identities, exact cleanup,
+redaction, and exactly one outer launch, manifest publication, nested dispatch,
+and payload. The synthetic report proves this admission boundary only; it is not
+Bash parity, image operability, or a native backend claim.
+
+The checked-in release authority does not currently select final immutable
+package and image candidates for those finalized commits. Consequently
+`bash tests/container_tools_release_runtime_test.sh --native` returns `77` and
+does not substitute prior package bytes, assign an image digest, or upgrade
+fixture evidence to a runtime claim. Native parity remains unavailable without
+the retained matching Bash baseline and unchanged parity image. Final-image
+operability remains unavailable without a final immutable image, exact host and
+in-container package identities, and a release-specific selected-root runner.
+These are distinct claims; a final image can establish operability but never
+historical Bash parity.
+
 ## Diagnostics And Configuration
 
 The launcher streams Git and deployer output to the terminal and writes the
