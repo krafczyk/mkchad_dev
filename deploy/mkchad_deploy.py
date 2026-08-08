@@ -218,14 +218,7 @@ def validate_release_v2_document(document: dict) -> dict:
     if container_actions != PACKAGE_ACTIONS:
         raise DeploymentError("container-tools package actions are incomplete or out of order")
     msk_actions = next(component["actions"] for component in components if component["name"] == "msk_containers")
-    expected_msk_actions = [
-        {"id": "host-tools-preflight", "phase": "preflight", "path": "bin/install_nvim.sh", "args": ["--check", "--recovery-dir", {"token": "recovery_dir"}, *HOST_PACKAGE_ARGS]},
-        {"id": "image-install-preflight", "phase": "preflight", "path": "nvim/bin/install_nvim_container", "args": ["--dry-run", "--source-revision", {"token": "component_revision"}, {"token": "staged_image"}]},
-        {"id": "host-tools-install", "phase": "apply", "path": "bin/install_nvim.sh", "args": ["--recovery-dir", {"token": "recovery_dir"}, *HOST_PACKAGE_ARGS]},
-        {"id": "image-install", "phase": "apply", "path": "nvim/bin/install_nvim_container", "args": ["--source-revision", {"token": "component_revision"}, {"token": "staged_image"}]},
-        {"id": "host-tools-verify", "phase": "verify", "path": "bin/install_nvim.sh", "args": ["--check", "--recovery-dir", {"token": "recovery_dir"}, *HOST_PACKAGE_ARGS]},
-    ]
-    if msk_actions != expected_msk_actions:
+    if msk_actions != DEVELOPER_ACTIONS:
         raise DeploymentError("msk container-tools actions are incomplete or out of order")
     serialized = json.dumps(document, sort_keys=True)
     if "host-bridge" in serialized or "host_bridge" in serialized:
@@ -330,10 +323,6 @@ def validate_result_v2_document(document: dict) -> dict:
     if not isinstance(document.get("log_path"), str) or not document["log_path"].startswith("/") or any(part in {"", ".", ".."} for part in pathlib.PurePosixPath(document["log_path"]).parts[1:]):
         raise DeploymentError("malformed terminal result log path")
     return document
-
-
-# Schema-1 callers were removed with schema-2 package identity reporting.
-validate_result_v1_document = validate_result_v2_document
 
 
 def _roots() -> dict[str, pathlib.Path]:

@@ -162,7 +162,7 @@ class DeploymentContractTests(unittest.TestCase):
             malformed = copy.deepcopy(result)
             mutate(malformed)
             with self.assertRaises(self.deploy.DeploymentError):
-                self.deploy.validate_result_v1_document(malformed)
+                self.deploy.validate_result_v2_document(malformed)
 
 
 class DeploymentExecutionTests(unittest.TestCase):

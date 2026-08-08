@@ -31,7 +31,7 @@ def load_result_validator():
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
-    return module.validate_result_v1_document
+    return module.validate_result_v2_document
 
 
 class ReleaseLauncherTests(unittest.TestCase):

@@ -148,7 +148,7 @@ spec = importlib.util.spec_from_file_location("mkchad_deploy", sys.argv[1])
 module = importlib.util.module_from_spec(spec)
 assert spec.loader is not None
 spec.loader.exec_module(module)
-module.validate_result_v1_document(json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")))
+module.validate_result_v2_document(json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")))
 PY
 }
 
