@@ -53,22 +53,45 @@ Run the repository-local developer command only from the canonical parent Git
 top level:
 
 ```bash
-./deploy/mkchad_develop.py [--image PATH] --container-tools-host-package PATH \
-  --container-tools-host-sha256 SHA256 --container-tools-host-version VERSION \
-  --container-tools-host-source-commit COMMIT \
-  --container-tools-host-architecture ARCH --container-tools-host-libc musl|glibc \
+./deploy/mkchad_develop.py --image PATH --container-tools-source PATH \
   [--replace-partial]
 ```
 
 It is a developer workflow, not a release. The source authority is the exact
 clean committed `HEAD` of the checked-out `msk_containers`, its nested
-`container_tools`, `mkchad`, and `opencode-db` repositories. The parent repository may be
-dirty. Child origins may be forked or missing, and unpublished local commits
-work without network access. Parent and nested gitlink revisions are not
-authority. Any dirty, staged, untracked, unmerged, renamed, or type-changing
-child bytes are rejected before target mutation. The supplied archive must hash
-to the supplied identity and its source commit must equal the admitted pinned
-`container_tools` child; the nested gitlink is never used as a fallback.
+`container_tools`, `mkchad`, and `opencode-db` repositories. The parent
+repository may be dirty. Child origins may be forked or missing, and unpublished
+local commits work without network access. Parent and nested gitlink revisions
+are not authority. Any dirty, staged, untracked, unmerged, renamed, or
+type-changing child bytes are rejected before target mutation.
+`--container-tools-source` must name a clean `container_tools` Git top-level at
+exactly the admitted nested child commit; the nested gitlink is never used as a
+fallback.
+
+The command stages that source's admitted exact commit into an invocation-private
+directory below `/tmp/mkchad-v1/container-tools-c11`, then builds one static musl
+host archive there while holding both the shared invocation lock and a fixed
+build-root-global nonblocking lock. The latter spans stale-run reclamation,
+staging, building, deployment, and result publication, so commands using
+different XDG state roots cannot reclaim each other's active build directories.
+When that build lock is busy, the command publishes a controlled developer
+failure result in its own state root. It calls the
+source-owned `scripts/build-package.sh` with its admitted commit, build/output
+directories, and `--libc musl`. Callers cannot choose a package archive, digest,
+version, architecture, source commit, or libc. The command bounds the build to
+five minutes, computes the archive SHA-256, verifies the generated `.sha256`
+content against that digest and archive basename, and derives its identity from
+`archive.json`. The identity must match the admitted commit, native architecture,
+and musl before passing it to the regular deployer; source-owned builder and
+archive validation handle malformed `VERSION` content.
+After it publishes a normal, controlled-failure, or interrupted terminal result,
+the command immediately makes one best-effort cleanup attempt for its `run-*`
+directory while still holding the build lock. Cleanup errors and interruption
+are suppressed so they cannot replace that result. The next command invocation
+reclaims only `run-*` residue left by an uncatchable interruption or crash. Build
+and Git/runtime command output is captured concurrently, decoded as UTF-8 with
+replacement, and limited to 1 MiB per channel; output beyond that limit fails
+the run with a controlled diagnostic.
 
 The command stages those four local commits and then follows the regular
 deployment procedure. Destinations still require their canonical origins and
@@ -80,16 +103,14 @@ Repair the reported issue and rerun the same command; `--replace-partial`
 asserts inactivity only when replacing a target that has managed paths but no
 lifecycle launcher.
 
-`--image` is optional. When it is omitted, the command preserves active image
-state without making a compatibility judgment and performs no image validation,
-installation, activation, rotation, pruning, or image verification. When a
-supplied image has the same digest as the valid active image, every image action
-is skipped and the existing image topology is unchanged. When the active image
-is different or absent, the supplied image receives intrinsic validation and
-the regular installer path. An unsafe active selector blocks supplied-image
-mutation. Only the active selected image qualifies for digest reuse; previous
-or other inactive images do not. A developer caller-supplied SIF is always
-preserved, including after a changed-image installation or failure.
+`--image` is required. When its digest matches the valid active image, every
+image action is skipped and the existing image topology is unchanged. When the
+active image is different or absent, the supplied image receives intrinsic
+validation and the regular installer path. An unsafe active selector blocks
+supplied-image mutation. Only the active selected image qualifies for digest
+reuse; previous or other inactive images do not. A developer caller-supplied
+SIF is always preserved, including after a changed-image installation or
+failure.
 
 Developer runs atomically publish a mode-tagged result at the shared
 `latest-result.json` path with local workspace, selected-commit, action, image,
@@ -123,15 +144,16 @@ wheel and virtual-environment installation remains independently supported.
 
 ## Container Tools Packages
 
-`container_tools` is one product, not a host-bridge component. Release and
-developer deployment require one explicit host archive. The deployer privately
+`container_tools` is one product, not a host-bridge component. Release
+deployment requires one explicit host archive. Developer deployment builds that
+archive automatically from its admitted source checkout. The deployer privately
 stages its exact bytes, reads `archive.json` from the versioned package root,
 binds the outer archive digest as the closed host identity, and resolves action
 arguments only from the selected release/developer identity; callers cannot
 supply internal action tokens. The pinned package verifier then checks the full
 archive before mutation. A supplied or reused image must expose the separately
-verified container identity at `/etc/mkchad/container-tools-package.json`.
-Both metadata documents must exactly match their selected identities.
+verified container identity at `/etc/mkchad/container-tools-package.json`. Both
+metadata documents must exactly match their selected identities.
 
 Host and in-container package identities may use different exact versions and
 source commits only when their `product_major` values match. A cross-major pair

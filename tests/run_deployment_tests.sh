@@ -23,6 +23,7 @@ export MKCHAD_TRUST_GROUP_WRITABLE_ROOTS=caller-value
 
 python3 -m py_compile deploy/mkchad_release.py deploy/mkchad_develop.py deploy/mkchad_deploy.py
 python3 -m unittest -v tests.test_mkchad_release tests.test_mkchad_develop tests.test_mkchad_deploy
+bash tests/container_tools_real_builder_gate.sh
 
 cat > "$canonical/bin/apptainer" <<'SH'
 #!/usr/bin/env sh
@@ -44,6 +45,51 @@ exit 0
 SH
 chmod 755 "$canonical/components/container_tools/tool.sh"
 mkdir -p "$canonical/components/container_tools/scripts"
+printf '%s\n' '1.0.0-dev' > "$canonical/components/container_tools/VERSION"
+cat > "$canonical/components/container_tools/scripts/build-package.sh" <<'SH'
+#!/usr/bin/env sh
+set -eu
+build_root= source_commit= output_dir= libc=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --build-root) build_root=$2; shift 2 ;;
+    --source-commit) source_commit=$2; shift 2 ;;
+    --output-dir) output_dir=$2; shift 2 ;;
+    --libc) libc=$2; shift 2 ;;
+    *) exit 2 ;;
+  esac
+done
+[ "$libc" = musl ] || exit 2
+mkdir -p "$build_root" "$output_dir"
+python3 - "$output_dir" "$source_commit" "$(cat "$(dirname "$0")/../VERSION")" <<'PY'
+import hashlib
+import gzip
+import io
+import json
+import os
+import pathlib
+import sys
+import tarfile
+
+output, commit, version = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+architecture = {"amd64": "x86_64", "arm64": "aarch64"}.get(os.uname().machine.lower(), os.uname().machine.lower())
+name = f"container-tools-{version}-{architecture}-musl-{commit}.tar.gz"
+archive = output / name
+metadata = {"schema": "container-tools.archive/v1", "architecture": architecture, "version": version, "source_commit": commit, "libc": "musl"}
+payload = json.dumps(metadata, sort_keys=True, separators=(",", ":")).encode("ascii")
+root = name.removesuffix(".tar.gz")
+with archive.open("wb") as raw, gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as compressed, tarfile.open(fileobj=compressed, mode="w", format=tarfile.PAX_FORMAT) as handle:
+    directory = tarfile.TarInfo(root)
+    directory.type, directory.mode, directory.mtime = tarfile.DIRTYPE, 0o755, 0
+    handle.addfile(directory)
+    member = tarfile.TarInfo(f"{root}/archive.json")
+    member.size, member.mode, member.mtime = len(payload), 0o644, 0
+    handle.addfile(member, io.BytesIO(payload))
+(output / f"{name}.sha256").write_text(f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {name}\n", encoding="ascii")
+print(archive)
+PY
+SH
+chmod 755 "$canonical/components/container_tools/scripts/build-package.sh"
 cat > "$canonical/components/container_tools/scripts/install-package.sh" <<'SH'
 #!/usr/bin/env sh
 set -eu
@@ -269,27 +315,15 @@ developer_runtime="$developer/runtime"
 developer_tmp="$developer/tmp"
 mkdir -p "$developer_home/containers" "$developer_config" "$developer_data" "$developer_state" "$developer_runtime" "$developer_tmp"
 chmod 700 "$developer_home" "$developer_config" "$developer_data" "$developer_state" "$developer_runtime" "$developer_tmp"
-developer_package="$developer/container-tools-host.tar.gz"
+developer_package=$("$tools/scripts/build-package.sh" --build-root "$developer/package-build" --source-commit "$tools_commit" --output-dir "$developer/package-output" --libc musl)
 python3 - "$developer_package" "$developer_home/containers/active.sif" "$tools_commit" <<'PY'
 import hashlib
-import io
 import json
 import pathlib
 import sys
-import tarfile
 
 package, image, commit = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), sys.argv[3]
-archive_identity = {"schema": "container-tools.archive/v1", "architecture": "x86_64", "version": "1.0.0-dev", "source_commit": commit, "libc": "glibc"}
-payload = json.dumps(archive_identity, sort_keys=True, separators=(",", ":")).encode()
-package_root = f"container-tools-{archive_identity['version']}-{archive_identity['architecture']}-{archive_identity['libc']}-{archive_identity['source_commit']}"
-with tarfile.open(package, "w:gz", format=tarfile.PAX_FORMAT) as archive:
-    directory = tarfile.TarInfo(package_root)
-    directory.type, directory.mode, directory.mtime = tarfile.DIRTYPE, 0o755, 0
-    archive.addfile(directory)
-    member = tarfile.TarInfo(f"{package_root}/archive.json")
-    member.size, member.mode, member.mtime = len(payload), 0o644, 0
-    archive.addfile(member, io.BytesIO(payload))
-identity = {"role": "host", "architecture": "x86_64", "version": "1.0.0-dev", "product_major": 1, "source_commit": commit, "libc": "glibc", "source_filename_class": "container-tools-package"}
+identity = {"role": "host", "architecture": "x86_64", "version": "1.0.0-dev", "product_major": 1, "source_commit": commit, "libc": "musl", "source_filename_class": "container-tools-package"}
 identity["sha256"] = hashlib.sha256(package.read_bytes()).hexdigest()
 image.write_text(json.dumps({**identity, "role": "container"}, sort_keys=True, separators=(",", ":")))
 PY
@@ -301,11 +335,11 @@ developer_package_sha=$(sha256sum "$developer_package" | cut -d' ' -f1)
 run_developer() {
   (
     cd "$workspace"
-    env HOME="$developer_home" XDG_CONFIG_HOME="$developer_config" XDG_DATA_HOME="$developer_data" XDG_STATE_HOME="$developer_state" XDG_RUNTIME_DIR="$developer_runtime" TMPDIR="$developer_tmp" NVIM_CONTAINER_DIR="$developer_home/containers" ./deploy/mkchad_develop.py "$@" --container-tools-host-package "$developer_package" --container-tools-host-sha256 "$developer_package_sha" --container-tools-host-version 1.0.0-dev --container-tools-host-source-commit "$tools_commit" --container-tools-host-architecture x86_64 --container-tools-host-libc glibc
+    env HOME="$developer_home" XDG_CONFIG_HOME="$developer_config" XDG_DATA_HOME="$developer_data" XDG_STATE_HOME="$developer_state" XDG_RUNTIME_DIR="$developer_runtime" TMPDIR="$developer_tmp" NVIM_CONTAINER_DIR="$developer_home/containers" ./deploy/mkchad_develop.py "$@" --container-tools-source "$tools"
   )
 }
 
-run_developer --replace-partial
+run_developer --image "$developer_home/containers/active.sif" --replace-partial
 python3 - "$developer_state/mkchad/deploy/latest-result.json" "$msk_commit" "$tools_commit" "$mkchad_commit" "$opencode_db_commit" <<'PY'
 import json
 import pathlib
@@ -316,8 +350,8 @@ assert result["mode"] == "developer"
 assert result["outcome"] == "succeeded"
 assert result["diagnostic"] == "developer deployment verified"
 assert result["workspace"]["dirty"] is True
-assert result["image"]["choice"] == "omitted"
-assert all("image" not in action["id"] for action in result["actions"])
+assert result["image"]["choice"] == "reused"
+assert {action["id"]: action["status"] for action in result["actions"] if "image" in action["id"]} == {"image-install-preflight": "skipped-compliant", "image-install": "skipped-compliant"}
 assert {item["name"]: item["observed_commit"] for item in result["components"]} == dict(zip(("msk_containers", "container_tools", "mkchad", "opencode-db"), sys.argv[2:]))
 PY
 test "$(git -C "$developer_data/mkchad/components/msk_containers" rev-parse HEAD)" = "$msk_commit"
@@ -351,7 +385,7 @@ import pathlib
 import sys
 
 path, commit, digest = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
-path.write_text(json.dumps({"role": "container", "architecture": "x86_64", "version": "1.0.0-dev", "product_major": 1, "source_commit": commit, "sha256": digest, "libc": "glibc", "source_filename_class": "container-tools-package"}, sort_keys=True, separators=(",", ":")) + "\n")
+path.write_text(json.dumps({"role": "container", "architecture": "x86_64", "version": "1.0.0-dev", "product_major": 1, "source_commit": commit, "sha256": digest, "libc": "musl", "source_filename_class": "container-tools-package"}, sort_keys=True, separators=(",", ":")) + "\n")
 PY
 changed_digest=$(sha256sum "$changed_image" | cut -d' ' -f1)
 run_developer --image "$changed_image"

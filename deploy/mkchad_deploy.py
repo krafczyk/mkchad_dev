@@ -43,6 +43,7 @@ CONFIGURATION_COMPONENTS = frozenset(name for name, disposition in COMPONENTS.it
 PHASES = ("preflight", "apply", "verify")
 TOKENS = frozenset({"recovery_dir", "staged_image", "component_revision"})
 ARCHITECTURES = frozenset({"x86_64", "aarch64", "ppc64le"})
+CAPTURE_LIMIT = 1024 * 1024
 PACKAGE_TOKENS = frozenset({
     "staged_container_tools_host_package", "container_tools_host_sha256",
     "container_tools_host_version",
@@ -337,34 +338,104 @@ def _roots() -> dict[str, pathlib.Path]:
 
 
 def _terminate_group(process: subprocess.Popen):
-    """Terminate one live subprocess group and wait for its leader."""
-    with contextlib.suppress(ProcessLookupError):
-        os.killpg(process.pid, signal.SIGTERM)
+    """Terminate one subprocess group while retaining its leader as the PGID anchor."""
+    leader_unreaped = process.returncode is None
     try:
-        process.wait(timeout=5)
-        return
-    except subprocess.TimeoutExpired:
-        pass
-    with contextlib.suppress(ProcessLookupError):
-        os.killpg(process.pid, signal.SIGKILL)
-    process.wait(timeout=5)
+        if not leader_unreaped:
+            return
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGTERM)
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                if os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None:
+                    break
+            except ChildProcessError:
+                # Another observer reaped the leader, so its old PGID is unsafe to signal.
+                leader_unreaped = False
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(0.1, remaining))
+    finally:
+        if leader_unreaped:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired as exc:
+                raise DeploymentError("process-group cleanup did not complete") from exc
+
+
+def _close_capture_pipes(process: subprocess.Popen):
+    """Close captured pipes after cleanup so escaped descendants cannot retain them."""
+    for pipe in (process.stdout, process.stderr):
+        if pipe is not None:
+            with contextlib.suppress(OSError):
+                pipe.close()
 
 
 def _capture(command: list[str], *, cwd: pathlib.Path | None = None, env: dict[str, str] | None = None, timeout: float = 300) -> subprocess.CompletedProcess:
-    """Run one bounded command in a new process group and capture its output."""
+    """Run one bounded command with concurrent, size-limited UTF-8 output capture.
+
+    Raises:
+        DeploymentError: If startup fails, either retained output channel exceeds
+            :data:`CAPTURE_LIMIT`, the command times out, or group cleanup is
+            uncertain.
+    """
     try:
-        process = subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True, close_fds=True)
-        stdout, stderr = process.communicate(timeout=timeout)
-    except KeyboardInterrupt:
-        if "process" in locals():
-            _terminate_group(process)
-        raise
-    except subprocess.TimeoutExpired as exc:
-        _terminate_group(process)
-        raise DeploymentError(f"command timed out after {timeout:g} seconds: {command[0]}") from exc
+        process = subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True, close_fds=True)
     except OSError as exc:
         raise DeploymentError(f"command could not start: {command[0]}") from exc
-    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+    assert process.stdout is not None and process.stderr is not None
+    selector = selectors.DefaultSelector()
+    captured = {"stdout": bytearray(), "stderr": bytearray()}
+    selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+    selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+    deadline = time.monotonic() + timeout
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(command, timeout)
+            for key, _ in selector.select(min(0.1, remaining)):
+                data = os.read(key.fileobj.fileno(), 65536)
+                if not data:
+                    selector.unregister(key.fileobj)
+                    continue
+                channel = key.data
+                if len(captured[channel]) + len(data) > CAPTURE_LIMIT:
+                    raise DeploymentError(f"command {channel} output exceeded {CAPTURE_LIMIT} byte capture limit: {command[0]}")
+                captured[channel].extend(data)
+        process.wait(timeout=max(0.1, deadline - time.monotonic()))
+    except KeyboardInterrupt:
+        try:
+            _terminate_group(process)
+        finally:
+            _close_capture_pipes(process)
+        raise
+    except subprocess.TimeoutExpired as exc:
+        try:
+            _terminate_group(process)
+        finally:
+            _close_capture_pipes(process)
+        raise DeploymentError(f"command timed out after {timeout:g} seconds: {command[0]}") from exc
+    except DeploymentError:
+        try:
+            _terminate_group(process)
+        finally:
+            _close_capture_pipes(process)
+        raise
+    finally:
+        selector.close()
+        _close_capture_pipes(process)
+    return subprocess.CompletedProcess(
+        command,
+        process.returncode,
+        bytes(captured["stdout"]).decode("utf-8", errors="replace"),
+        bytes(captured["stderr"]).decode("utf-8", errors="replace"),
+    )
 
 
 def _git(arguments: list[str], cwd: pathlib.Path | None = None, check: bool = True) -> subprocess.CompletedProcess:

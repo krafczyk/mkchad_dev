@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import tempfile
 import tarfile
+import time
 import unittest
 from unittest import mock
 import sys
@@ -53,7 +54,12 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         self.workspace = self.root / "workspace"
         self._init(self.workspace, {"README": "parent\n"})
         tools = self.root / "tools"
-        self._init(tools, {"tool.sh": "#!/bin/sh\nexit 0\n", "scripts/install-package.sh": "#!/bin/sh\nexit 0\n"})
+        self._init(tools, {
+            "tool.sh": "#!/bin/sh\nexit 0\n",
+            "VERSION": "1.0.0-dev\n",
+            "scripts/build-package.sh": "#!/bin/sh\nexit 0\n",
+            "scripts/install-package.sh": "#!/bin/sh\nexit 0\n",
+        })
         (tools / "scripts/install-package.sh").chmod(0o755)
         msk = self.root / "msk"
         self._init(msk, {"bin/install_nvim.sh": "#!/bin/sh\nexit 0\n", "nvim/bin/install_nvim_container": "#!/bin/sh\nexit 0\n"})
@@ -80,10 +86,16 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         self.mkchad = self.workspace / "mkchad"
         self.database = self.workspace / "opencode-db"
         self.package = self.root / "container-tools-host.tar.gz"
-        archive_metadata = {"schema": "container-tools.archive/v1", "architecture": self.deploy._native_architecture(), "version": "1.0.0-dev", "source_commit": self._commit_value(self.tools), "libc": "glibc"}
+        self.built_package = self.root / "container-tools-host-musl.tar.gz"
+        self._write_package(self.package, "glibc")
+        self._write_package(self.built_package, "musl")
+
+    def _write_package(self, path, libc):
+        """Write one synthetic archive whose metadata matches the tools checkout."""
+        archive_metadata = {"schema": "container-tools.archive/v1", "architecture": self.deploy._native_architecture(), "version": "1.0.0-dev", "source_commit": self._commit_value(self.tools), "libc": libc}
         payload = json.dumps(archive_metadata, sort_keys=True, separators=(",", ":")).encode("ascii")
         package_root = f"container-tools-{archive_metadata['version']}-{archive_metadata['architecture']}-{archive_metadata['libc']}-{archive_metadata['source_commit']}"
-        with tarfile.open(self.package, "w:gz", format=tarfile.PAX_FORMAT) as archive:
+        with tarfile.open(path, "w:gz", format=tarfile.PAX_FORMAT) as archive:
             directory = tarfile.TarInfo(package_root)
             directory.type = tarfile.DIRTYPE
             directory.mode = 0o755
@@ -126,10 +138,11 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         identity.update(role="container", product_major=1, source_filename_class="container-tools-package")
         path.write_text(json.dumps(identity, sort_keys=True, separators=(",", ":")), encoding="ascii")
 
-    def _command_package_args(self):
-        """Return the public CLI representation of the synthetic archive identity."""
-        identity = self._package_kwargs()["host_package_identity"]
-        return ["--container-tools-host-package", str(self.package), "--container-tools-host-sha256", identity["sha256"], "--container-tools-host-version", identity["version"], "--container-tools-host-source-commit", identity["source_commit"], "--container-tools-host-architecture", identity["architecture"], "--container-tools-host-libc", identity["libc"]]
+    def _command_args(self, image=None, source=None):
+        """Return the reduced public command interface for the fixture sources."""
+        image = image or self.root / "image.sif"
+        image.write_bytes(b"image")
+        return ["--image", str(image), "--container-tools-source", str(source or self.tools)]
 
     def test_clean_unpublished_heads_are_staged_from_local_objects_with_dirty_parent_allowed(self):
         (self.workspace / "parent-untracked").write_text("allowed\n", encoding="ascii")
@@ -385,51 +398,601 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         with lock.open("w") as handle:
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
             with mock.patch.dict(os.environ, {"HOME": str(self.root / "home"), "XDG_STATE_HOME": str(state)}, clear=False), contextlib.redirect_stderr(terminal):
-                self.assertEqual(command.main(["--image", str(image), *self._command_package_args()]), 2)
+                self.assertEqual(command.main(self._command_args(image)), 2)
         self.assertIn("another invocation", terminal.getvalue())
         self.assertFalse((state / "mkchad" / "deploy" / "latest-result.json").exists())
 
-    def test_public_command_accepts_an_omitted_image(self):
+    def test_public_command_has_only_the_reduced_required_interface(self):
         command = load_developer_command()
         state = self.root / "state"
 
-        with mock.patch.dict(os.environ, {"HOME": str(self.root / "home"), "XDG_STATE_HOME": str(state)}, clear=False), mock.patch.object(
+        with mock.patch.object(command.pathlib.Path, "cwd", return_value=self.workspace), mock.patch.dict(os.environ, {"HOME": str(self.root / "home"), "XDG_STATE_HOME": str(state)}, clear=False), mock.patch.object(
+            command, "_build_host_package", return_value=(self.built_package, {**self._package_kwargs()["host_package_identity"], "libc": "musl"})
+        ), mock.patch.object(
             command.deploy, "execute_developer_deployment", return_value=2
         ) as execute:
-            self.assertEqual(command.main(self._command_package_args()), 2)
+            self.assertEqual(command.main(self._command_args()), 2)
 
-        self.assertIsNone(execute.call_args.args[1])
+        self.assertEqual(execute.call_args.args[1], (self.root / "image.sif").absolute())
+        self.assertEqual(execute.call_args.args[2], self.built_package)
+        self.assertEqual(execute.call_args.kwargs["host_package_identity"]["libc"], "musl")
+        with self.assertRaises(SystemExit):
+            command.main(["--container-tools-host-package", str(self.package)])
+        with self.assertRaises(SystemExit):
+            command.main([*self._command_args(), "--libc", "musl"])
+
+    def test_build_invocation_uses_source_commit_musl_and_derived_identity(self):
+        command = load_developer_command()
+        command.BUILD_ROOT.mkdir(parents=True, exist_ok=True)
+        build_root = pathlib.Path(tempfile.mkdtemp(prefix="mkchad-develop-build-", dir="/tmp/mkchad-v1/container-tools-c11"))
+        self.addCleanup(shutil.rmtree, build_root, True)
+        commands = []
+
+        def build(argv, **kwargs):
+            commands.append(argv)
+            output = pathlib.Path(argv[argv.index("--output-dir") + 1])
+            output.mkdir(parents=True)
+            shutil.copyfile(self.built_package, output / "container-tools-host.tar.gz")
+            digest = hashlib.sha256(self.built_package.read_bytes()).hexdigest()
+            (output / "container-tools-host.tar.gz.sha256").write_text(f"{digest}  container-tools-host.tar.gz\n", encoding="ascii")
+            return subprocess.CompletedProcess(argv, 0, stdout="built\n", stderr="")
+
+        source_commit = self._commit_value(self.tools)
+        with mock.patch.object(command.deploy, "_capture", side_effect=build) as capture:
+            archive, identity = command._build_host_package(self.tools, source_commit, build_root)
+
+        self.assertEqual(archive.name, "container-tools-host.tar.gz")
+        self.assertEqual(identity["sha256"], hashlib.sha256(self.built_package.read_bytes()).hexdigest())
+        self.assertEqual(identity["version"], "1.0.0-dev")
+        self.assertEqual(identity["source_commit"], source_commit)
+        self.assertEqual(identity["libc"], "musl")
+        self.assertEqual(commands[0][0], str(self.tools / "scripts/build-package.sh"))
+        self.assertEqual(commands[0][commands[0].index("--source-commit") + 1], source_commit)
+        self.assertEqual(commands[0][commands[0].index("--libc") + 1], "musl")
+        self.assertNotIn("--version", commands[0])
+        self.assertEqual(capture.call_args.kwargs, {"timeout": command.BUILD_TIMEOUT})
+
+    def test_public_command_builds_from_a_private_exact_commit_checkout(self):
+        command = load_developer_command()
+        state = self.root / "state"
+        build_root = self.root / "container-tools-c11"
+        observed = {}
+
+        def build(source, source_commit, temporary, log):
+            observed["source"] = source
+            observed["commit"] = source_commit
+            observed["temporary"] = temporary
+            self.assertNotEqual(source, self.tools)
+            self.assertEqual(self._commit_value(source), source_commit)
+            self.assertEqual((source / "VERSION").read_text(encoding="ascii"), "1.0.0-dev\n")
+            return self.built_package, {**self._package_kwargs()["host_package_identity"], "libc": "musl"}
+
+        with mock.patch.object(command.pathlib.Path, "cwd", return_value=self.workspace), mock.patch.dict(
+            os.environ, {"HOME": str(self.root / "home"), "XDG_STATE_HOME": str(state)}, clear=False
+        ), mock.patch.object(command, "BUILD_ROOT", build_root), mock.patch.object(
+            command, "_build_host_package", side_effect=build
+        ), mock.patch.object(command.deploy, "execute_developer_deployment", return_value=2):
+            self.assertEqual(command.main(self._command_args()), 2)
+
+        self.assertEqual(observed["commit"], self._commit_value(self.tools))
+        self.assertFalse(observed["temporary"].exists())
+
+    def test_stale_build_reclamation_leaves_non_run_entries_untouched(self):
+        command = load_developer_command()
+        build_root = self.root / "container-tools-c11"
+        stale = build_root / "run-old"
+        retained = build_root / "keep"
+        run_file = build_root / "run-output.txt"
+        build_root.mkdir()
+        stale.mkdir()
+        retained.mkdir()
+        run_file.write_text("retain\n", encoding="ascii")
+        (build_root / "run-link").symlink_to(retained)
+
+        with mock.patch.object(command, "BUILD_ROOT", build_root):
+            command._reclaim_stale_build_runs()
+
+        self.assertFalse(stale.exists())
+        self.assertTrue(retained.is_dir())
+        self.assertTrue(run_file.is_file())
+        self.assertTrue((build_root / "run-link").is_symlink())
+
+    def test_cleanup_error_after_verified_deploy_does_not_replace_its_result(self):
+        command = load_developer_command()
+        state = self.root / "state"
+        build_root = self.root / "container-tools-c11"
+
+        def deploy_success(*args, **kwargs):
+            kwargs["result_path"].write_text(
+                json.dumps(
+                    {
+                        "mode": "developer",
+                        "run_id": kwargs["run_id"],
+                        "log_path": str(kwargs["log_path"]),
+                        "outcome": "succeeded",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return 0
+
+        with mock.patch.object(command.pathlib.Path, "cwd", return_value=self.workspace), mock.patch.dict(
+            os.environ, {"HOME": str(self.root / "home"), "XDG_STATE_HOME": str(state)}, clear=False
+        ), mock.patch.object(command, "BUILD_ROOT", build_root), mock.patch.object(
+            command, "_build_host_package", return_value=(self.built_package, {**self._package_kwargs()["host_package_identity"], "libc": "musl"})
+        ), mock.patch.object(command.deploy, "execute_developer_deployment", side_effect=deploy_success), mock.patch.object(
+            command.shutil, "rmtree", side_effect=OSError("cleanup unavailable")
+        ) as cleanup:
+            self.assertEqual(command.main(self._command_args()), 0)
+
+        cleanup.assert_called_once()
+        result = json.loads((state / "mkchad" / "deploy" / "latest-result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["outcome"], "succeeded")
+        self.assertEqual(len(list(build_root.glob("run-*"))), 1)
+
+    def test_public_command_cleans_run_after_verified_deploy(self):
+        command = load_developer_command()
+        state = self.root / "state"
+        build_root = self.root / "container-tools-c11"
+
+        def deploy_success(*args, **kwargs):
+            kwargs["result_path"].write_text(
+                json.dumps(
+                    {
+                        "mode": "developer",
+                        "run_id": kwargs["run_id"],
+                        "log_path": str(kwargs["log_path"]),
+                        "outcome": "succeeded",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return 0
+
+        with mock.patch.object(command.pathlib.Path, "cwd", return_value=self.workspace), mock.patch.dict(
+            os.environ, {"HOME": str(self.root / "home"), "XDG_STATE_HOME": str(state)}, clear=False
+        ), mock.patch.object(command, "BUILD_ROOT", build_root), mock.patch.object(
+            command, "_build_host_package", return_value=(self.built_package, {**self._package_kwargs()["host_package_identity"], "libc": "musl"})
+        ), mock.patch.object(command.deploy, "execute_developer_deployment", side_effect=deploy_success):
+            self.assertEqual(command.main(self._command_args()), 0)
+
+        result = json.loads((state / "mkchad" / "deploy" / "latest-result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["outcome"], "succeeded")
+        self.assertEqual(list(build_root.glob("run-*")), [])
+
+    def test_cleanup_interruption_after_verified_deploy_does_not_replace_its_result(self):
+        command = load_developer_command()
+        state = self.root / "state"
+        build_root = self.root / "container-tools-c11"
+
+        def deploy_success(*args, **kwargs):
+            kwargs["result_path"].write_text(
+                json.dumps(
+                    {
+                        "mode": "developer",
+                        "run_id": kwargs["run_id"],
+                        "log_path": str(kwargs["log_path"]),
+                        "outcome": "succeeded",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return 0
+
+        with mock.patch.object(command.pathlib.Path, "cwd", return_value=self.workspace), mock.patch.dict(
+            os.environ, {"HOME": str(self.root / "home"), "XDG_STATE_HOME": str(state)}, clear=False
+        ), mock.patch.object(command, "BUILD_ROOT", build_root), mock.patch.object(
+            command, "_build_host_package", return_value=(self.built_package, {**self._package_kwargs()["host_package_identity"], "libc": "musl"})
+        ), mock.patch.object(command.deploy, "execute_developer_deployment", side_effect=deploy_success), mock.patch.object(
+            command.shutil, "rmtree", side_effect=KeyboardInterrupt
+        ) as cleanup:
+            self.assertEqual(command.main(self._command_args()), 0)
+
+        cleanup.assert_called_once()
+        result = json.loads((state / "mkchad" / "deploy" / "latest-result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["outcome"], "succeeded")
+        self.assertEqual(len(list(build_root.glob("run-*"))), 1)
+
+    def test_public_command_cleans_run_after_matching_deployment_failure(self):
+        command = load_developer_command()
+        state = self.root / "state"
+        build_root = self.root / "container-tools-c11"
+
+        def deploy_failure(*args, **kwargs):
+            kwargs["result_path"].write_text(
+                json.dumps(
+                    {
+                        "mode": "developer",
+                        "run_id": kwargs["run_id"],
+                        "log_path": str(kwargs["log_path"]),
+                        "outcome": "failed",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return 2
+
+        with mock.patch.object(command.pathlib.Path, "cwd", return_value=self.workspace), mock.patch.dict(
+            os.environ, {"HOME": str(self.root / "home"), "XDG_STATE_HOME": str(state)}, clear=False
+        ), mock.patch.object(command, "BUILD_ROOT", build_root), mock.patch.object(
+            command, "_build_host_package", return_value=(self.built_package, {**self._package_kwargs()["host_package_identity"], "libc": "musl"})
+        ), mock.patch.object(command.deploy, "execute_developer_deployment", side_effect=deploy_failure):
+            self.assertEqual(command.main(self._command_args()), 2)
+
+        result = json.loads((state / "mkchad" / "deploy" / "latest-result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["outcome"], "failed")
+        self.assertEqual(list(build_root.glob("run-*")), [])
+
+    def test_global_build_lock_blocks_distinct_state_roots_with_a_result(self):
+        command = load_developer_command()
+        build_root = self.root / "container-tools-c11"
+        state = self.root / "other-state"
+
+        with mock.patch.object(command.pathlib.Path, "cwd", return_value=self.workspace), mock.patch.object(
+            command, "BUILD_ROOT", build_root
+        ), command._build_root_lock(), mock.patch.dict(
+            os.environ, {"HOME": str(self.root / "home"), "XDG_STATE_HOME": str(state)}, clear=False
+        ):
+            self.assertEqual(command.main(self._command_args()), 2)
+
+        result = json.loads((state / "mkchad" / "deploy" / "latest-result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["outcome"], "failed")
+        self.assertIn("another developer build", result["diagnostic"])
+
+    def test_public_command_publishes_final_wait_cleanup_failure(self):
+        command = load_developer_command()
+        state = self.root / "state"
+        build_root = self.root / "container-tools-c11"
+
+        with mock.patch.object(command.pathlib.Path, "cwd", return_value=self.workspace), mock.patch.dict(
+            os.environ, {"HOME": str(self.root / "home"), "XDG_STATE_HOME": str(state)}, clear=False
+        ), mock.patch.object(command, "BUILD_ROOT", build_root), mock.patch.object(
+            command, "_build_host_package", side_effect=command.deploy.DeploymentError("process-group cleanup did not complete")
+        ):
+            self.assertEqual(command.main(self._command_args()), 2)
+
+        result = json.loads((state / "mkchad" / "deploy" / "latest-result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["outcome"], "failed")
+        self.assertIn("process-group cleanup did not complete", result["diagnostic"])
+
+    def test_capture_replaces_malformed_subprocess_output(self):
+        result = self.deploy._capture(
+            [sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'\\xff'); sys.stderr.buffer.write(b'\\xfe')"]
+        )
+
+        self.assertEqual(result.stdout, "\ufffd")
+        self.assertEqual(result.stderr, "\ufffd")
+
+    def test_capture_retains_normal_stdout_and_stderr_channels(self):
+        result = self.deploy._capture(
+            [sys.executable, "-c", "import sys; print('standard'); print('error', file=sys.stderr)"]
+        )
+
+        self.assertEqual(result.stdout, "standard\n")
+        self.assertEqual(result.stderr, "error\n")
+
+    def test_capture_rejects_output_overflow(self):
+        with self.assertRaisesRegex(self.deploy.DeploymentError, "stdout output exceeded"):
+            self.deploy._capture(
+                [sys.executable, "-c", f"import sys; sys.stdout.write('x' * {self.deploy.CAPTURE_LIMIT + 1})"]
+            )
+
+    def test_build_rejects_missing_or_multiple_archives(self):
+        command = load_developer_command()
+        command.BUILD_ROOT.mkdir(parents=True, exist_ok=True)
+        source_commit = self._commit_value(self.tools)
+        for name, copies in (("missing", 0), ("multiple", 2)):
+            with self.subTest(output=name), tempfile.TemporaryDirectory(prefix="mkchad-develop-build-", dir="/tmp/mkchad-v1/container-tools-c11") as temporary:
+                def build(argv, **kwargs):
+                    output = pathlib.Path(argv[argv.index("--output-dir") + 1])
+                    output.mkdir(parents=True)
+                    for index in range(copies):
+                        shutil.copyfile(self.built_package, output / f"package-{index}.tar.gz")
+                    return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+                with mock.patch.object(command.deploy, "_capture", side_effect=build):
+                    with self.assertRaisesRegex(command.deploy.DeploymentError, "malformed output"):
+                        command._build_host_package(self.tools, source_commit, pathlib.Path(temporary))
+
+    def test_build_rejects_malformed_checksum_content(self):
+        command = load_developer_command()
+        command.BUILD_ROOT.mkdir(parents=True, exist_ok=True)
+        source_commit = self._commit_value(self.tools)
+        digest = hashlib.sha256(self.built_package.read_bytes()).hexdigest()
+        checksums = ("fixture\n", f"{digest}  wrong-name.tar.gz\n", f"{'0' * 64}  container-tools-host.tar.gz\n")
+
+        for checksum in checksums:
+            with self.subTest(checksum=checksum), tempfile.TemporaryDirectory(prefix="mkchad-develop-build-", dir="/tmp/mkchad-v1/container-tools-c11") as temporary:
+                def build(argv, **kwargs):
+                    output = pathlib.Path(argv[argv.index("--output-dir") + 1])
+                    output.mkdir(parents=True)
+                    archive = output / "container-tools-host.tar.gz"
+                    shutil.copyfile(self.built_package, archive)
+                    archive.with_name(archive.name + ".sha256").write_text(checksum, encoding="ascii")
+                    return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+                with mock.patch.object(command.deploy, "_capture", side_effect=build):
+                    with self.assertRaisesRegex(command.deploy.DeploymentError, "checksum does not match"):
+                        command._build_host_package(self.tools, source_commit, pathlib.Path(temporary))
+
+    def test_build_output_is_redacted_and_emitted_once_per_destination(self):
+        command = load_developer_command()
+        command.BUILD_ROOT.mkdir(parents=True, exist_ok=True)
+        source_commit = self._commit_value(self.tools)
+        terminal = io.StringIO()
+        log = io.StringIO()
+
+        def build(argv, **kwargs):
+            output = pathlib.Path(argv[argv.index("--output-dir") + 1])
+            output.mkdir(parents=True)
+            archive = output / "container-tools-host.tar.gz"
+            shutil.copyfile(self.built_package, archive)
+            digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+            archive.with_name(archive.name + ".sha256").write_text(f"{digest}  {archive.name}\n", encoding="ascii")
+            return subprocess.CompletedProcess(argv, 0, stdout="token=secret\n", stderr="password=secret\n")
+
+        with tempfile.TemporaryDirectory(prefix="mkchad-develop-build-", dir="/tmp/mkchad-v1/container-tools-c11") as temporary, contextlib.redirect_stdout(command._StreamLog(terminal, log)), contextlib.redirect_stderr(command._StreamLog(terminal, log)), mock.patch.object(command.deploy, "_capture", side_effect=build):
+            command._build_host_package(self.tools, source_commit, pathlib.Path(temporary), log)
+
+        expected = "token=<redacted>\npassword=<redacted>\n"
+        self.assertEqual(terminal.getvalue(), expected)
+        self.assertEqual(log.getvalue(), expected)
+
+    def test_bounded_capture_terminates_timeout_descendants(self):
+        """Kill a SIGTERM-ignoring descendant after its leader exits on SIGTERM."""
+        marker = self.root / "timeout-descendant-marker"
+        started = self.root / "timeout-descendant-started"
+        release = self.root / "timeout-descendant-release"
+        descendant = self.root / "ignore-term.py"
+        descendant.write_text(
+            "import pathlib, signal, sys, time\n"
+            "marker = pathlib.Path(sys.argv[1])\n"
+            "started = pathlib.Path(sys.argv[2])\n"
+            "release = pathlib.Path(sys.argv[3])\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "started.write_text('started')\n"
+            "while not release.exists():\n"
+            "    time.sleep(0.01)\n"
+            "marker.write_text('survived')\n",
+            encoding="ascii",
+        )
+        script = self.root / "spawn-descendant.py"
+        script.write_text(
+            "import pathlib, subprocess, sys, time\n"
+            "marker = pathlib.Path(sys.argv[1])\n"
+            "started = pathlib.Path(sys.argv[2])\n"
+            "release = pathlib.Path(sys.argv[3])\n"
+            "descendant = pathlib.Path(sys.argv[4])\n"
+            "subprocess.Popen([sys.executable, str(descendant), str(marker), str(started), str(release)])\n"
+            "time.sleep(60)\n",
+            encoding="ascii",
+        )
+
+        with self.assertRaisesRegex(self.deploy.DeploymentError, "timed out"):
+            self.deploy._capture([sys.executable, str(script), str(marker), str(started), str(release), str(descendant)], timeout=0.5)
+        self.assertTrue(started.exists())
+        release.write_text("release", encoding="ascii")
+        time.sleep(0.5)
+        self.assertFalse(marker.exists())
+
+    def test_timeout_closes_pipes_held_by_an_escaped_descendant(self):
+        """Return promptly without signaling a detached descendant retaining stdout/stderr."""
+        started = self.root / "escaped-descendant-started"
+        release = self.root / "escaped-descendant-release"
+        completed = self.root / "escaped-descendant-completed"
+        descendant = self.root / "escaped-descendant.py"
+        descendant.write_text(
+            "import os, pathlib, sys, time\n"
+            "started = pathlib.Path(sys.argv[1])\n"
+            "release = pathlib.Path(sys.argv[2])\n"
+            "completed = pathlib.Path(sys.argv[3])\n"
+            "started.write_text(f'{os.getpid()} {os.getsid(0)}')\n"
+            "while not release.exists():\n"
+            "    time.sleep(0.01)\n"
+            "completed.write_text('released')\n",
+            encoding="ascii",
+        )
+        leader = self.root / "spawn-escaped-descendant.py"
+        leader.write_text(
+            "import pathlib, subprocess, sys, time\n"
+            "started = pathlib.Path(sys.argv[1])\n"
+            "subprocess.Popen([sys.executable, sys.argv[2], sys.argv[1], sys.argv[3], sys.argv[4]], start_new_session=True)\n"
+            "while not started.exists():\n"
+            "    time.sleep(0.01)\n"
+            "time.sleep(60)\n",
+            encoding="ascii",
+        )
+        probe = (
+            "import importlib.util, pathlib, sys, time\n"
+            "spec = importlib.util.spec_from_file_location('mkchad_deploy', sys.argv[1])\n"
+            "module = importlib.util.module_from_spec(spec)\n"
+            "spec.loader.exec_module(module)\n"
+            "started, leader, descendant, release, completed = sys.argv[2:]\n"
+            "began = time.monotonic()\n"
+            "try:\n"
+            "    module._capture([sys.executable, leader, started, descendant, release, completed], timeout=0.25)\n"
+            "except module.DeploymentError:\n"
+            "    print(time.monotonic() - began)\n"
+            "else:\n"
+            "    raise AssertionError('capture unexpectedly completed')\n"
+        )
+        try:
+            result = subprocess.run(
+                [
+                    sys.executable, "-c", probe, str(ROOT / "deploy/mkchad_deploy.py"),
+                    str(started), str(leader), str(descendant), str(release), str(completed),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            self.assertLess(float(result.stdout), 2)
+            pid, session = started.read_text(encoding="ascii").split()
+            self.assertEqual(pid, session)
+            release.write_text("release", encoding="ascii")
+            deadline = time.monotonic() + 2
+            while not completed.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(completed.exists())
+        finally:
+            release.touch()
+
+    def test_termination_keeps_the_exited_leader_unreaped_until_group_kill(self):
+        """Retain the leader PID as the process-group identity anchor through SIGKILL."""
+        process = mock.Mock(pid=12345, returncode=None)
+        events = []
+
+        def killpg(pid, signum):
+            events.append(("killpg", pid, signum))
+
+        def waitid(kind, pid, options):
+            events.append(("waitid", kind, pid, options))
+            return object()
+
+        def wait(timeout):
+            events.append(("wait", timeout))
+
+        process.wait.side_effect = wait
+        with mock.patch.object(self.deploy.os, "killpg", side_effect=killpg), mock.patch.object(
+            self.deploy.os, "waitid", side_effect=waitid
+        ):
+            self.deploy._terminate_group(process)
+
+        self.assertEqual(
+            events,
+            [
+                ("killpg", process.pid, self.deploy.signal.SIGTERM),
+                ("waitid", self.deploy.os.P_PID, process.pid, self.deploy.os.WEXITED | self.deploy.os.WNOHANG | self.deploy.os.WNOWAIT),
+                ("killpg", process.pid, self.deploy.signal.SIGKILL),
+                ("wait", 5),
+            ],
+        )
+
+    def test_termination_reports_an_unreaped_group_without_resignaling(self):
+        process = mock.Mock(pid=12345, returncode=None)
+        process.wait.side_effect = subprocess.TimeoutExpired([], 5)
+        events = []
+
+        def killpg(pid, signum):
+            events.append((pid, signum))
+
+        with mock.patch.object(self.deploy.os, "killpg", side_effect=killpg), mock.patch.object(
+            self.deploy.os, "waitid", return_value=object()
+        ):
+            with self.assertRaisesRegex(self.deploy.DeploymentError, "cleanup did not complete"):
+                self.deploy._terminate_group(process)
+
+        self.assertEqual(events, [(process.pid, self.deploy.signal.SIGTERM), (process.pid, self.deploy.signal.SIGKILL)])
+
+    def test_termination_does_not_signal_when_the_leader_was_reaped_elsewhere(self):
+        process = mock.Mock(pid=12345, returncode=None)
+
+        with mock.patch.object(self.deploy.os, "killpg") as killpg, mock.patch.object(
+            self.deploy.os, "waitid", side_effect=ChildProcessError
+        ):
+            self.deploy._terminate_group(process)
+
+        killpg.assert_called_once_with(process.pid, self.deploy.signal.SIGTERM)
+
+    def test_public_command_rejects_a_source_checkout_at_another_commit(self):
+        command = load_developer_command()
+        other = self.root / "other-container-tools"
+        self._init(other, {"VERSION": "1.0.0-dev\n", "scripts/build-package.sh": "#!/bin/sh\nexit 0\n"})
+        state = self.root / "state"
+
+        with mock.patch.object(command.pathlib.Path, "cwd", return_value=self.workspace), mock.patch.dict(os.environ, {"HOME": str(self.root / "home"), "XDG_STATE_HOME": str(state)}, clear=False), mock.patch.object(
+            command, "_build_host_package", side_effect=AssertionError("must not build")
+        ):
+            self.assertEqual(command.main(self._command_args(source=other)), 2)
+
+        result = json.loads((state / "mkchad" / "deploy" / "latest-result.json").read_text(encoding="utf-8"))
+        self.assertIn("does not match admitted", result["diagnostic"])
+
+    def test_public_command_cleans_failed_or_timed_out_build_and_publishes_failure(self):
+        command = load_developer_command()
+        state = self.root / "state"
+        build_parent = self.root / "container-tools-c11"
+
+        for build, diagnostic in (
+            (subprocess.CompletedProcess([], 78, stdout="", stderr="build failed\n"), "package build failed"),
+            (command.deploy.DeploymentError("command timed out after 1 seconds: build-package.sh"), "timed out"),
+        ):
+            capture = command.deploy._capture
+
+            def fail_build(argv, **kwargs):
+                if pathlib.Path(argv[0]).name == "build-package.sh":
+                    if isinstance(build, Exception):
+                        raise build
+                    return build
+                return capture(argv, **kwargs)
+
+            with self.subTest(build=type(build).__name__), mock.patch.object(command.pathlib.Path, "cwd", return_value=self.workspace), mock.patch.dict(os.environ, {"HOME": str(self.root / "home"), "XDG_STATE_HOME": str(state)}, clear=False), mock.patch.object(
+                command, "BUILD_ROOT", build_parent
+            ), mock.patch.object(command.deploy, "_capture", side_effect=fail_build):
+                self.assertEqual(command.main(self._command_args()), 2)
+
+            self.assertEqual([path.name for path in build_parent.iterdir()], ["build.lock"])
+            result = json.loads((state / "mkchad" / "deploy" / "latest-result.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["outcome"], "failed")
+            self.assertIn(diagnostic, result["diagnostic"])
+
+    def test_public_command_cleans_interrupted_build_and_publishes_interruption(self):
+        command = load_developer_command()
+        state = self.root / "state"
+        build_parent = self.root / "container-tools-c11"
+        capture = command.deploy._capture
+
+        def interrupt_build(argv, **kwargs):
+            if pathlib.Path(argv[0]).name == "build-package.sh":
+                raise KeyboardInterrupt
+            return capture(argv, **kwargs)
+
+        with mock.patch.object(command.pathlib.Path, "cwd", return_value=self.workspace), mock.patch.dict(os.environ, {"HOME": str(self.root / "home"), "XDG_STATE_HOME": str(state)}, clear=False), mock.patch.object(
+            command, "BUILD_ROOT", build_parent
+        ), mock.patch.object(command.deploy, "_capture", side_effect=interrupt_build):
+            self.assertEqual(command.main(self._command_args()), 2)
+
+        self.assertEqual([path.name for path in build_parent.iterdir()], ["build.lock"])
+        result = json.loads((state / "mkchad" / "deploy" / "latest-result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["outcome"], "interrupted")
 
     def test_public_command_publishes_a_field_complete_fallback_for_os_errors(self):
         command = load_developer_command()
         state = self.root / "state"
 
-        with mock.patch.dict(os.environ, {"HOME": str(self.root / "home"), "XDG_STATE_HOME": str(state)}, clear=False), mock.patch.object(
+        with mock.patch.object(command.pathlib.Path, "cwd", return_value=self.workspace), mock.patch.dict(os.environ, {"HOME": str(self.root / "home"), "XDG_STATE_HOME": str(state)}, clear=False), mock.patch.object(
             command.deploy, "execute_developer_deployment", side_effect=OSError("preflight unavailable")
         ):
-            self.assertEqual(command.main(self._command_package_args()), 2)
+            with mock.patch.object(command, "_build_host_package", return_value=(self.built_package, {**self._package_kwargs()["host_package_identity"], "libc": "musl"})):
+                self.assertEqual(command.main(self._command_args()), 2)
 
         result = json.loads((state / "mkchad" / "deploy" / "latest-result.json").read_text(encoding="utf-8"))
         self.assertEqual(result["mode"], "developer")
         self.assertEqual(result["outcome"], "failed")
         self.assertEqual(result["phase"], "preflight")
         self.assertEqual(result["failed_step"], "developer-admission")
-        self.assertEqual(result["image"], {"choice": "omitted", "supplied_sha256": None, "active_sha256": None, "decision": "preserved"})
+        self.assertEqual(result["image"], {"choice": "install", "supplied_sha256": None, "active_sha256": None, "decision": "unavailable"})
         self.assertIn("preflight unavailable", result["diagnostic"])
 
     def test_public_command_publishes_an_interrupted_fallback(self):
         command = load_developer_command()
         state = self.root / "state"
+        build_root = self.root / "container-tools-c11"
 
-        with mock.patch.dict(os.environ, {"HOME": str(self.root / "home"), "XDG_STATE_HOME": str(state)}, clear=False), mock.patch.object(
+        with mock.patch.object(command.pathlib.Path, "cwd", return_value=self.workspace), mock.patch.dict(os.environ, {"HOME": str(self.root / "home"), "XDG_STATE_HOME": str(state)}, clear=False), mock.patch.object(
+            command, "BUILD_ROOT", build_root
+        ), mock.patch.object(
             command.deploy, "execute_developer_deployment", side_effect=KeyboardInterrupt
         ):
-            self.assertEqual(command.main(self._command_package_args()), 2)
+            with mock.patch.object(command, "_build_host_package", return_value=(self.built_package, {**self._package_kwargs()["host_package_identity"], "libc": "musl"})):
+                self.assertEqual(command.main(self._command_args()), 2)
 
         result = json.loads((state / "mkchad" / "deploy" / "latest-result.json").read_text(encoding="utf-8"))
         self.assertEqual(result["outcome"], "interrupted")
         self.assertEqual(result["failed_step"], "developer-admission")
         self.assertIn("interrupted", result["diagnostic"])
+        self.assertEqual(list(build_root.glob("run-*")), [])
 
 
 if __name__ == "__main__":

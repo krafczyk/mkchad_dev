@@ -114,6 +114,35 @@ class DeploymentContractTests(unittest.TestCase):
                 check=True,
             )
 
+    def test_archive_identity_rejects_malformed_identity_fields(self):
+        """Keep invalid archive metadata inside the deployer's controlled failure path."""
+        valid = {
+            "schema": "container-tools.archive/v1",
+            "version": "1.0.0",
+            "architecture": "x86_64",
+            "libc": "musl",
+            "source_commit": "a" * 40,
+        }
+        mutations = (
+            {**valid, "schema": "container-tools.archive/v2"},
+            {**valid, "version": "01.0.0"},
+            {**valid, "architecture": "invalid"},
+            {**valid, "libc": "invalid"},
+            {**valid, "source_commit": "invalid"},
+            {**valid, "unexpected": True},
+        )
+        for metadata in mutations:
+            with self.subTest(metadata=metadata), tempfile.TemporaryDirectory(prefix="deploy-archive-identity-", dir="/tmp/mkchad-v1") as temporary:
+                archive_path = pathlib.Path(temporary) / "package.tar.gz"
+                root = f"container-tools-{valid['version']}-{valid['architecture']}-{valid['libc']}-{valid['source_commit']}"
+                payload = json.dumps(metadata, sort_keys=True, separators=(",", ":")).encode("ascii")
+                with tarfile.open(archive_path, "w:gz", format=tarfile.PAX_FORMAT) as archive:
+                    member = tarfile.TarInfo(f"{root}/archive.json")
+                    member.size = len(payload)
+                    archive.addfile(member, io.BytesIO(payload))
+                with self.assertRaisesRegex(self.deploy.DeploymentError, "invalid metadata"):
+                    self.deploy._archive_package_identity(archive_path, hashlib.sha256(archive_path.read_bytes()).hexdigest())
+
     def test_package_roles_identities_and_action_order_fail_closed(self):
         """Reject forged package metadata before deployment staging can begin."""
         mutations = (
