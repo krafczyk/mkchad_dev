@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MkChad Container Package Audit</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #101416;
+      --panel: #171d20;
+      --panel-soft: #1d2529;
+      --text: #e7ecee;
+      --muted: #aebbc0;
+      --line: #354248;
+      --accent: #78d6b0;
+      --accent-soft: #18382e;
+      --warn: #f3c774;
+      --warn-soft: #382f1d;
+      --info: #8bc7ef;
+      --info-soft: #193143;
+      --danger: #f0a0a0;
+      --danger-soft: #3b2225;
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 15px/1.65 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    main { width: min(940px, calc(100% - 32px)); margin: 0 auto; padding: 48px 0 72px; }
+    header, section { margin-bottom: 42px; }
+    h1, h2, h3 { line-height: 1.2; letter-spacing: -0.02em; }
+    h1 { margin: 8px 0 14px; font-size: clamp(2rem, 5vw, 3.4rem); max-width: 16ch; }
+    h2 { margin: 0 0 18px; font-size: 1.55rem; }
+    h3 { margin: 0; font-size: 1.18rem; }
+    p, li { max-width: 75ch; }
+    code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; color: #b9e8d3; }
+    a { color: var(--info); text-underline-offset: 3px; }
+    .eyebrow { color: var(--accent); font-size: .75rem; font-weight: 750; letter-spacing: .12em; text-transform: uppercase; }
+    .lede { max-width: 66ch; color: var(--muted); font-size: 1.08rem; }
+    .metadata, .stats, .chips { display: flex; flex-wrap: wrap; gap: 10px; }
+    .metadata span, .stat, .chip {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: var(--panel);
+      padding: 6px 11px;
+    }
+    .metadata { margin-top: 24px; color: var(--muted); font-size: .84rem; }
+    .stats { margin-top: 24px; }
+    .stat { min-width: 112px; border-radius: 12px; }
+    .stat strong { display: block; font-size: 1.45rem; color: inherit; }
+    .stat span { color: var(--muted); font-size: .8rem; }
+    .callout, article, .axis, .rejections {
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: var(--panel);
+    }
+    .callout { padding: 18px 20px; background: var(--accent-soft); }
+    .axes { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+    .axis { padding: 14px 16px; color: var(--muted); }
+    .jump-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 18px; margin: 0 0 22px; padding: 18px 22px 18px 42px; border-radius: 14px; background: var(--panel-soft); }
+    article { padding: 22px; margin-bottom: 16px; }
+    article.top { background: var(--accent-soft); border-color: #397b65; }
+    .card-head { display: flex; align-items: flex-start; gap: 14px; }
+    .rank {
+      display: grid; place-items: center; flex: 0 0 34px; height: 34px;
+      border-radius: 10px; background: var(--accent); color: #092019; font-weight: 850;
+    }
+    .chips { margin: 14px 0; }
+    .chip { font-size: .75rem; padding: 3px 9px; color: var(--muted); background: var(--panel-soft); }
+    dl { display: grid; grid-template-columns: 92px 1fr; gap: 8px 16px; margin: 18px 0 0; }
+    dt { color: var(--muted); font-size: .74rem; font-weight: 750; letter-spacing: .08em; text-transform: uppercase; }
+    dd { margin: 0; max-width: 74ch; }
+    .rejections { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; min-width: 650px; }
+    th, td { padding: 12px 14px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--line); }
+    th { color: var(--muted); font-size: .75rem; letter-spacing: .06em; text-transform: uppercase; }
+    tr:last-child td { border-bottom: 0; }
+    footer { color: var(--muted); font-size: .78rem; border-top: 1px solid var(--line); padding-top: 18px; }
+    @media (max-width: 680px) {
+      main { width: min(100% - 20px, 940px); padding-top: 28px; }
+      .axes, .jump-list { grid-template-columns: 1fr; }
+      dl { grid-template-columns: 1fr; gap: 2px; }
+      dd { margin-bottom: 10px; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="eyebrow">Container inventory review</div>
+    <h1>MkChad Container Package Audit</h1>
+    <p class="lede">The container is already broad. The useful question is not which popular tools are absent, but which absent executable closes a demonstrated MkChad workflow without duplicating editor, host, or release ownership.</p>
+    <div class="metadata">
+      <span>Date: <time datetime="2026-08-03">2026-08-03</time></span>
+      <span>Topic: <code>mkchad-container-packages</code></span>
+      <span>Focus: useful missing software packages</span>
+      <span>Mode: <code>repo-grounded</code></span>
+    </div>
+    <div class="stats">
+      <div class="stat"><strong>36</strong><span>raw candidates</span></div>
+      <div class="stat"><strong>12</strong><span>deduplicated</span></div>
+      <div class="stat"><strong>6</strong><span>survivors</span></div>
+      <div class="stat"><strong>1</strong><span>strong package add</span></div>
+    </div>
+  </header>
+
+  <section id="grounding-context">
+    <div class="eyebrow">Grounding</div>
+    <h2>Grounding Context</h2>
+    <p>The x86_64 and aarch64 definitions already provide Node 24, Python, Java, Rust, C/C++, Lua, Neovim, OpenCode, browser automation, language tooling, GitHub access, structural search, process and network diagnostics, profiling, encryption, SQLite, and media processing. Architecture parity is mechanically enforced.</p>
+    <p>OpenCode, Compound Engineering, and opencode-project-reload all use Bun for source development, but the image installs OpenCode from immutable architecture-specific release tarballs. Optional TypeScript and Bash language servers are deliberately Mason-owned. The ADR also records floating pip, npm, and source inputs, making reproducibility a stronger baseline gap than generic package breadth.</p>
+    <div class="callout"><strong>External evidence limit.</strong> Dedicated web search was unavailable in this environment. Package availability and upstream artifact claims therefore require verification before implementation.</div>
+  </section>
+
+  <section id="topic-axes">
+    <div class="eyebrow">Surface map</div>
+    <h2>Topic Axes</h2>
+    <div class="axes">
+      <div class="axis">Repository authoring toolchains</div>
+      <div class="axis">Editor and shell navigation</div>
+      <div class="axis">Diagnostics and release operations</div>
+      <div class="axis">Baseline reproducibility and image cost</div>
+    </div>
+  </section>
+
+  <section id="ranked-ideas">
+    <div class="eyebrow">Qualified directions</div>
+    <h2>Ranked Ideas</h2>
+    <ol class="jump-list">
+      <li><a href="#idea-1">Pinned Bun authoring runtime</a></li>
+      <li><a href="#idea-2">Freeze existing inputs first</a></li>
+      <li><a href="#idea-3">Conditional shfmt baseline</a></li>
+      <li><a href="#idea-4">Navigation admission freeze</a></li>
+      <li><a href="#idea-5">Host-side closure artifacts</a></li>
+      <li><a href="#idea-6">Release architecture parity</a></li>
+    </ol>
+
+    <article id="idea-1" class="top">
+      <div class="card-head"><div class="rank">1</div><div><h3>Pinned Bun authoring runtime</h3><div class="chips"><span class="chip">Repository authoring toolchains</span><span class="chip">Confidence 92%</span><span class="chip">Complexity Medium</span></div></div></div>
+      <p>Add one checksum-pinned Bun release for x86_64 and aarch64 so the container can run the documented test, typecheck, build, and validation commands in OpenCode, Compound Engineering, and opencode-project-reload. Keep Bun structurally separate from OpenCode installation: the shipped OpenCode package remains the immutable architecture-specific tarball, and structural tests continue rejecting the former source-build route.</p>
+      <dl>
+        <dt>Basis</dt><dd><code>direct:</code> All three active TypeScript repositories declare Bun commands, while <code>tests/nvim_container_tooling_test.sh</code> rejects Bun-based OpenCode build remnants rather than a separately owned authoring runtime.</dd>
+        <dt>Rationale</dt><dd>This is the only absent executable tied to several current repository workflows. It also provides the in-process runtime needed if native OpenCode routing is later moved from Python to TypeScript.</dd>
+        <dt>Downsides</dt><dd>Adds another architecture-specific artifact and update policy. OpenCode and project-reload currently express different Bun versions, so one compatibility baseline must be selected and tested before pinning.</dd>
+      </dl>
+    </article>
+
+    <article id="idea-2">
+      <div class="card-head"><div class="rank">2</div><div><h3>Freeze existing inputs before broadening the image</h3><div class="chips"><span class="chip">Baseline reproducibility and image cost</span><span class="chip">Confidence 88%</span><span class="chip">Complexity Medium</span></div></div></div>
+      <p>Before adding a second convenience package, pin the existing floating Python and source selections, verify direct downloads such as Node, and capture resolved dependency closures. Evaluate <code>uv</code> only as a build-time mechanism after the desired Python lock and VCS-source contract is explicit.</p>
+      <dl>
+        <dt>Basis</dt><dd><code>direct:</code> ADR 002 records <code>pydantic@main</code>, unpinned pip packages, mutable source branches, and uncaptured transitive package closures as current reproducibility limits.</dd>
+        <dt>Rationale</dt><dd>Stabilizing what is already shipped makes every later package proposal measurable and reviewable.</dd>
+        <dt>Downsides</dt><dd>This does not immediately add an interactive tool. <code>uv</code> is not yet justified as the chosen mechanism and needs upstream architecture and lock-behavior verification.</dd>
+      </dl>
+    </article>
+
+    <article id="idea-3">
+      <div class="card-head"><div class="rank">3</div><div><h3>Conditional <code>shfmt</code> baseline</h3><div class="chips"><span class="chip">Repository authoring toolchains</span><span class="chip">Confidence 62%</span><span class="chip">Complexity Low</span></div></div></div>
+      <p>Add an exact-version <code>shfmt</code> binary only if MkChad adopts a repository-owned formatting command or CI gate for its shell-heavy launch, lifecycle, container, and deployment code. It would complement ShellCheck rather than duplicate a language server.</p>
+      <dl>
+        <dt>Basis</dt><dd><code>reasoned:</code> The image already validates ShellCheck and the workspace maintains many shell scripts, but no current workflow invokes <code>shfmt</code>.</dd>
+        <dt>Rationale</dt><dd>A formatter can make a broad shell surface cheaper to maintain, but only when its formatting contract is explicit.</dd>
+        <dt>Downsides</dt><dd>Without an adopted gate this is merely a familiar convenience and should not enter the baseline.</dd>
+      </dl>
+    </article>
+
+    <article id="idea-4">
+      <div class="card-head"><div class="rank">4</div><div><h3>Navigation admission freeze</h3><div class="chips"><span class="chip">Editor and shell navigation</span><span class="chip">Confidence 94%</span><span class="chip">Complexity Low</span></div></div></div>
+      <p>Explicitly decline <code>fd</code>, <code>fzf</code>, <code>bat</code>, <code>zoxide</code>, and terminal-multiplexer additions until an exercised MkChad workflow identifies an operation not covered by Snacks, ripgrep, ast-grep, OpenCode fuzzy matching, or native terminal providers.</p>
+      <dl>
+        <dt>Basis</dt><dd><code>direct:</code> Current picker, text-search, structural-search, and terminal paths are already owned by MkChad, OpenCode, or Neovim integrations.</dd>
+        <dt>Rationale</dt><dd>This keeps personal shell preference separate from the immutable product baseline.</dd>
+        <dt>Downsides</dt><dd>Users who prefer those commands must install them in a writable user layer or use host tools.</dd>
+      </dl>
+    </article>
+
+    <article id="idea-5">
+      <div class="card-head"><div class="rank">5</div><div><h3>Host-side dependency closure artifacts</h3><div class="chips"><span class="chip">Diagnostics and release operations</span><span class="chip">Confidence 86%</span><span class="chip">Complexity Medium</span></div></div></div>
+      <p>Generate RPM, pip, npm, Cargo, LuaRocks, and source-revision inventories beside each released image. If an SBOM tool such as <code>syft</code> is selected, keep it pinned in release CI or on the build host rather than shipping it inside the interactive container.</p>
+      <dl>
+        <dt>Basis</dt><dd><code>direct:</code> ADR 002 already says resolved package lists should be captured when exact image provenance is required.</dd>
+        <dt>Rationale</dt><dd>The next diagnostic tool should explain the entire image rather than become one more unexplained image component.</dd>
+        <dt>Downsides</dt><dd>This improves release evidence but does not add an in-container capability. Tool selection remains unverified externally.</dd>
+      </dl>
+    </article>
+
+    <article id="idea-6">
+      <div class="card-head"><div class="rank">6</div><div><h3>Close release architecture parity first</h3><div class="chips"><span class="chip">Diagnostics and release operations</span><span class="chip">Confidence 95%</span><span class="chip">Complexity Medium</span></div></div></div>
+      <p>Require both x86_64 and aarch64 verified SIF artifacts before calling a release parity-complete. The source definitions maintain package parity, but the current parent release manifest binds only an x86_64 image.</p>
+      <dl>
+        <dt>Basis</dt><dd><code>direct:</code> <code>deploy/release.json</code> currently contains one x86_64 artifact despite architecture-aware deployment code and parity-tested source definitions.</dd>
+        <dt>Rationale</dt><dd>Adding packages to both Dockerfiles has limited value if only one resulting architecture is distributable through the release contract.</dd>
+        <dt>Downsides</dt><dd>This expands build and release operations rather than the package baseline itself.</dd>
+      </dl>
+    </article>
+  </section>
+
+  <section id="rejection-summary">
+    <div class="eyebrow">Deliberate cuts</div>
+    <h2>Rejection Summary</h2>
+    <div class="rejections">
+      <table>
+        <thead><tr><th>Idea</th><th>Reason rejected</th></tr></thead>
+        <tbody>
+          <tr><td><code>tmux</code> conformance fixture</td><td>Current opencode.nvim provider ownership is user-land; no active image-owned provider contract justifies it.</td></tr>
+          <tr><td>Generic <code>fd</code>/<code>fzf</code>/<code>bat</code>/<code>zoxide</code> bundle</td><td>Already-covered workflows and no demonstrated missing command.</td></tr>
+          <tr><td>Docker, Podman, or Apptainer in-image</td><td>Container engines and privileged runtime state are intentionally host-owned.</td></tr>
+          <tr><td>More process/network/profiling packages</td><td>The existing diagnostic surface is broad; a bounded evidence command would provide more value.</td></tr>
+          <tr><td>Immediate <code>uv</code> installation</td><td>The reproducibility need is sound, but the chosen lock contract and upstream architecture evidence are not established.</td></tr>
+          <tr><td>Bun writable overlay</td><td>The existing overlay is npm-prefix-specific and does not establish safe Bun acquisition, update, or rollback semantics.</td></tr>
+          <tr><td>Single Chromium consolidation</td><td>Plausible savings, but Playwright intentionally carries a tested browser revision; parity must be proven first.</td></tr>
+          <tr><td>Browser companion image</td><td>New distribution and lifecycle complexity without demonstrated demand; scope exceeds package admission.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <footer class="composition-signal">Composed 2026-08-03T00:39Z by ce-ideate from the MkChad workspace and the current package-selection ADR.</footer>
+</main>
+</body>
+</html>
