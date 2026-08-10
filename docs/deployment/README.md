@@ -9,8 +9,7 @@ install -Dm755 deploy/mkchad_release.py ~/.local/bin/mkchad-release
 ```
 
 ```bash
-mkchad-release --release TAG --image /absolute/path/to/nvim_container_x86.sif \
-  --container-tools-host-package /absolute/path/to/container-tools-host.tar.gz
+mkchad-release --release TAG --image /absolute/path/to/nvim_container_x86.sif
 ```
 
 The caller-owned image may be stored directly under the managed container
@@ -30,12 +29,11 @@ development, validation, supervisor, or recovery option.
 
 `deploy/release.json` is schema 2 and is the deployment authority. It records
 every component repository, full commit, disposition, destination, ordered
-actions, preserved paths, image digest, role-keyed `container-tools-package`
-identities, and configuration handoff pin. Each identity has a role,
-architecture, semantic version/product major, source commit, SHA-256, libc
-family, and filename class. These
-explicit pins are independent of parent or nested Git links; a manifest pin may
-intentionally differ from a development checkout's gitlink.
+actions, preserved paths, image digest, and configuration handoff pin. The
+`container_tools` component commit selects the host source independently of the
+image's Dockerfile pin. These explicit pins are independent of parent or nested
+Git links; a manifest pin may intentionally differ from a development
+checkout's gitlink.
 
 Schema-1 manifests, bootstrap evidence, receipts, bundles, journals, and
 recovery records are unsupported history. The schema-2 deployer neither reads,
@@ -53,37 +51,32 @@ Run the repository-local developer command only from the canonical parent Git
 top level:
 
 ```bash
-./deploy/mkchad_develop.py --image PATH --container-tools-source PATH \
-  [--replace-partial]
+./deploy/mkchad_develop.py --image PATH [--replace-partial]
 ```
 
 It is a developer workflow, not a release. The source authority is the exact
 clean committed `HEAD` of the checked-out `msk_containers`, its nested
 `container_tools`, `mkchad`, and `opencode-db` repositories. The parent
 repository may be dirty. Child origins may be forked or missing, and unpublished
-local commits work without network access. Parent and nested gitlink revisions
-are not authority. Any dirty, staged, untracked, unmerged, renamed, or
-type-changing child bytes are rejected before target mutation.
-`--container-tools-source` must name a clean `container_tools` Git top-level at
-exactly the admitted nested child commit; the nested gitlink is never used as a
-fallback.
+local commits work without network access. The admitted nested
+`msk_containers/container_tools` checkout is the only developer host-package
+source and must match the admitted nested gitlink. Any dirty, staged, untracked,
+unmerged, renamed, or type-changing child bytes are rejected before target
+mutation.
 
 The command stages that source's admitted exact commit into an invocation-private
-directory below `/tmp/mkchad-v1/container-tools-c11`, then builds one static musl
-host archive there while holding both the shared invocation lock and a fixed
+directory below `/tmp/mkchad-v1/container-tools-runtime-boundary`, then builds
+and installs the static executable with normal CMake commands while holding both
+the shared invocation lock and a fixed
 build-root-global nonblocking lock. The latter spans stale-run reclamation,
 staging, building, deployment, and result publication, so commands using
 different XDG state roots cannot reclaim each other's active build directories.
 When that build lock is busy, the command publishes a controlled developer
-failure result in its own state root. It calls the
-source-owned `scripts/build-package.sh` with its admitted commit, build/output
-directories, and `--libc musl`. Callers cannot choose a package archive, digest,
-version, architecture, source commit, or libc. The command bounds the build to
-five minutes, computes the archive SHA-256, verifies the generated `.sha256`
-content against that digest and archive basename, and derives its identity from
-`archive.json`. The identity must match the admitted commit, native architecture,
-and musl before passing it to the regular deployer; source-owned builder and
-archive validation handle malformed `VERSION` content.
+failure result in its own state root. X86_64 and AArch64 builds select
+`musl-gcc`; PPC64LE selects GCC. The installed executable's JSON version must
+report the admitted source commit, native architecture, product version, and
+`ct-mount-plan-v1` grammar. Callers cannot select another source, archive,
+identity, compiler family, or install prefix.
 After it publishes a normal, controlled-failure, or interrupted terminal result,
 the command immediately makes one best-effort cleanup attempt for its `run-*`
 directory while still holding the build lock. Cleanup errors and interruption
@@ -142,38 +135,16 @@ newer is required. This managed launcher installation builds no wheel, contacts
 no package index, and adds no dependency. The child repository's standalone
 wheel and virtual-environment installation remains independently supported.
 
-## Container Tools Packages
+## Container Tools Host Selection
 
 `container_tools` is one product, not a host-bridge component. Release
-deployment requires one explicit host archive. Developer deployment builds that
-archive automatically from its admitted source checkout. The deployer privately
-stages its exact bytes, reads `archive.json` from the versioned package root,
-binds the outer archive digest as the closed host identity, and resolves action
-arguments only from the selected release/developer identity; callers cannot
-supply internal action tokens. The pinned package verifier then checks the full
-archive before mutation. A supplied or reused image must expose the separately
-verified container identity at `/etc/mkchad/container-tools-package.json`. Both
-metadata documents must exactly match their selected identities.
-
-Host and in-container package identities may use different exact versions and
-source commits only when their `product_major` values match. A cross-major pair
-is rejected during preflight, before checkouts, host tools, or images mutate.
-An architecture without both closed role entries is unavailable rather than
-falling back to another archive.
-
-The ordered package actions are `container-tools-package-preflight`,
-`container-tools-package-install`, and `container-tools-package-verify`.
-Preflight runs before host-tool and image mutation, package install precedes
-host-tool installation, and package verification completes before terminal
-success. Host-tool actions receive the archive, SHA-256, version, source commit,
-architecture, libc, and private recovery directory as a fixed
-argv. Generated compatibility scripts remain package-owned and are verified as
-one configured package identity rather than compared with source templates. The
-image installer receives the corresponding in-container identity. The package
-installer records interrupted replacement state only in a private recovery
-directory; repair the reported condition and rerun with the same archive
-identity. Terminal schema-2 results report expected and observed host/container
-identities without archive contents, environment values, or prefix inventories.
+deployment checks out the release-pinned component commit; developer deployment
+uses the admitted nested child. Both build and install that exact checkout with
+CMake and verify compile-time JSON identity. Neither command accepts an archive
+or source selector, reads package metadata from the image, compares host and
+image versions, or records a container-package result role. The independently
+pinned image remains digest-validated. Runtime compatibility is enforced when
+an in-container host operation reads the mounted mount-plan grammar.
 
 An existing clean component checkout does not require the lifecycle launcher to
 be preinstalled when no managed host tool or image exists yet. Deployment treats
@@ -187,7 +158,6 @@ replace that legacy partial state through the normal verified installers:
 
 ```bash
 mkchad-release --release TAG --image /absolute/path/to/image.sif \
-  --container-tools-host-package /absolute/path/to/container-tools-host.tar.gz \
   --replace-partial
 ```
 
@@ -200,37 +170,18 @@ and rerun the same command; no rollback or recovery command exists.
 
 ## Runtime Evidence
 
-The workspace-level release binding gate consumes the finalized child
-`container-tools.runtime-evidence/v1` validator and the parent selected-root
-harness. Run its deterministic, credential-free fixture gate from the workspace
-root:
+The workspace-level release source-selection gate validates the reduced manifest
+and terminal result contracts. Run its deterministic, credential-free fixture
+gate from the workspace root:
 
 ```bash
 bash tests/container_tools_release_runtime_test.sh --self-test
 ```
 
-The fixture creates a temporary package archive, image metadata document,
-runtime report, terminal schema-2 result, and root binding document beneath
-`/tmp/mkchad-v1`. It verifies the selected workspace `HEAD`, finalized
-`msk_containers` commit `cb834dbea46ded29ba812085902102dd79a5371f`, and nested
-`container_tools` commit `0c806b4c3fafdc11d9ee16e66d4ba4805953241c`. It then
-binds the release manifest's host and container identities to the archive
-digest and metadata, the image digest and metadata, the report source and
-manifest digests, schema-2 expected/observed package identities, exact cleanup,
-redaction, and exactly one outer launch, manifest publication, nested dispatch,
-and payload. The synthetic report proves this admission boundary only; it is not
-Bash parity, image operability, or a native backend claim.
-
-The checked-in release authority does not currently select final immutable
-package and image candidates for those finalized commits. Consequently
-`bash tests/container_tools_release_runtime_test.sh --native` returns `77` and
-does not substitute prior package bytes, assign an image digest, or upgrade
-fixture evidence to a runtime claim. Native parity remains unavailable without
-the retained matching Bash baseline and unchanged parity image. Final-image
-operability remains unavailable without a final immutable image, exact host and
-in-container package identities, and a release-specific selected-root runner.
-These are distinct claims; a final image can establish operability but never
-historical Bash parity.
+The fixture proves that release authority contains only image artifacts, selects
+host source through the `container_tools` component commit, gives that component
+no archive actions, emits no package result field, and rejects both removed CLI
+selectors. Native image operability remains a separate image-build gate.
 
 ## Diagnostics And Configuration
 

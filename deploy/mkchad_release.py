@@ -33,7 +33,6 @@ RESULT_FIELDS = {
     "phase",
     "components",
     "artifact",
-    "packages",
     "actions",
     "configuration_handoff",
     "failed_step",
@@ -216,7 +215,6 @@ def _fallback_result(run_id: str, release: str, started_at: str, log_path: pathl
         "phase": "preflight",
         "components": [{"name": name, "disposition": disposition, "requested_commit": "0" * 40, "observed_commit": None} for name, disposition in components],
         "artifact": {"architecture": "x86_64", "expected_sha256": "0" * 64, "observed_sha256": None},
-        "packages": {"expected": [{"role": role, "architecture": "x86_64", "version": "0.0.0", "product_major": 0, "source_commit": "0" * 40, "sha256": "0" * 64, "libc": "glibc", "source_filename_class": "container-tools-package"} for role in ("host", "container")], "observed": [None, None]},
         "actions": [],
         "configuration_handoff": {
             "state": "configuration-pending",
@@ -267,16 +265,6 @@ def _valid_result_document(document: object) -> bool:
     if not isinstance(artifact, dict) or set(artifact) != {"architecture", "expected_sha256", "observed_sha256"} or artifact.get("architecture") not in {"x86_64", "aarch64", "ppc64le"} or not re.fullmatch(r"[0-9a-f]{64}", artifact.get("expected_sha256", "")):
         return False
     if artifact.get("observed_sha256") is not None and not re.fullmatch(r"[0-9a-f]{64}", artifact["observed_sha256"]):
-        return False
-    packages = document.get("packages")
-    if not isinstance(packages, dict) or set(packages) != {"expected", "observed"} or not isinstance(packages["expected"], list) or not isinstance(packages["observed"], list) or len(packages["expected"]) != 2 or len(packages["observed"]) != 2:
-        return False
-    roles = set()
-    for expected, observed in zip(packages["expected"], packages["observed"], strict=True):
-        if not isinstance(expected, dict) or set(expected) != {"role", "architecture", "version", "product_major", "source_commit", "sha256", "libc", "source_filename_class"} or expected.get("role") not in {"host", "container"} or expected["role"] in roles or expected.get("architecture") not in {"x86_64", "aarch64", "ppc64le"} or not isinstance(expected.get("version"), str) or not re.fullmatch(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?", expected["version"]) or not isinstance(expected.get("product_major"), int) or expected["product_major"] < 0 or not re.fullmatch(r"[0-9a-f]{40}", expected.get("source_commit", "")) or not re.fullmatch(r"[0-9a-f]{64}", expected.get("sha256", "")) or expected.get("libc") not in {"musl", "glibc"} or expected.get("source_filename_class") != "container-tools-package" or observed is not None and observed != expected:
-            return False
-        roles.add(expected["role"])
-    if roles != {"host", "container"} or packages["expected"][0]["product_major"] != packages["expected"][1]["product_major"]:
         return False
     actions = document.get("actions")
     if not isinstance(actions, list):
@@ -358,7 +346,6 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0], allow_abbrev=False)
     parser.add_argument("--release", required=True)
     parser.add_argument("--image", type=pathlib.Path, required=True)
-    parser.add_argument("--container-tools-host-package", type=pathlib.Path, required=True)
     parser.add_argument("--replace-partial", action="store_true", help="assert the managed service is inactive and replace legacy partial state")
     args = parser.parse_args(argv)
     try:
@@ -390,8 +377,6 @@ def main(argv: list[str] | None = None) -> int:
                             args.release,
                             "--image",
                             str(args.image.absolute()),
-                            "--container-tools-host-package",
-                            str(args.container_tools_host_package.absolute()),
                             *(["--replace-partial"] if args.replace_partial else []),
                             "--log-path",
                             str(log_path),

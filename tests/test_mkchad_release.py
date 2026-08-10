@@ -54,8 +54,6 @@ class ReleaseLauncherTests(unittest.TestCase):
         self.addCleanup(setattr, tempfile, "tempdir", previous_tempdir)
         self.image = self.root / "image with spaces.sif"
         self.image.write_bytes(b"image")
-        self.package = self.root / "container-tools-host.tar.gz"
-        self.package.write_bytes(b"package")
 
     def tearDown(self):
         shutil.rmtree(self.root, ignore_errors=True)
@@ -107,7 +105,6 @@ if mode not in ('missing', 'stale'):
             ]
         ],
         'artifact': {'architecture': 'x86_64', 'expected_sha256': '0' * 64, 'observed_sha256': None},
-        'packages': {'expected': [{'role': role, 'architecture': 'x86_64', 'version': '0.0.0', 'product_major': 0, 'source_commit': '0' * 40, 'sha256': '0' * 64, 'libc': 'glibc', 'source_filename_class': 'container-tools-package'} for role in ('host', 'container')], 'observed': [None, None]},
         'actions': [],
         'configuration_handoff': {
             'state': 'configuration-pending', 'contract_version': 1, 'guidance': 'docs/deployment/README.md',
@@ -155,7 +152,7 @@ raise SystemExit(child_exit)
         if capture:
             environment["MKCHAD_RELEASE_CAPTURE"] = str(capture)
         with mock.patch.dict(os.environ, environment, clear=False), mock.patch.object(self.launcher, "DEFAULT_REMOTE", str(remote)), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-            result = self.launcher.main(["--release", release, "--image", str(self.image), "--container-tools-host-package", str(self.package), *extra])
+            result = self.launcher.main(["--release", release, "--image", str(self.image), *extra])
         return result, stdout.getvalue(), stderr.getvalue()
 
     @property
@@ -228,7 +225,7 @@ raise SystemExit(child_exit)
         _, remote, _ = self.remote_with_release()
         for extra in (("--remote", "elsewhere"), ("--expected-parent-commit", "a" * 40), ("recover",)):
             with self.subTest(extra=extra), mock.patch.object(self.launcher, "DEFAULT_REMOTE", str(remote)), self.assertRaises(SystemExit) as raised:
-                self.launcher.main(["--release", "v1", "--image", str(self.image), "--container-tools-host-package", str(self.package), *extra])
+                self.launcher.main(["--release", "v1", "--image", str(self.image), *extra])
             self.assertEqual(raised.exception.code, 2)
         self.assertFalse(self.deploy_root.exists())
 
@@ -265,12 +262,12 @@ raise SystemExit(child_exit)
         self.assertIn("deployer", result["diagnostic"])
         self.assertFalse(list(self.deploy_root.glob(".latest-result-*")))
 
-    def test_child_result_rejects_leading_zero_package_versions(self):
-        """Keep launcher-side result validation aligned with package admission."""
+    def test_child_result_rejects_removed_package_fields(self):
+        """Keep launcher-side result validation aligned with the reduced result."""
         _, remote, _ = self.remote_with_release()
         self.assertEqual(self.invoke(remote)[0], 0)
         result = self.latest_result()
-        result["packages"]["expected"][0]["version"] = "01.0.0"
+        result["packages"] = {"expected": [], "observed": []}
         self.assertFalse(self.launcher._valid_result_document(result))
 
     def test_child_status_and_missing_or_mismatched_results_use_the_right_terminal_result(self):
@@ -313,7 +310,7 @@ raise SystemExit(child_exit)
         with mock.patch.dict(os.environ, {"HOME": str(self.home), "XDG_STATE_HOME": str(self.state)}, clear=False), mock.patch.object(
             self.launcher, "_checkout_release", return_value=(checkout, deployer)
         ), mock.patch.object(self.launcher, "_run", side_effect=interrupt):
-            self.assertEqual(self.launcher.main(["--release", "v1", "--image", str(self.image), "--container-tools-host-package", str(self.package)]), 2)
+            self.assertEqual(self.launcher.main(["--release", "v1", "--image", str(self.image)]), 2)
         self.assertEqual(self.latest_result()["outcome"], "interrupted")
 
     def test_contention_does_not_rotate_logs_or_replace_the_result(self):

@@ -21,8 +21,7 @@ reported release pins agree.
 Historical schema-1 deployment receipts and recovery records do not participate
 in this configuration contract.
 
-Schema-2 results additionally report expected and observed `container_tools`
-package identities for the host and image roles. They are diagnostic deployment
-evidence only: configuration must not infer a package path, archive location,
-or token from them. Host and in-container identities can differ within one
-product major; a release never admits a cross-major pair.
+Schema-2 results report the selected host source commit through component
+evidence and the independently validated image digest. They contain no package
+archive or host/container compatibility role. Configuration must not infer a
+package path, archive location, image-internal identity, or token from them.

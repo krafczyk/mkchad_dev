@@ -20,7 +20,7 @@ import mkchad_deploy as deploy
 import mkchad_release as release
 
 
-BUILD_ROOT = pathlib.Path("/tmp/mkchad-v1/container-tools-c11")
+BUILD_ROOT = pathlib.Path("/tmp/mkchad-v1/container-tools-runtime-boundary")
 BUILD_TIMEOUT = 300
 
 
@@ -75,8 +75,8 @@ def _write_build_output(stream, log, text: str) -> None:
     release._write_stream(target, log, text.encode("utf-8", errors="replace"))
 
 
-def _build_host_package(source: pathlib.Path, source_commit: str, temporary: pathlib.Path, log=None) -> tuple[pathlib.Path, dict]:
-    """Build and derive one static musl host archive from an admitted source.
+def _install_host_tools(source: pathlib.Path, source_commit: str, temporary: pathlib.Path, log=None) -> None:
+    """Build and install the admitted container-tools source with CMake.
 
     Args:
         source: Clean container-tools Git top-level selected by the caller.
@@ -85,52 +85,46 @@ def _build_host_package(source: pathlib.Path, source_commit: str, temporary: pat
         log: Optional open invocation log receiving redacted build output.
 
     Returns:
-        The sole generated archive and its digest-bound host package identity.
+        ``None`` after the compiled executable reports the selected commit.
 
     Raises:
-        deploy.DeploymentError: If the build fails, produces malformed output, or
-            its derived archive identity differs from the selected source.
+        deploy.DeploymentError: If CMake fails or the installed executable does
+            not report the selected source commit.
     """
-    build_root = temporary / "build"
-    output_dir = temporary / "output"
-    command = [
-        str(source / "scripts" / "build-package.sh"),
-        "--build-root", str(build_root),
-        "--source-commit", source_commit,
-        "--output-dir", str(output_dir),
-        "--libc", "musl",
-    ]
-    completed = deploy._capture(command, timeout=BUILD_TIMEOUT)
-    _write_build_output(sys.stdout, log, completed.stdout)
-    _write_build_output(sys.stderr, log, completed.stderr)
-    if completed.returncode:
-        raise deploy.DeploymentError("container-tools package build failed")
-    try:
-        outputs = list(output_dir.iterdir())
-    except OSError as exc:
-        raise deploy.DeploymentError("container-tools package build produced no output") from exc
-    archives = [path for path in outputs if path.name.endswith(".tar.gz")]
-    if len(archives) != 1 or any(path.is_symlink() or not path.is_file() for path in outputs):
-        raise deploy.DeploymentError("container-tools package build produced malformed output")
-    archive = archives[0]
-    checksum = archive.with_name(archive.name + ".sha256")
-    if set(outputs) != {archive, checksum} or checksum.is_symlink() or not checksum.is_file():
-        raise deploy.DeploymentError("container-tools package build produced malformed output")
-    digest = deploy._stable_regular_digest(archive, "built container-tools package")
-    try:
-        generated_checksum = checksum.read_text(encoding="ascii")
-    except (OSError, UnicodeDecodeError) as exc:
-        raise deploy.DeploymentError("container-tools package build produced malformed output") from exc
-    if generated_checksum != f"{digest}  {archive.name}\n":
-        raise deploy.DeploymentError("container-tools package build checksum does not match its archive")
-    identity = deploy._archive_package_identity(archive, digest)
-    if (
-        identity["architecture"] != deploy._native_architecture()
-        or identity["libc"] != "musl"
-        or identity["source_commit"] != source_commit
+    build = temporary / "build"
+    architecture = deploy._native_architecture()
+    compiler = "musl-gcc" if architecture in {"x86_64", "aarch64"} else "gcc"
+    prefix = pathlib.Path(os.environ.get("HOME", "~")).expanduser() / ".local"
+    for command in (
+        [
+            "cmake", "-S", str(source), "-B", str(build),
+            "-DCMAKE_BUILD_TYPE=Release", "-DCONTAINER_TOOLS_STATIC=ON",
+            f"-DCMAKE_C_COMPILER={compiler}", f"-DCMAKE_INSTALL_PREFIX={prefix}",
+        ],
+        ["cmake", "--build", str(build)],
+        ["cmake", "--install", str(build)],
     ):
-        raise deploy.DeploymentError("built container-tools package metadata does not match the selected source")
-    return archive, identity
+        completed = deploy._capture(command, timeout=BUILD_TIMEOUT)
+        _write_build_output(sys.stdout, log, completed.stdout)
+        _write_build_output(sys.stderr, log, completed.stderr)
+        if completed.returncode:
+            raise deploy.DeploymentError("container-tools CMake installation failed")
+    completed = deploy._capture([str(prefix / "bin" / "container-tools"), "--version", "--json"], timeout=BUILD_TIMEOUT)
+    if completed.returncode:
+        raise deploy.DeploymentError("installed container-tools version check failed")
+    try:
+        identity = json.loads(completed.stdout, object_pairs_hook=deploy._reject_duplicates)
+    except (json.JSONDecodeError, deploy.DeploymentError) as exc:
+        raise deploy.DeploymentError("installed container-tools version is malformed") from exc
+    if (
+        not isinstance(identity, dict)
+        or set(identity) != {"product_version", "source_commit", "architecture", "mount_plan_grammar"}
+        or not isinstance(identity["product_version"], str)
+        or identity["source_commit"] != source_commit
+        or identity["architecture"] != architecture
+        or identity["mount_plan_grammar"] != "ct-mount-plan-v1"
+    ):
+        raise deploy.DeploymentError("installed container-tools identity does not match selected source")
 
 
 @contextlib.contextmanager
@@ -204,7 +198,6 @@ def main(argv: list[str] | None = None) -> int:
     """
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0], allow_abbrev=False)
     parser.add_argument("--image", type=pathlib.Path, required=True)
-    parser.add_argument("--container-tools-source", type=pathlib.Path, required=True)
     parser.add_argument("--replace-partial", action="store_true")
     args = parser.parse_args(argv)
     state_root = release._state_root()
@@ -221,7 +214,7 @@ def main(argv: list[str] | None = None) -> int:
             with log_path.open("x", encoding="utf-8") as log, contextlib.redirect_stdout(_StreamLog(sys.stdout, log)), contextlib.redirect_stderr(_StreamLog(sys.stderr, log)):
                 try:
                     admission = deploy.admit_developer_workspace(workspace)
-                    source = args.container_tools_source.absolute()
+                    source = workspace / "msk_containers" / "container_tools"
                     source_commit = deploy._developer_child(source, "container-tools source")
                     if source_commit != admission["commits"]["container_tools"]:
                         raise deploy.DeploymentError("container-tools source commit does not match admitted workspace child")
@@ -230,8 +223,7 @@ def main(argv: list[str] | None = None) -> int:
                         temporary = pathlib.Path(tempfile.mkdtemp(prefix=f"run-{run_id}-", dir=BUILD_ROOT))
                         try:
                             staged_source = _stage_build_source(source, source_commit, temporary)
-                            archive, package = _build_host_package(staged_source, source_commit, temporary, log)
-                            status = deploy.execute_developer_deployment(workspace, args.image.absolute(), archive, host_package_identity=package, log_path=log_path, result_path=result_path, run_id=run_id, replace_partial=args.replace_partial)
+                            status = deploy.execute_developer_deployment(workspace, args.image.absolute(), staged_source, installer=lambda: _install_host_tools(staged_source, source_commit, temporary, log), log_path=log_path, result_path=result_path, run_id=run_id, replace_partial=args.replace_partial)
                             if _matching_result(result_path, run_id, log_path, status):
                                 os.replace(result_path, latest_result)
                                 return status

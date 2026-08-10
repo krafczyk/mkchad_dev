@@ -11,7 +11,6 @@ import pathlib
 import shutil
 import subprocess
 import tempfile
-import tarfile
 import time
 import unittest
 from unittest import mock
@@ -57,10 +56,7 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         self._init(tools, {
             "tool.sh": "#!/bin/sh\nexit 0\n",
             "VERSION": "1.0.0-dev\n",
-            "scripts/build-package.sh": "#!/bin/sh\nexit 0\n",
-            "scripts/install-package.sh": "#!/bin/sh\nexit 0\n",
         })
-        (tools / "scripts/install-package.sh").chmod(0o755)
         msk = self.root / "msk"
         self._init(msk, {"bin/install_nvim.sh": "#!/bin/sh\nexit 0\n", "nvim/bin/install_nvim_container": "#!/bin/sh\nexit 0\n"})
         (msk / "nvim/bin/install_nvim_container").chmod(0o755)
@@ -85,28 +81,6 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         self.tools = self.msk / "container_tools"
         self.mkchad = self.workspace / "mkchad"
         self.database = self.workspace / "opencode-db"
-        self.package = self.root / "container-tools-host.tar.gz"
-        self.built_package = self.root / "container-tools-host-musl.tar.gz"
-        self._write_package(self.package, "glibc")
-        self._write_package(self.built_package, "musl")
-
-    def _write_package(self, path, libc):
-        """Write one synthetic archive whose metadata matches the tools checkout."""
-        archive_metadata = {"schema": "container-tools.archive/v1", "architecture": self.deploy._native_architecture(), "version": "1.0.0-dev", "source_commit": self._commit_value(self.tools), "libc": libc}
-        payload = json.dumps(archive_metadata, sort_keys=True, separators=(",", ":")).encode("ascii")
-        package_root = f"container-tools-{archive_metadata['version']}-{archive_metadata['architecture']}-{archive_metadata['libc']}-{archive_metadata['source_commit']}"
-        with tarfile.open(path, "w:gz", format=tarfile.PAX_FORMAT) as archive:
-            directory = tarfile.TarInfo(package_root)
-            directory.type = tarfile.DIRTYPE
-            directory.mode = 0o755
-            directory.mtime = 0
-            archive.addfile(directory)
-            member = tarfile.TarInfo(f"{package_root}/archive.json")
-            member.size = len(payload)
-            member.mode = 0o644
-            member.mtime = 0
-            archive.addfile(member, io.BytesIO(payload))
-
     def _run(self, command):
         return subprocess.run(command, check=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
@@ -129,20 +103,21 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         return self._run(["git", "-C", str(path), "rev-parse", "HEAD"]).stdout.strip()
 
     def _package_kwargs(self):
-        """Return the admitted archive identity for direct deployer tests."""
-        return {"host_package": self.package, "host_package_identity": {"role": "host", "sha256": hashlib.sha256(self.package.read_bytes()).hexdigest(), "version": "1.0.0-dev", "source_commit": self._commit_value(self.tools), "architecture": {"amd64": "x86_64", "arm64": "aarch64"}.get(os.uname().machine.lower(), os.uname().machine.lower()), "libc": "glibc"}}
+        """Return the admitted source and a deterministic installer fixture."""
+        return {"source": self.tools, "installer": lambda: None}
 
     def _write_image(self, path):
-        """Write synthetic in-image container package metadata for one test SIF."""
-        identity = dict(self._package_kwargs()["host_package_identity"])
-        identity.update(role="container", product_major=1, source_filename_class="container-tools-package")
-        path.write_text(json.dumps(identity, sort_keys=True, separators=(",", ":")), encoding="ascii")
+        """Write one opaque image fixture."""
+        path.write_bytes(b"image")
 
     def _command_args(self, image=None, source=None):
         """Return the reduced public command interface for the fixture sources."""
         image = image or self.root / "image.sif"
         image.write_bytes(b"image")
-        return ["--image", str(image), "--container-tools-source", str(source or self.tools)]
+        arguments = ["--image", str(image)]
+        if source is not None:
+            arguments.extend(("--container-tools-source", str(source)))
+        return arguments
 
     def test_clean_unpublished_heads_are_staged_from_local_objects_with_dirty_parent_allowed(self):
         (self.workspace / "parent-untracked").write_text("allowed\n", encoding="ascii")
@@ -239,8 +214,6 @@ class DeveloperWorkspaceTests(unittest.TestCase):
             actions=[],
             artifact={"architecture": "x86_64", "sha256": "a" * 64},
             image={"choice": "reused", "supplied_sha256": "a" * 64, "active_sha256": "a" * 64, "decision": "reused-active"},
-            packages={"host": {**self._package_kwargs()["host_package_identity"], "product_major": 1, "source_filename_class": "container-tools-package"}, "container": {**self._package_kwargs()["host_package_identity"], "role": "container", "product_major": 1, "source_filename_class": "container-tools-package"}},
-            package_observations={"host": None, "container": None},
             run_id="123e4567-e89b-12d3-a456-426614174000",
             started_at="2026-08-03T00:00:00Z",
             log_path=pathlib.Path("/tmp/mkchad-v1/develop.log"),
@@ -268,7 +241,7 @@ class DeveloperWorkspaceTests(unittest.TestCase):
             "XDG_STATE_HOME": str(self.root / "state"), "NVIM_CONTAINER_DIR": str(home / "containers"),
         }
         result_path = self.root / "developer-result.json"
-        with mock.patch.dict(os.environ, environment, clear=False), mock.patch.object(self.deploy, "_runtime_image"), mock.patch.object(self.deploy, "_runtime_image_package_identity", return_value={}), mock.patch.object(self.deploy, "_run_action"), mock.patch.object(self.deploy, "_host_tool_mismatches", return_value={"msk_containers": None, "opencode-db": None}), mock.patch.object(self.deploy, "_active_image_digest", return_value=hashlib.sha256(image.read_bytes()).hexdigest()):
+        with mock.patch.dict(os.environ, environment, clear=False), mock.patch.object(self.deploy, "_runtime_image"), mock.patch.object(self.deploy, "_run_action"), mock.patch.object(self.deploy, "_host_tool_mismatches", return_value={"msk_containers": None, "opencode-db": None}), mock.patch.object(self.deploy, "_active_image_digest", return_value=hashlib.sha256(image.read_bytes()).hexdigest()):
             self.assertEqual(self.deploy.execute_developer_deployment(self.workspace, image, log_path=self.root / "developer.log", result_path=result_path, run_id="123e4567-e89b-12d3-a456-426614174000", **self._package_kwargs()), 0)
         result = json.loads(result_path.read_text(encoding="utf-8"))
         self.assertEqual(result["mode"], "developer")
@@ -291,7 +264,7 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         result_path = self.root / "developer-result.json"
         with mock.patch.dict(os.environ, environment, clear=False), mock.patch.object(self.deploy, "_stage_image", side_effect=AssertionError("image staging")), mock.patch.object(
             self.deploy, "_runtime_image", side_effect=AssertionError("runtime validation")
-        ), mock.patch.object(self.deploy, "_runtime_image_package_identity", return_value={}), mock.patch.object(self.deploy, "_active_image_digest", side_effect=AssertionError("image verification")), mock.patch.object(
+        ), mock.patch.object(self.deploy, "_active_image_digest", side_effect=AssertionError("image verification")), mock.patch.object(
             self.deploy, "_run_action", wraps=self.deploy._run_action
         ) as action, mock.patch.object(self.deploy, "_host_tool_mismatches", return_value={"msk_containers": None, "opencode-db": None}):
             self.assertEqual(self.deploy.execute_developer_deployment(self.workspace, None, log_path=self.root / "developer.log", result_path=result_path, run_id="123e4567-e89b-12d3-a456-426614174000", replace_partial=True, **self._package_kwargs()), 0)
@@ -323,7 +296,7 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         home = self.root / "home"
         container_dir = home / "containers"
         container_dir.mkdir(parents=True)
-        image_bytes = json.dumps({**self._package_kwargs()["host_package_identity"], "role": "container", "product_major": 1, "source_filename_class": "container-tools-package"}, sort_keys=True, separators=(",", ":")).encode("ascii")
+        image_bytes = b"image"
         digest = hashlib.sha256(image_bytes).hexdigest()
         architecture = {"amd64": "x86_64", "arm64": "aarch64"}.get(os.uname().machine.lower(), os.uname().machine.lower())
         image = container_dir / f"neovim_1.2.3_gabcdef0_{digest}_{architecture}.sif"
@@ -336,7 +309,7 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         topology = sorted(path.name for path in container_dir.iterdir())
         with mock.patch.dict(os.environ, environment, clear=False), mock.patch.object(self.deploy, "_stage_image", side_effect=AssertionError("image staging")), mock.patch.object(
             self.deploy, "_runtime_image", side_effect=AssertionError("runtime validation")
-        ), mock.patch.object(self.deploy, "_runtime_image_package_identity", return_value={}), mock.patch.object(self.deploy, "_active_image_digest", side_effect=AssertionError("image verification")), mock.patch.object(
+        ), mock.patch.object(self.deploy, "_active_image_digest", side_effect=AssertionError("image verification")), mock.patch.object(
             self.deploy, "_run_action", wraps=self.deploy._run_action
         ) as action, mock.patch.object(self.deploy, "_host_tool_mismatches", return_value={"msk_containers": None, "opencode-db": None}):
             self.assertEqual(self.deploy.execute_developer_deployment(self.workspace, image, log_path=self.root / "developer.log", result_path=self.root / "developer-result.json", run_id="123e4567-e89b-12d3-a456-426614174000", replace_partial=True, **self._package_kwargs()), 0)
@@ -349,7 +322,7 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         home = self.root / "home"
         container_dir = home / "containers"
         container_dir.mkdir(parents=True)
-        image_bytes = json.dumps({**self._package_kwargs()["host_package_identity"], "role": "container", "product_major": 1, "source_filename_class": "container-tools-package"}, sort_keys=True, separators=(",", ":")).encode("ascii")
+        image_bytes = b"image"
         digest = hashlib.sha256(image_bytes).hexdigest()
         architecture = {"amd64": "x86_64", "arm64": "aarch64"}.get(os.uname().machine.lower(), os.uname().machine.lower())
         image = container_dir / f"neovim_1.2.3_gabcdef0_{digest}_{architecture}.sif"
@@ -405,57 +378,62 @@ class DeveloperWorkspaceTests(unittest.TestCase):
     def test_public_command_has_only_the_reduced_required_interface(self):
         command = load_developer_command()
         state = self.root / "state"
+        observed = {}
+
+        def execute_deployment(_workspace, image, source, **_kwargs):
+            observed["image"] = image
+            observed["commit"] = self._commit_value(source)
+            return 2
 
         with mock.patch.object(command.pathlib.Path, "cwd", return_value=self.workspace), mock.patch.dict(os.environ, {"HOME": str(self.root / "home"), "XDG_STATE_HOME": str(state)}, clear=False), mock.patch.object(
-            command, "_build_host_package", return_value=(self.built_package, {**self._package_kwargs()["host_package_identity"], "libc": "musl"})
+            command, "_install_host_tools"
         ), mock.patch.object(
-            command.deploy, "execute_developer_deployment", return_value=2
-        ) as execute:
+            command.deploy, "execute_developer_deployment", side_effect=execute_deployment
+        ):
             self.assertEqual(command.main(self._command_args()), 2)
 
-        self.assertEqual(execute.call_args.args[1], (self.root / "image.sif").absolute())
-        self.assertEqual(execute.call_args.args[2], self.built_package)
-        self.assertEqual(execute.call_args.kwargs["host_package_identity"]["libc"], "musl")
+        self.assertEqual(observed["image"], (self.root / "image.sif").absolute())
+        self.assertEqual(observed["commit"], self._commit_value(self.tools))
         with self.assertRaises(SystemExit):
-            command.main(["--container-tools-host-package", str(self.package)])
+            command.main([*self._command_args(), "--container-tools-host-package", "/tmp/package.tar.gz"])
         with self.assertRaises(SystemExit):
-            command.main([*self._command_args(), "--libc", "musl"])
+            command.main([*self._command_args(), "--container-tools-source", str(self.tools)])
 
-    def test_build_invocation_uses_source_commit_musl_and_derived_identity(self):
+    def test_build_invocation_uses_cmake_musl_and_compiled_identity(self):
         command = load_developer_command()
         command.BUILD_ROOT.mkdir(parents=True, exist_ok=True)
-        build_root = pathlib.Path(tempfile.mkdtemp(prefix="mkchad-develop-build-", dir="/tmp/mkchad-v1/container-tools-c11"))
+        build_root = pathlib.Path(tempfile.mkdtemp(prefix="mkchad-develop-build-", dir="/tmp/mkchad-v1/container-tools-runtime-boundary"))
         self.addCleanup(shutil.rmtree, build_root, True)
         commands = []
+        source_commit = self._commit_value(self.tools)
+        identity = json.dumps({
+            "product_version": "1.0.0-dev",
+            "source_commit": source_commit,
+            "architecture": self.deploy._native_architecture(),
+            "mount_plan_grammar": "ct-mount-plan-v1",
+        }) + "\n"
 
         def build(argv, **kwargs):
             commands.append(argv)
-            output = pathlib.Path(argv[argv.index("--output-dir") + 1])
-            output.mkdir(parents=True)
-            shutil.copyfile(self.built_package, output / "container-tools-host.tar.gz")
-            digest = hashlib.sha256(self.built_package.read_bytes()).hexdigest()
-            (output / "container-tools-host.tar.gz.sha256").write_text(f"{digest}  container-tools-host.tar.gz\n", encoding="ascii")
-            return subprocess.CompletedProcess(argv, 0, stdout="built\n", stderr="")
+            stdout = identity if argv[-2:] == ["--version", "--json"] else "built\n"
+            return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
 
-        source_commit = self._commit_value(self.tools)
         with mock.patch.object(command.deploy, "_capture", side_effect=build) as capture:
-            archive, identity = command._build_host_package(self.tools, source_commit, build_root)
+            command._install_host_tools(self.tools, source_commit, build_root)
 
-        self.assertEqual(archive.name, "container-tools-host.tar.gz")
-        self.assertEqual(identity["sha256"], hashlib.sha256(self.built_package.read_bytes()).hexdigest())
-        self.assertEqual(identity["version"], "1.0.0-dev")
-        self.assertEqual(identity["source_commit"], source_commit)
-        self.assertEqual(identity["libc"], "musl")
-        self.assertEqual(commands[0][0], str(self.tools / "scripts/build-package.sh"))
-        self.assertEqual(commands[0][commands[0].index("--source-commit") + 1], source_commit)
-        self.assertEqual(commands[0][commands[0].index("--libc") + 1], "musl")
-        self.assertNotIn("--version", commands[0])
+        self.assertEqual(commands[0][:3], ["cmake", "-S", str(self.tools)])
+        self.assertIn("-DCONTAINER_TOOLS_STATIC=ON", commands[0])
+        expected_compiler = "musl-gcc" if self.deploy._native_architecture() in {"x86_64", "aarch64"} else "gcc"
+        self.assertIn(f"-DCMAKE_C_COMPILER={expected_compiler}", commands[0])
+        self.assertEqual(commands[1][0:2], ["cmake", "--build"])
+        self.assertEqual(commands[2][0:2], ["cmake", "--install"])
+        self.assertEqual(commands[3][-2:], ["--version", "--json"])
         self.assertEqual(capture.call_args.kwargs, {"timeout": command.BUILD_TIMEOUT})
 
     def test_public_command_builds_from_a_private_exact_commit_checkout(self):
         command = load_developer_command()
         state = self.root / "state"
-        build_root = self.root / "container-tools-c11"
+        build_root = self.root / "container-tools-runtime-boundary"
         observed = {}
 
         def build(source, source_commit, temporary, log):
@@ -465,13 +443,11 @@ class DeveloperWorkspaceTests(unittest.TestCase):
             self.assertNotEqual(source, self.tools)
             self.assertEqual(self._commit_value(source), source_commit)
             self.assertEqual((source / "VERSION").read_text(encoding="ascii"), "1.0.0-dev\n")
-            return self.built_package, {**self._package_kwargs()["host_package_identity"], "libc": "musl"}
-
         with mock.patch.object(command.pathlib.Path, "cwd", return_value=self.workspace), mock.patch.dict(
             os.environ, {"HOME": str(self.root / "home"), "XDG_STATE_HOME": str(state)}, clear=False
         ), mock.patch.object(command, "BUILD_ROOT", build_root), mock.patch.object(
-            command, "_build_host_package", side_effect=build
-        ), mock.patch.object(command.deploy, "execute_developer_deployment", return_value=2):
+            command, "_install_host_tools", side_effect=build
+        ), mock.patch.object(command.deploy, "execute_developer_deployment", side_effect=lambda *_args, **kwargs: (kwargs["installer"](), 2)[1]):
             self.assertEqual(command.main(self._command_args()), 2)
 
         self.assertEqual(observed["commit"], self._commit_value(self.tools))
@@ -479,7 +455,7 @@ class DeveloperWorkspaceTests(unittest.TestCase):
 
     def test_stale_build_reclamation_leaves_non_run_entries_untouched(self):
         command = load_developer_command()
-        build_root = self.root / "container-tools-c11"
+        build_root = self.root / "container-tools-runtime-boundary"
         stale = build_root / "run-old"
         retained = build_root / "keep"
         run_file = build_root / "run-output.txt"
@@ -500,7 +476,7 @@ class DeveloperWorkspaceTests(unittest.TestCase):
     def test_cleanup_error_after_verified_deploy_does_not_replace_its_result(self):
         command = load_developer_command()
         state = self.root / "state"
-        build_root = self.root / "container-tools-c11"
+        build_root = self.root / "container-tools-runtime-boundary"
 
         def deploy_success(*args, **kwargs):
             kwargs["result_path"].write_text(
@@ -519,7 +495,7 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         with mock.patch.object(command.pathlib.Path, "cwd", return_value=self.workspace), mock.patch.dict(
             os.environ, {"HOME": str(self.root / "home"), "XDG_STATE_HOME": str(state)}, clear=False
         ), mock.patch.object(command, "BUILD_ROOT", build_root), mock.patch.object(
-            command, "_build_host_package", return_value=(self.built_package, {**self._package_kwargs()["host_package_identity"], "libc": "musl"})
+            command, "_install_host_tools"
         ), mock.patch.object(command.deploy, "execute_developer_deployment", side_effect=deploy_success), mock.patch.object(
             command.shutil, "rmtree", side_effect=OSError("cleanup unavailable")
         ) as cleanup:
@@ -533,7 +509,7 @@ class DeveloperWorkspaceTests(unittest.TestCase):
     def test_public_command_cleans_run_after_verified_deploy(self):
         command = load_developer_command()
         state = self.root / "state"
-        build_root = self.root / "container-tools-c11"
+        build_root = self.root / "container-tools-runtime-boundary"
 
         def deploy_success(*args, **kwargs):
             kwargs["result_path"].write_text(
@@ -552,7 +528,7 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         with mock.patch.object(command.pathlib.Path, "cwd", return_value=self.workspace), mock.patch.dict(
             os.environ, {"HOME": str(self.root / "home"), "XDG_STATE_HOME": str(state)}, clear=False
         ), mock.patch.object(command, "BUILD_ROOT", build_root), mock.patch.object(
-            command, "_build_host_package", return_value=(self.built_package, {**self._package_kwargs()["host_package_identity"], "libc": "musl"})
+            command, "_install_host_tools"
         ), mock.patch.object(command.deploy, "execute_developer_deployment", side_effect=deploy_success):
             self.assertEqual(command.main(self._command_args()), 0)
 
@@ -563,7 +539,7 @@ class DeveloperWorkspaceTests(unittest.TestCase):
     def test_cleanup_interruption_after_verified_deploy_does_not_replace_its_result(self):
         command = load_developer_command()
         state = self.root / "state"
-        build_root = self.root / "container-tools-c11"
+        build_root = self.root / "container-tools-runtime-boundary"
 
         def deploy_success(*args, **kwargs):
             kwargs["result_path"].write_text(
@@ -582,7 +558,7 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         with mock.patch.object(command.pathlib.Path, "cwd", return_value=self.workspace), mock.patch.dict(
             os.environ, {"HOME": str(self.root / "home"), "XDG_STATE_HOME": str(state)}, clear=False
         ), mock.patch.object(command, "BUILD_ROOT", build_root), mock.patch.object(
-            command, "_build_host_package", return_value=(self.built_package, {**self._package_kwargs()["host_package_identity"], "libc": "musl"})
+            command, "_install_host_tools"
         ), mock.patch.object(command.deploy, "execute_developer_deployment", side_effect=deploy_success), mock.patch.object(
             command.shutil, "rmtree", side_effect=KeyboardInterrupt
         ) as cleanup:
@@ -596,7 +572,7 @@ class DeveloperWorkspaceTests(unittest.TestCase):
     def test_public_command_cleans_run_after_matching_deployment_failure(self):
         command = load_developer_command()
         state = self.root / "state"
-        build_root = self.root / "container-tools-c11"
+        build_root = self.root / "container-tools-runtime-boundary"
 
         def deploy_failure(*args, **kwargs):
             kwargs["result_path"].write_text(
@@ -615,7 +591,7 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         with mock.patch.object(command.pathlib.Path, "cwd", return_value=self.workspace), mock.patch.dict(
             os.environ, {"HOME": str(self.root / "home"), "XDG_STATE_HOME": str(state)}, clear=False
         ), mock.patch.object(command, "BUILD_ROOT", build_root), mock.patch.object(
-            command, "_build_host_package", return_value=(self.built_package, {**self._package_kwargs()["host_package_identity"], "libc": "musl"})
+            command, "_install_host_tools"
         ), mock.patch.object(command.deploy, "execute_developer_deployment", side_effect=deploy_failure):
             self.assertEqual(command.main(self._command_args()), 2)
 
@@ -625,7 +601,7 @@ class DeveloperWorkspaceTests(unittest.TestCase):
 
     def test_global_build_lock_blocks_distinct_state_roots_with_a_result(self):
         command = load_developer_command()
-        build_root = self.root / "container-tools-c11"
+        build_root = self.root / "container-tools-runtime-boundary"
         state = self.root / "other-state"
 
         with mock.patch.object(command.pathlib.Path, "cwd", return_value=self.workspace), mock.patch.object(
@@ -642,12 +618,14 @@ class DeveloperWorkspaceTests(unittest.TestCase):
     def test_public_command_publishes_final_wait_cleanup_failure(self):
         command = load_developer_command()
         state = self.root / "state"
-        build_root = self.root / "container-tools-c11"
+        build_root = self.root / "container-tools-runtime-boundary"
 
         with mock.patch.object(command.pathlib.Path, "cwd", return_value=self.workspace), mock.patch.dict(
             os.environ, {"HOME": str(self.root / "home"), "XDG_STATE_HOME": str(state)}, clear=False
         ), mock.patch.object(command, "BUILD_ROOT", build_root), mock.patch.object(
-            command, "_build_host_package", side_effect=command.deploy.DeploymentError("process-group cleanup did not complete")
+            command, "_install_host_tools", side_effect=command.deploy.DeploymentError("process-group cleanup did not complete")
+        ), mock.patch.object(
+            command.deploy, "execute_developer_deployment", side_effect=lambda *_args, **kwargs: kwargs["installer"]()
         ):
             self.assertEqual(command.main(self._command_args()), 2)
 
@@ -677,43 +655,26 @@ class DeveloperWorkspaceTests(unittest.TestCase):
                 [sys.executable, "-c", f"import sys; sys.stdout.write('x' * {self.deploy.CAPTURE_LIMIT + 1})"]
             )
 
-    def test_build_rejects_missing_or_multiple_archives(self):
+    def test_build_rejects_cmake_failure(self):
         command = load_developer_command()
         command.BUILD_ROOT.mkdir(parents=True, exist_ok=True)
         source_commit = self._commit_value(self.tools)
-        for name, copies in (("missing", 0), ("multiple", 2)):
-            with self.subTest(output=name), tempfile.TemporaryDirectory(prefix="mkchad-develop-build-", dir="/tmp/mkchad-v1/container-tools-c11") as temporary:
-                def build(argv, **kwargs):
-                    output = pathlib.Path(argv[argv.index("--output-dir") + 1])
-                    output.mkdir(parents=True)
-                    for index in range(copies):
-                        shutil.copyfile(self.built_package, output / f"package-{index}.tar.gz")
-                    return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        with tempfile.TemporaryDirectory(prefix="mkchad-develop-build-", dir="/tmp/mkchad-v1/container-tools-runtime-boundary") as temporary, mock.patch.object(
+            command.deploy, "_capture", return_value=subprocess.CompletedProcess([], 1, stdout="", stderr="failed\n")
+        ):
+            with self.assertRaisesRegex(command.deploy.DeploymentError, "CMake installation failed"):
+                command._install_host_tools(self.tools, source_commit, pathlib.Path(temporary))
 
-                with mock.patch.object(command.deploy, "_capture", side_effect=build):
-                    with self.assertRaisesRegex(command.deploy.DeploymentError, "malformed output"):
-                        command._build_host_package(self.tools, source_commit, pathlib.Path(temporary))
-
-    def test_build_rejects_malformed_checksum_content(self):
+    def test_build_rejects_malformed_or_mismatched_compiled_identity(self):
         command = load_developer_command()
         command.BUILD_ROOT.mkdir(parents=True, exist_ok=True)
         source_commit = self._commit_value(self.tools)
-        digest = hashlib.sha256(self.built_package.read_bytes()).hexdigest()
-        checksums = ("fixture\n", f"{digest}  wrong-name.tar.gz\n", f"{'0' * 64}  container-tools-host.tar.gz\n")
-
-        for checksum in checksums:
-            with self.subTest(checksum=checksum), tempfile.TemporaryDirectory(prefix="mkchad-develop-build-", dir="/tmp/mkchad-v1/container-tools-c11") as temporary:
-                def build(argv, **kwargs):
-                    output = pathlib.Path(argv[argv.index("--output-dir") + 1])
-                    output.mkdir(parents=True)
-                    archive = output / "container-tools-host.tar.gz"
-                    shutil.copyfile(self.built_package, archive)
-                    archive.with_name(archive.name + ".sha256").write_text(checksum, encoding="ascii")
-                    return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
-
-                with mock.patch.object(command.deploy, "_capture", side_effect=build):
-                    with self.assertRaisesRegex(command.deploy.DeploymentError, "checksum does not match"):
-                        command._build_host_package(self.tools, source_commit, pathlib.Path(temporary))
+        identities = ("not-json", json.dumps({"product_version": "1.0.0-dev", "source_commit": "0" * 40, "architecture": self.deploy._native_architecture(), "mount_plan_grammar": "ct-mount-plan-v1"}))
+        for identity in identities:
+            responses = [subprocess.CompletedProcess([], 0, stdout="", stderr="")] * 3 + [subprocess.CompletedProcess([], 0, stdout=identity, stderr="")]
+            with self.subTest(identity=identity), tempfile.TemporaryDirectory(prefix="mkchad-develop-build-", dir="/tmp/mkchad-v1/container-tools-runtime-boundary") as temporary, mock.patch.object(command.deploy, "_capture", side_effect=responses):
+                with self.assertRaises(command.deploy.DeploymentError):
+                    command._install_host_tools(self.tools, source_commit, pathlib.Path(temporary))
 
     def test_build_output_is_redacted_and_emitted_once_per_destination(self):
         command = load_developer_command()
@@ -721,18 +682,20 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         source_commit = self._commit_value(self.tools)
         terminal = io.StringIO()
         log = io.StringIO()
+        calls = 0
 
         def build(argv, **kwargs):
-            output = pathlib.Path(argv[argv.index("--output-dir") + 1])
-            output.mkdir(parents=True)
-            archive = output / "container-tools-host.tar.gz"
-            shutil.copyfile(self.built_package, archive)
-            digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-            archive.with_name(archive.name + ".sha256").write_text(f"{digest}  {archive.name}\n", encoding="ascii")
-            return subprocess.CompletedProcess(argv, 0, stdout="token=secret\n", stderr="password=secret\n")
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return subprocess.CompletedProcess(argv, 0, stdout="token=secret\n", stderr="password=secret\n")
+            if calls == 4:
+                identity = {"product_version": "1.0.0-dev", "source_commit": source_commit, "architecture": self.deploy._native_architecture(), "mount_plan_grammar": "ct-mount-plan-v1"}
+                return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(identity), stderr="")
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
-        with tempfile.TemporaryDirectory(prefix="mkchad-develop-build-", dir="/tmp/mkchad-v1/container-tools-c11") as temporary, contextlib.redirect_stdout(command._StreamLog(terminal, log)), contextlib.redirect_stderr(command._StreamLog(terminal, log)), mock.patch.object(command.deploy, "_capture", side_effect=build):
-            command._build_host_package(self.tools, source_commit, pathlib.Path(temporary), log)
+        with tempfile.TemporaryDirectory(prefix="mkchad-develop-build-", dir="/tmp/mkchad-v1/container-tools-runtime-boundary") as temporary, contextlib.redirect_stdout(command._StreamLog(terminal, log)), contextlib.redirect_stderr(command._StreamLog(terminal, log)), mock.patch.object(command.deploy, "_capture", side_effect=build):
+            command._install_host_tools(self.tools, source_commit, pathlib.Path(temporary), log)
 
         expected = "token=<redacted>\npassword=<redacted>\n"
         self.assertEqual(terminal.getvalue(), expected)
@@ -895,33 +858,19 @@ class DeveloperWorkspaceTests(unittest.TestCase):
 
         killpg.assert_called_once_with(process.pid, self.deploy.signal.SIGTERM)
 
-    def test_public_command_rejects_a_source_checkout_at_another_commit(self):
-        command = load_developer_command()
-        other = self.root / "other-container-tools"
-        self._init(other, {"VERSION": "1.0.0-dev\n", "scripts/build-package.sh": "#!/bin/sh\nexit 0\n"})
-        state = self.root / "state"
-
-        with mock.patch.object(command.pathlib.Path, "cwd", return_value=self.workspace), mock.patch.dict(os.environ, {"HOME": str(self.root / "home"), "XDG_STATE_HOME": str(state)}, clear=False), mock.patch.object(
-            command, "_build_host_package", side_effect=AssertionError("must not build")
-        ):
-            self.assertEqual(command.main(self._command_args(source=other)), 2)
-
-        result = json.loads((state / "mkchad" / "deploy" / "latest-result.json").read_text(encoding="utf-8"))
-        self.assertIn("does not match admitted", result["diagnostic"])
-
     def test_public_command_cleans_failed_or_timed_out_build_and_publishes_failure(self):
         command = load_developer_command()
         state = self.root / "state"
-        build_parent = self.root / "container-tools-c11"
+        build_parent = self.root / "container-tools-runtime-boundary"
 
         for build, diagnostic in (
-            (subprocess.CompletedProcess([], 78, stdout="", stderr="build failed\n"), "package build failed"),
-            (command.deploy.DeploymentError("command timed out after 1 seconds: build-package.sh"), "timed out"),
+            (subprocess.CompletedProcess([], 78, stdout="", stderr="build failed\n"), "CMake installation failed"),
+            (command.deploy.DeploymentError("command timed out after 1 seconds: cmake"), "timed out"),
         ):
             capture = command.deploy._capture
 
             def fail_build(argv, **kwargs):
-                if pathlib.Path(argv[0]).name == "build-package.sh":
+                if pathlib.Path(argv[0]).name == "cmake":
                     if isinstance(build, Exception):
                         raise build
                     return build
@@ -929,7 +878,9 @@ class DeveloperWorkspaceTests(unittest.TestCase):
 
             with self.subTest(build=type(build).__name__), mock.patch.object(command.pathlib.Path, "cwd", return_value=self.workspace), mock.patch.dict(os.environ, {"HOME": str(self.root / "home"), "XDG_STATE_HOME": str(state)}, clear=False), mock.patch.object(
                 command, "BUILD_ROOT", build_parent
-            ), mock.patch.object(command.deploy, "_capture", side_effect=fail_build):
+            ), mock.patch.object(command.deploy, "_capture", side_effect=fail_build), mock.patch.object(
+                command.deploy, "execute_developer_deployment", side_effect=lambda *_args, **kwargs: kwargs["installer"]()
+            ):
                 self.assertEqual(command.main(self._command_args()), 2)
 
             self.assertEqual([path.name for path in build_parent.iterdir()], ["build.lock"])
@@ -940,17 +891,19 @@ class DeveloperWorkspaceTests(unittest.TestCase):
     def test_public_command_cleans_interrupted_build_and_publishes_interruption(self):
         command = load_developer_command()
         state = self.root / "state"
-        build_parent = self.root / "container-tools-c11"
+        build_parent = self.root / "container-tools-runtime-boundary"
         capture = command.deploy._capture
 
         def interrupt_build(argv, **kwargs):
-            if pathlib.Path(argv[0]).name == "build-package.sh":
+            if pathlib.Path(argv[0]).name == "cmake":
                 raise KeyboardInterrupt
             return capture(argv, **kwargs)
 
         with mock.patch.object(command.pathlib.Path, "cwd", return_value=self.workspace), mock.patch.dict(os.environ, {"HOME": str(self.root / "home"), "XDG_STATE_HOME": str(state)}, clear=False), mock.patch.object(
             command, "BUILD_ROOT", build_parent
-        ), mock.patch.object(command.deploy, "_capture", side_effect=interrupt_build):
+        ), mock.patch.object(command.deploy, "_capture", side_effect=interrupt_build), mock.patch.object(
+            command.deploy, "execute_developer_deployment", side_effect=lambda *_args, **kwargs: kwargs["installer"]()
+        ):
             self.assertEqual(command.main(self._command_args()), 2)
 
         self.assertEqual([path.name for path in build_parent.iterdir()], ["build.lock"])
@@ -964,7 +917,7 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         with mock.patch.object(command.pathlib.Path, "cwd", return_value=self.workspace), mock.patch.dict(os.environ, {"HOME": str(self.root / "home"), "XDG_STATE_HOME": str(state)}, clear=False), mock.patch.object(
             command.deploy, "execute_developer_deployment", side_effect=OSError("preflight unavailable")
         ):
-            with mock.patch.object(command, "_build_host_package", return_value=(self.built_package, {**self._package_kwargs()["host_package_identity"], "libc": "musl"})):
+            with mock.patch.object(command, "_install_host_tools"):
                 self.assertEqual(command.main(self._command_args()), 2)
 
         result = json.loads((state / "mkchad" / "deploy" / "latest-result.json").read_text(encoding="utf-8"))
@@ -978,14 +931,14 @@ class DeveloperWorkspaceTests(unittest.TestCase):
     def test_public_command_publishes_an_interrupted_fallback(self):
         command = load_developer_command()
         state = self.root / "state"
-        build_root = self.root / "container-tools-c11"
+        build_root = self.root / "container-tools-runtime-boundary"
 
         with mock.patch.object(command.pathlib.Path, "cwd", return_value=self.workspace), mock.patch.dict(os.environ, {"HOME": str(self.root / "home"), "XDG_STATE_HOME": str(state)}, clear=False), mock.patch.object(
             command, "BUILD_ROOT", build_root
         ), mock.patch.object(
             command.deploy, "execute_developer_deployment", side_effect=KeyboardInterrupt
         ):
-            with mock.patch.object(command, "_build_host_package", return_value=(self.built_package, {**self._package_kwargs()["host_package_identity"], "libc": "musl"})):
+            with mock.patch.object(command, "_install_host_tools"):
                 self.assertEqual(command.main(self._command_args()), 2)
 
         result = json.loads((state / "mkchad" / "deploy" / "latest-result.json").read_text(encoding="utf-8"))
