@@ -92,18 +92,9 @@ def _install_host_tools(source: pathlib.Path, source_commit: str, temporary: pat
             not report the selected source commit.
     """
     build = temporary / "build"
-    architecture = deploy._native_architecture()
-    compiler = "musl-gcc" if architecture in {"x86_64", "aarch64"} else "gcc"
     prefix = pathlib.Path(os.environ.get("HOME", "~")).expanduser() / ".local"
-    for command in (
-        [
-            "cmake", "-S", str(source), "-B", str(build),
-            "-DCMAKE_BUILD_TYPE=Release", "-DCONTAINER_TOOLS_STATIC=ON",
-            f"-DCMAKE_C_COMPILER={compiler}", f"-DCMAKE_INSTALL_PREFIX={prefix}",
-        ],
-        ["cmake", "--build", str(build)],
-        ["cmake", "--install", str(build)],
-    ):
+    architecture, commands = deploy._container_tools_build_commands(source, build, prefix)
+    for command in commands:
         completed = deploy._capture(command, timeout=BUILD_TIMEOUT)
         _write_build_output(sys.stdout, log, completed.stdout)
         _write_build_output(sys.stderr, log, completed.stderr)
@@ -112,19 +103,7 @@ def _install_host_tools(source: pathlib.Path, source_commit: str, temporary: pat
     completed = deploy._capture([str(prefix / "bin" / "container-tools"), "--version", "--json"], timeout=BUILD_TIMEOUT)
     if completed.returncode:
         raise deploy.DeploymentError("installed container-tools version check failed")
-    try:
-        identity = json.loads(completed.stdout, object_pairs_hook=deploy._reject_duplicates)
-    except (json.JSONDecodeError, deploy.DeploymentError) as exc:
-        raise deploy.DeploymentError("installed container-tools version is malformed") from exc
-    if (
-        not isinstance(identity, dict)
-        or set(identity) != {"product_version", "source_commit", "architecture", "mount_plan_grammar"}
-        or not isinstance(identity["product_version"], str)
-        or identity["source_commit"] != source_commit
-        or identity["architecture"] != architecture
-        or identity["mount_plan_grammar"] != "ct-mount-plan-v1"
-    ):
-        raise deploy.DeploymentError("installed container-tools identity does not match selected source")
+    deploy._container_tools_identity(completed.stdout, source_commit, architecture)
 
 
 @contextlib.contextmanager
@@ -175,20 +154,6 @@ def _reclaim_stale_build_runs():
             _discard_build_run(candidate)
 
 
-def _stage_build_source(source: pathlib.Path, source_commit: str, temporary: pathlib.Path) -> pathlib.Path:
-    """Stage the caller-selected exact container-tools commit for private building."""
-    _, checkout = deploy._stage(
-        {
-            "name": "container_tools",
-            "repository": deploy.DEVELOPER_REPOSITORIES["container_tools"],
-            "commit": source_commit,
-        },
-        temporary,
-        source,
-    )
-    return checkout
-
-
 def main(argv: list[str] | None = None) -> int:
     """Run one local developer deployment under the shared invocation lock.
 
@@ -213,17 +178,20 @@ def main(argv: list[str] | None = None) -> int:
             latest_result = state_root / "latest-result.json"
             with log_path.open("x", encoding="utf-8") as log, contextlib.redirect_stdout(_StreamLog(sys.stdout, log)), contextlib.redirect_stderr(_StreamLog(sys.stderr, log)):
                 try:
-                    admission = deploy.admit_developer_workspace(workspace)
-                    source = workspace / "msk_containers" / "container_tools"
-                    source_commit = deploy._developer_child(source, "container-tools source")
-                    if source_commit != admission["commits"]["container_tools"]:
-                        raise deploy.DeploymentError("container-tools source commit does not match admitted workspace child")
                     with _build_root_lock():
                         _reclaim_stale_build_runs()
                         temporary = pathlib.Path(tempfile.mkdtemp(prefix=f"run-{run_id}-", dir=BUILD_ROOT))
                         try:
-                            staged_source = _stage_build_source(source, source_commit, temporary)
-                            status = deploy.execute_developer_deployment(workspace, args.image.absolute(), staged_source, installer=lambda: _install_host_tools(staged_source, source_commit, temporary, log), log_path=log_path, result_path=result_path, run_id=run_id, replace_partial=args.replace_partial)
+                            status = deploy.execute_developer_deployment(
+                                workspace,
+                                args.image.absolute(),
+                                installer=lambda staged_source, source_commit, _staging: _install_host_tools(staged_source, source_commit, temporary, log),
+                                staging_root=temporary,
+                                log_path=log_path,
+                                result_path=result_path,
+                                run_id=run_id,
+                                replace_partial=args.replace_partial,
+                            )
                             if _matching_result(result_path, run_id, log_path, status):
                                 os.replace(result_path, latest_result)
                                 return status

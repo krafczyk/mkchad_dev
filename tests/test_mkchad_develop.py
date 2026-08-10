@@ -103,8 +103,8 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         return self._run(["git", "-C", str(path), "rev-parse", "HEAD"]).stdout.strip()
 
     def _package_kwargs(self):
-        """Return the admitted source and a deterministic installer fixture."""
-        return {"source": self.tools, "installer": lambda: None}
+        """Return a deterministic installer fixture."""
+        return {"installer": lambda _source, _commit, _staging: None, "staging_root": self.root}
 
     def _write_image(self, path):
         """Write one opaque image fixture."""
@@ -241,8 +241,16 @@ class DeveloperWorkspaceTests(unittest.TestCase):
             "XDG_STATE_HOME": str(self.root / "state"), "NVIM_CONTAINER_DIR": str(home / "containers"),
         }
         result_path = self.root / "developer-result.json"
+        installed = {}
+
+        def install(source, source_commit, staging):
+            installed["source"] = source
+            installed["commit"] = self._commit_value(source)
+            installed["selected_commit"] = source_commit
+            installed["staging"] = staging
+
         with mock.patch.dict(os.environ, environment, clear=False), mock.patch.object(self.deploy, "_runtime_image"), mock.patch.object(self.deploy, "_run_action"), mock.patch.object(self.deploy, "_host_tool_mismatches", return_value={"msk_containers": None, "opencode-db": None}), mock.patch.object(self.deploy, "_active_image_digest", return_value=hashlib.sha256(image.read_bytes()).hexdigest()):
-            self.assertEqual(self.deploy.execute_developer_deployment(self.workspace, image, log_path=self.root / "developer.log", result_path=result_path, run_id="123e4567-e89b-12d3-a456-426614174000", **self._package_kwargs()), 0)
+            self.assertEqual(self.deploy.execute_developer_deployment(self.workspace, image, installer=install, staging_root=self.root, log_path=self.root / "developer.log", result_path=result_path, run_id="123e4567-e89b-12d3-a456-426614174000"), 0)
         result = json.loads(result_path.read_text(encoding="utf-8"))
         self.assertEqual(result["mode"], "developer")
         self.assertEqual(result["outcome"], "succeeded")
@@ -250,6 +258,11 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         destination = self.root / "config" / "mkchad"
         self.assertEqual(self._commit_value(destination), self._commit_value(self.mkchad))
         self.assertEqual(self._commit_value(self.root / "data" / "mkchad" / "components" / "opencode-db"), self._commit_value(self.database))
+        self.assertNotEqual(installed["source"], self.tools)
+        self.assertEqual(installed["commit"], self._commit_value(self.tools))
+        self.assertEqual(installed["selected_commit"], installed["commit"])
+        self.assertEqual(installed["source"].parent, installed["staging"])
+        self.assertEqual(installed["staging"].parent, self.root)
         self.assertTrue(image.is_file())
 
     def test_omitted_image_preserves_active_state_and_skips_image_actions(self):
@@ -380,9 +393,9 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         state = self.root / "state"
         observed = {}
 
-        def execute_deployment(_workspace, image, source, **_kwargs):
+        def execute_deployment(_workspace, image, **kwargs):
             observed["image"] = image
-            observed["commit"] = self._commit_value(source)
+            kwargs["installer"](self.tools, self._commit_value(self.tools), self.root / "staging")
             return 2
 
         with mock.patch.object(command.pathlib.Path, "cwd", return_value=self.workspace), mock.patch.dict(os.environ, {"HOME": str(self.root / "home"), "XDG_STATE_HOME": str(state)}, clear=False), mock.patch.object(
@@ -393,7 +406,6 @@ class DeveloperWorkspaceTests(unittest.TestCase):
             self.assertEqual(command.main(self._command_args()), 2)
 
         self.assertEqual(observed["image"], (self.root / "image.sif").absolute())
-        self.assertEqual(observed["commit"], self._commit_value(self.tools))
         with self.assertRaises(SystemExit):
             command.main([*self._command_args(), "--container-tools-host-package", "/tmp/package.tar.gz"])
         with self.assertRaises(SystemExit):
@@ -430,7 +442,7 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         self.assertEqual(commands[3][-2:], ["--version", "--json"])
         self.assertEqual(capture.call_args.kwargs, {"timeout": command.BUILD_TIMEOUT})
 
-    def test_public_command_builds_from_a_private_exact_commit_checkout(self):
+    def test_public_command_builds_from_the_deployer_supplied_checkout(self):
         command = load_developer_command()
         state = self.root / "state"
         build_root = self.root / "container-tools-runtime-boundary"
@@ -440,14 +452,13 @@ class DeveloperWorkspaceTests(unittest.TestCase):
             observed["source"] = source
             observed["commit"] = source_commit
             observed["temporary"] = temporary
-            self.assertNotEqual(source, self.tools)
             self.assertEqual(self._commit_value(source), source_commit)
             self.assertEqual((source / "VERSION").read_text(encoding="ascii"), "1.0.0-dev\n")
         with mock.patch.object(command.pathlib.Path, "cwd", return_value=self.workspace), mock.patch.dict(
             os.environ, {"HOME": str(self.root / "home"), "XDG_STATE_HOME": str(state)}, clear=False
         ), mock.patch.object(command, "BUILD_ROOT", build_root), mock.patch.object(
             command, "_install_host_tools", side_effect=build
-        ), mock.patch.object(command.deploy, "execute_developer_deployment", side_effect=lambda *_args, **kwargs: (kwargs["installer"](), 2)[1]):
+        ), mock.patch.object(command.deploy, "execute_developer_deployment", side_effect=lambda *_args, **kwargs: (kwargs["installer"](self.tools, self._commit_value(self.tools), self.root / "staging"), 2)[1]):
             self.assertEqual(command.main(self._command_args()), 2)
 
         self.assertEqual(observed["commit"], self._commit_value(self.tools))
@@ -625,7 +636,7 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         ), mock.patch.object(command, "BUILD_ROOT", build_root), mock.patch.object(
             command, "_install_host_tools", side_effect=command.deploy.DeploymentError("process-group cleanup did not complete")
         ), mock.patch.object(
-            command.deploy, "execute_developer_deployment", side_effect=lambda *_args, **kwargs: kwargs["installer"]()
+            command.deploy, "execute_developer_deployment", side_effect=lambda *_args, **kwargs: kwargs["installer"](self.tools, self._commit_value(self.tools), self.root / "staging")
         ):
             self.assertEqual(command.main(self._command_args()), 2)
 
@@ -879,7 +890,7 @@ class DeveloperWorkspaceTests(unittest.TestCase):
             with self.subTest(build=type(build).__name__), mock.patch.object(command.pathlib.Path, "cwd", return_value=self.workspace), mock.patch.dict(os.environ, {"HOME": str(self.root / "home"), "XDG_STATE_HOME": str(state)}, clear=False), mock.patch.object(
                 command, "BUILD_ROOT", build_parent
             ), mock.patch.object(command.deploy, "_capture", side_effect=fail_build), mock.patch.object(
-                command.deploy, "execute_developer_deployment", side_effect=lambda *_args, **kwargs: kwargs["installer"]()
+                command.deploy, "execute_developer_deployment", side_effect=lambda *_args, **kwargs: kwargs["installer"](self.tools, self._commit_value(self.tools), self.root / "staging")
             ):
                 self.assertEqual(command.main(self._command_args()), 2)
 
@@ -902,7 +913,7 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         with mock.patch.object(command.pathlib.Path, "cwd", return_value=self.workspace), mock.patch.dict(os.environ, {"HOME": str(self.root / "home"), "XDG_STATE_HOME": str(state)}, clear=False), mock.patch.object(
             command, "BUILD_ROOT", build_parent
         ), mock.patch.object(command.deploy, "_capture", side_effect=interrupt_build), mock.patch.object(
-            command.deploy, "execute_developer_deployment", side_effect=lambda *_args, **kwargs: kwargs["installer"]()
+            command.deploy, "execute_developer_deployment", side_effect=lambda *_args, **kwargs: kwargs["installer"](self.tools, self._commit_value(self.tools), self.root / "staging")
         ):
             self.assertEqual(command.main(self._command_args()), 2)
 

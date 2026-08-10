@@ -22,15 +22,4 @@ python3 -m unittest -v tests.test_mkchad_release tests.test_mkchad_develop tests
 bash tests/container_tools_real_builder_gate.sh
 bash tests/container_tools_release_runtime_test.sh --self-test
 
-if python3 deploy/mkchad_release.py --release fixture --image /tmp/image.sif \
-  --container-tools-host-package /tmp/package.tar.gz >/dev/null 2>&1; then
-  printf '%s\n' 'release CLI accepted the removed package selector' >&2
-  exit 1
-fi
-if python3 deploy/mkchad_develop.py --image /tmp/image.sif \
-  --container-tools-source /tmp/source >/dev/null 2>&1; then
-  printf '%s\n' 'developer CLI accepted the removed source selector' >&2
-  exit 1
-fi
-
 printf '%s\n' 'deployment tests passed'

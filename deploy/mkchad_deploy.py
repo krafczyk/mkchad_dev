@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
 import contextlib
 import datetime
 import fcntl
@@ -905,7 +906,7 @@ def _publish(path: pathlib.Path, document: dict, *, validate=True):
     os.replace(temporary, path)
 
 
-def _execute_components(deployed: dict[str, dict], artifact: dict, image: pathlib.Path | None, *, developer: bool, log_path: pathlib.Path, result_path: pathlib.Path, run_id: str, replace_partial: bool, stage_sources, recheck_sources, install_host_tools, result_builder) -> int:
+def _execute_components(deployed: dict[str, dict], artifact: dict, image: pathlib.Path | None, *, developer: bool, result_path: pathlib.Path, replace_partial: bool, staging_root: pathlib.Path | None, stage_sources, recheck_sources, install_host_tools, result_builder) -> int:
     """Run the shared target procedure from already-selected component sources.
 
     Source selection differs between release and developer modes; destination
@@ -931,7 +932,7 @@ def _execute_components(deployed: dict[str, dict], artifact: dict, image: pathli
     ]
     action_results = {(item["component"], item["id"]): item for item in actions}
     image_info = {"choice": "omitted" if image is None else "install", "supplied_sha256": None, "active_sha256": None, "decision": "preserved" if image is None else "pending"}
-    staging = pathlib.Path(tempfile.mkdtemp(prefix="mkchad-deploy-"))
+    staging = pathlib.Path(tempfile.mkdtemp(prefix="mkchad-deploy-", dir=staging_root))
     try:
         if image is not None:
             image_info["supplied_sha256"] = _stable_regular_digest(image, "caller image")
@@ -1088,7 +1089,7 @@ def _execute_components(deployed: dict[str, dict], artifact: dict, image: pathli
                     failure_step = "caller-image-consumption"
                     _consume_caller_image(image, roots, artifact["sha256"])
             diagnostic = "developer deployment verified" if developer else "deployment verified; configuration is pending"
-            install_host_tools(staged["container_tools"][1], staging)
+            install_host_tools(staged["container_tools"][1], deployed["container_tools"]["commit"], staging)
             _publish(result_path, result_builder(roots, actions, "succeeded", phase, None, diagnostic, started_at, image_info), validate=not developer)
             return 0
     except KeyboardInterrupt:
@@ -1106,6 +1107,39 @@ def _execute_components(deployed: dict[str, dict], artifact: dict, image: pathli
         shutil.rmtree(staging, ignore_errors=True)
 
 
+def _container_tools_build_commands(source: pathlib.Path, build: pathlib.Path, prefix: pathlib.Path) -> tuple[str, tuple[list[str], ...]]:
+    """Return the native architecture and fixed CMake source-install commands."""
+    architecture = _native_architecture()
+    compiler = "musl-gcc" if architecture in {"x86_64", "aarch64"} else "gcc"
+    return architecture, (
+        [
+            "cmake", "-S", str(source), "-B", str(build),
+            "-DCMAKE_BUILD_TYPE=Release", "-DCONTAINER_TOOLS_STATIC=ON",
+            f"-DCMAKE_C_COMPILER={compiler}", f"-DCMAKE_INSTALL_PREFIX={prefix}",
+        ],
+        ["cmake", "--build", str(build)],
+        ["cmake", "--install", str(build)],
+    )
+
+
+def _container_tools_identity(stdout: str, source_commit: str, architecture: str) -> dict:
+    """Parse and validate one compile-time container-tools identity object."""
+    try:
+        identity = json.loads(stdout, object_pairs_hook=_reject_duplicates)
+    except (json.JSONDecodeError, DeploymentError) as exc:
+        raise DeploymentError("installed container-tools version is malformed") from exc
+    if (
+        not isinstance(identity, dict)
+        or set(identity) != {"product_version", "source_commit", "architecture", "mount_plan_grammar"}
+        or not isinstance(identity["product_version"], str)
+        or identity["source_commit"] != source_commit
+        or identity["architecture"] != architecture
+        or identity["mount_plan_grammar"] != "ct-mount-plan-v1"
+    ):
+        raise DeploymentError("installed container-tools identity does not match selected source")
+    return identity
+
+
 def _install_host_tools(source: pathlib.Path, source_commit: str, staging: pathlib.Path) -> None:
     """Build and install one staged container-tools checkout with CMake.
 
@@ -1118,37 +1152,17 @@ def _install_host_tools(source: pathlib.Path, source_commit: str, staging: pathl
         DeploymentError: If CMake fails or the installed binary does not report
             the source commit selected for this deployment.
     """
-    architecture = _native_architecture()
-    compiler = "musl-gcc" if architecture in {"x86_64", "aarch64"} else "gcc"
     prefix = _roots()["home"] / ".local"
     build = staging / "container-tools-build"
-    for command in (
-        [
-            "cmake", "-S", str(source), "-B", str(build),
-            "-DCMAKE_BUILD_TYPE=Release", "-DCONTAINER_TOOLS_STATIC=ON",
-            f"-DCMAKE_C_COMPILER={compiler}", f"-DCMAKE_INSTALL_PREFIX={prefix}",
-        ],
-        ["cmake", "--build", str(build)],
-        ["cmake", "--install", str(build)],
-    ):
+    architecture, commands = _container_tools_build_commands(source, build, prefix)
+    for command in commands:
         result = _capture(command, timeout=300)
         if result.returncode:
             raise DeploymentError("container-tools CMake installation failed")
     result = _capture([str(prefix / "bin" / "container-tools"), "--version", "--json"], timeout=40)
-    try:
-        identity = json.loads(result.stdout, object_pairs_hook=_reject_duplicates)
-    except (json.JSONDecodeError, DeploymentError) as exc:
-        raise DeploymentError("installed container-tools version is malformed") from exc
-    if (
-        result.returncode
-        or not isinstance(identity, dict)
-        or set(identity) != {"product_version", "source_commit", "architecture", "mount_plan_grammar"}
-        or not isinstance(identity["product_version"], str)
-        or identity["source_commit"] != source_commit
-        or identity["architecture"] != architecture
-        or identity["mount_plan_grammar"] != "ct-mount-plan-v1"
-    ):
+    if result.returncode:
         raise DeploymentError("installed container-tools identity does not match selected source")
+    _container_tools_identity(result.stdout, source_commit, architecture)
 
 
 def execute_deployment(repo: pathlib.Path, image: pathlib.Path, *, release_tag: str, log_path: pathlib.Path, result_path: pathlib.Path, run_id: str, replace_partial: bool = False) -> int:
@@ -1182,21 +1196,25 @@ def execute_deployment(repo: pathlib.Path, image: pathlib.Path, *, release_tag: 
         raise DeploymentError("release has no image for this architecture")
     deployed = {item["name"]: dict(item) for item in manifest["components"] if item["disposition"] == "deployed"}
     return _execute_components(
-        deployed, artifact, image, developer=False, log_path=log_path, result_path=result_path, run_id=run_id, replace_partial=replace_partial,
+        deployed, artifact, image, developer=False, result_path=result_path, replace_partial=replace_partial, staging_root=None,
         stage_sources=_stage_release_sources, recheck_sources=lambda: None,
-        install_host_tools=lambda source, staging: _install_host_tools(source, deployed["container_tools"]["commit"], staging),
+        install_host_tools=_install_host_tools,
         result_builder=lambda roots, actions, outcome, phase, failed_step, diagnostic, started_at, image_info: _result(manifest, roots, artifact, run_id, release_tag, started_at, log_path, actions, outcome, phase, failed_step, diagnostic, image_info["active_sha256"]),
     )
 
 
-def execute_developer_deployment(workspace: pathlib.Path, image: pathlib.Path | None, source: pathlib.Path, *, installer, log_path: pathlib.Path, result_path: pathlib.Path, run_id: str, replace_partial: bool = False) -> int:
+def execute_developer_deployment(workspace: pathlib.Path, image: pathlib.Path | None, *, installer: Callable[[pathlib.Path, str, pathlib.Path], None], staging_root: pathlib.Path, log_path: pathlib.Path, result_path: pathlib.Path, run_id: str, replace_partial: bool = False) -> int:
     """Deploy clean local child commits through the regular target procedure.
 
     Args:
         workspace: Canonical parent workspace with four clean child checkouts.
         image: Optional caller-owned image; omission preserves active image state.
-        source: Private checkout of the admitted nested container-tools child.
-        installer: Callable that installs and verifies that selected source.
+        installer: Callback accepting the invocation-scoped staged
+            container-tools checkout, its admitted commit, and its staging
+            root. It installs and verifies the selected host tool before the
+            staging tree is removed.
+        staging_root: Existing command-owned directory beneath which source
+            staging is created and removed.
         log_path: Absolute launcher-owned log path.
         result_path: Path receiving the terminal developer result.
         run_id: Invocation UUID.
@@ -1204,7 +1222,8 @@ def execute_developer_deployment(workspace: pathlib.Path, image: pathlib.Path | 
             without lifecycle tooling is inactive.
 
     Returns:
-        Zero on verified success, otherwise two after publishing failure state.
+        Zero on verified success, otherwise two after publishing failure state,
+        including supported installer failures.
 
     Raises:
         DeploymentError: If source admission, architecture, or handoff fails.
@@ -1220,13 +1239,14 @@ def execute_developer_deployment(workspace: pathlib.Path, image: pathlib.Path | 
     if architecture not in ARCHITECTURES:
         raise DeploymentError("developer deployment has no image for this architecture")
     artifact = {"architecture": architecture, "sha256": None}
-    if _developer_child(source, "staged container-tools source") != admission["commits"]["container_tools"]:
+    source = workspace / "msk_containers" / "container_tools"
+    if _developer_child(source, "container-tools source") != admission["commits"]["container_tools"]:
         raise DeploymentError("developer container-tools source does not match the admitted workspace child")
     deployed = _developer_components(admission["commits"])
     return _execute_components(
-        deployed, artifact, image, developer=True, log_path=log_path, result_path=result_path, run_id=run_id, replace_partial=replace_partial,
+        deployed, artifact, image, developer=True, result_path=result_path, replace_partial=replace_partial, staging_root=staging_root,
         stage_sources=lambda _components, staging: stage_developer_sources(admission, staging), recheck_sources=lambda: recheck_developer_workspace(admission),
-        install_host_tools=lambda _source, _staging: installer(),
+        install_host_tools=installer,
         result_builder=lambda _roots, actions, outcome, phase, failed_step, diagnostic, started, image_info: developer_result(admission, actions=actions, artifact=artifact, image=image_info, run_id=run_id, started_at=started, log_path=log_path, outcome=outcome, phase=phase, failed_step=failed_step, diagnostic=diagnostic),
     )
 

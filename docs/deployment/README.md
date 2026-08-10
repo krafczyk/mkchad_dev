@@ -64,10 +64,10 @@ source and must match the admitted nested gitlink. Any dirty, staged, untracked,
 unmerged, renamed, or type-changing child bytes are rejected before target
 mutation.
 
-The command stages that source's admitted exact commit into an invocation-private
-directory below `/tmp/mkchad-v1/container-tools-runtime-boundary`, then builds
-and installs the static executable with normal CMake commands while holding both
-the shared invocation lock and a fixed
+The command stages all admitted exact commits below its invocation-private
+`run-*` directory in `/tmp/mkchad-v1/container-tools-runtime-boundary`, then
+builds and installs the static executable from that staged source with normal
+CMake commands while holding both the shared invocation lock and a fixed
 build-root-global nonblocking lock. The latter spans stale-run reclamation,
 staging, building, deployment, and result publication, so commands using
 different XDG state roots cannot reclaim each other's active build directories.
