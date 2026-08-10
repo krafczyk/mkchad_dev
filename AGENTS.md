@@ -63,12 +63,13 @@ define focused verification and any required local toolchain details.
 
 ## Schumann Container Storage Override
 
-Container image builds and SingularityCE/Apptainer runtime storage are an
-explicit exception to the default disposable root on this host. The tracked
-Schumann `~/.config/ct_runtime.conf` redirects their large cache and temporary
-trees beneath `/data1/matthew`; architecture-specific Buildx caches are
-serialized and generation-rotated there. Source checkouts, ordinary tests, and
-all other disposable artifacts remain beneath `/tmp/mkchad-v1`.
+SingularityCE/Apptainer runtime storage is an explicit exception to the default
+disposable root on this host. The tracked Schumann `~/.config/ct_runtime.conf`
+redirects its large cache and temporary trees beneath `/data1/matthew`. Native
+image builders own their cache and temporary storage through their normal
+defaults or caller configuration; this workspace does not manage it. Source
+checkouts, ordinary tests, and all other disposable artifacts remain beneath
+`/tmp/mkchad-v1`.
 
 ## Protected Live Paths
 
