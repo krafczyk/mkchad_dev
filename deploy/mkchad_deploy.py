@@ -1118,7 +1118,14 @@ def _execute_components(deployed: dict[str, dict], artifact: dict, image: pathli
             active = False
             if lifecycle.exists():
                 status = _capture([str(lifecycle), "status", "--json"], env={**os.environ, "HOME": str(roots["home"]), "XDG_CONFIG_HOME": str(roots["xdg_config_home"]), "XDG_DATA_HOME": str(roots["xdg_data_home"]), "XDG_STATE_HOME": str(roots["xdg_state_home"])}, timeout=40)
-                payload = json.loads(status.stdout) if not status.returncode else None
+                try:
+                    payload = json.loads(status.stdout) if not status.returncode else None
+                except json.JSONDecodeError as exc:
+                    raise DeploymentError(
+                        "installed lifecycle command returned malformed status JSON",
+                        category="lifecycle-status",
+                        action="installed lifecycle command returned malformed status JSON; reinstall the MkChad host launchers, then rerun",
+                    ) from exc
                 if not isinstance(payload, dict) or payload.get("schema") != 1 or payload.get("ok") is not True or payload.get("command") != "status" or payload.get("status") not in {"inactive", "healthy", "degraded", "blocked", "starting", "stopping", "failed"}:
                     raise DeploymentError(
                         "managed service status is unavailable or malformed",

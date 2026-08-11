@@ -536,6 +536,23 @@ class DeploymentExecutionTests(unittest.TestCase):
             self.assertEqual(self._execute("323e4567-e89b-12d3-a456-426614174000"), 0)
         self.assertEqual(host_tool.stat().st_mode & 0o777, 0o755)
 
+    def test_malformed_lifecycle_stdout_reports_the_repair_prerequisite(self):
+        self.assertEqual(self._execute(), 0)
+        lifecycle = self.home / ".local" / "bin" / "mkchad-opencode-server"
+        lifecycle.write_text(
+            "#!/bin/sh\nprintf '%s\\n' debug '{\"schema\":1,\"ok\":true,\"command\":\"status\",\"status\":\"inactive\"}'\n",
+            encoding="ascii",
+        )
+        lifecycle.chmod(0o755)
+
+        self.assertEqual(self._execute("223e4567-e89b-12d3-a456-426614174000"), 2)
+
+        diagnostic = self._result()["diagnostic"]
+        self.assertIn("lifecycle-status", diagnostic)
+        self.assertIn("installed lifecycle command returned malformed status JSON", diagnostic)
+        self.assertIn("reinstall the MkChad host launchers", diagnostic)
+        self.assertNotIn("command-failure", diagnostic)
+
     def test_opencode_db_launcher_mismatch_requires_inactive_lifecycle_and_reinstalls(self):
         self.assertEqual(self._execute(), 0)
         launcher = self.home / ".local" / "bin" / "opencode-db"
