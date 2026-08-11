@@ -43,6 +43,37 @@ class _StreamLog:
         self.log.flush()
 
 
+def _diagnostic(operation: str, category: str, action: str, log_path: pathlib.Path | None = None) -> str:
+    """Render one bounded developer diagnostic using the shared redaction policy."""
+    return release._diagnostic(operation, category, action, log_path)
+
+
+def _develop_failure_diagnostic(error: BaseException, log_path: pathlib.Path) -> str:
+    """Classify local build and deployment errors without publishing exception text."""
+    if isinstance(error, deploy.DeploymentError) and error.category is not None and error.action is not None:
+        return _diagnostic("developer deployment", error.category, error.action, log_path)
+    text = str(error)
+    if "CMake" in text:
+        category = "cmake-install"
+    elif "installed container-tools" in text:
+        category = "installed-version"
+    elif "developer build root" in text:
+        category = "build-root"
+    elif "another developer build" in text:
+        category = "build-contention"
+    elif "cleanup" in text:
+        category = "command-cleanup"
+    elif "timed out" in text:
+        category = "command-timeout"
+    elif "output exceeded" in text:
+        category = "command-output-limit"
+    elif "source" in text or "child" in text or "workspace" in text:
+        category = "source-admission"
+    else:
+        category = "deployment-failure"
+    return _diagnostic("developer deployment", category, "repair the reported prerequisite and rerun", log_path)
+
+
 def _fallback_result(workspace: pathlib.Path, run_id: str, started_at: str, log_path: pathlib.Path, diagnostic: str, image: pathlib.Path | None) -> dict:
     """Build a bounded developer failure result before source admission completes."""
     return {
@@ -55,13 +86,33 @@ def _fallback_result(workspace: pathlib.Path, run_id: str, started_at: str, log_
     }
 
 
-def _matching_result(path: pathlib.Path, run_id: str, log_path: pathlib.Path, status: int) -> bool:
-    """Return whether the direct deployer published this invocation's result."""
+def _load_result(path: pathlib.Path, run_id: str, log_path: pathlib.Path, status: int) -> tuple[dict | None, str | None]:
+    """Read one developer result and return its document or safe rejection category."""
     try:
         document = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None, "missing"
     except (OSError, json.JSONDecodeError):
-        return False
-    return document.get("mode") == "developer" and document.get("run_id") == run_id and document.get("log_path") == str(log_path) and (status == 0) == (document.get("outcome") == "succeeded")
+        return None, "unreadable"
+    if not isinstance(document, dict) or document.get("mode") != "developer":
+        return None, "schema-invalid"
+    if document.get("run_id") != run_id:
+        return None, "run-binding-mismatch"
+    if document.get("log_path") != str(log_path):
+        return None, "log-binding-mismatch"
+    if (status == 0) != (document.get("outcome") == "succeeded"):
+        return None, "status-outcome-mismatch"
+    return document, None
+
+
+def _child_result_issue(path: pathlib.Path, run_id: str, log_path: pathlib.Path, status: int) -> str | None:
+    """Return a safe rejection category for a direct deployer result."""
+    return _load_result(path, run_id, log_path, status)[1]
+
+
+def _matching_result(path: pathlib.Path, run_id: str, log_path: pathlib.Path, status: int) -> bool:
+    """Return whether the direct deployer published this invocation's result."""
+    return _load_result(path, run_id, log_path, status)[1] is None
 
 
 def _write_build_output(stream, log, text: str) -> None:
@@ -94,15 +145,23 @@ def _install_host_tools(source: pathlib.Path, source_commit: str, temporary: pat
     build = temporary / "build"
     prefix = pathlib.Path(os.environ.get("HOME", "~")).expanduser() / ".local"
     architecture, commands = deploy._container_tools_build_commands(source, build, prefix)
-    for command in commands:
+    for phase, command in zip(("configure", "build", "install"), commands, strict=True):
         completed = deploy._capture(command, timeout=BUILD_TIMEOUT)
         _write_build_output(sys.stdout, log, completed.stdout)
         _write_build_output(sys.stderr, log, completed.stderr)
         if completed.returncode:
-            raise deploy.DeploymentError("container-tools CMake installation failed")
+            raise deploy.DeploymentError(
+                f"container-tools CMake {phase} failed",
+                category=f"cmake-{phase}",
+                action=f"inspect the retained CMake output, repair the {phase} prerequisites after status {completed.returncode}, and rerun",
+            )
     completed = deploy._capture([str(prefix / "bin" / "container-tools"), "--version", "--json"], timeout=BUILD_TIMEOUT)
     if completed.returncode:
-        raise deploy.DeploymentError("installed container-tools version check failed")
+        raise deploy.DeploymentError(
+            "installed container-tools version check failed",
+            category="installed-version",
+            action=f"repair the installed container-tools executable after status {completed.returncode}, then rerun",
+        )
     deploy._container_tools_identity(completed.stdout, source_commit, architecture)
 
 
@@ -165,9 +224,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--image", type=pathlib.Path, required=True)
     parser.add_argument("--replace-partial", action="store_true")
     args = parser.parse_args(argv)
-    state_root = release._state_root()
-    workspace = pathlib.Path.cwd().resolve()
+    retained_log = None
     try:
+        state_root = release._state_root()
+        workspace = pathlib.Path.cwd().resolve()
         with release._invocation_lock(state_root):
             logs = state_root / "logs"
             release._rotate_logs(logs)
@@ -177,6 +237,7 @@ def main(argv: list[str] | None = None) -> int:
             result_path = state_root / f".result-{run_id}.json"
             latest_result = state_root / "latest-result.json"
             with log_path.open("x", encoding="utf-8") as log, contextlib.redirect_stdout(_StreamLog(sys.stdout, log)), contextlib.redirect_stderr(_StreamLog(sys.stderr, log)):
+                retained_log = log_path
                 try:
                     with _build_root_lock():
                         _reclaim_stale_build_runs()
@@ -192,17 +253,21 @@ def main(argv: list[str] | None = None) -> int:
                                 run_id=run_id,
                                 replace_partial=args.replace_partial,
                             )
-                            if _matching_result(result_path, run_id, log_path, status):
-                                os.replace(result_path, latest_result)
+                            document, issue = _load_result(result_path, run_id, log_path, status)
+                            if issue is None:
+                                assert document is not None
+                                release._promote_child_result(result_path, latest_result, document)
                                 return status
-                            release._publish_result(latest_result, _fallback_result(workspace, run_id, started_at, log_path, "developer deployer did not publish a matching terminal result", args.image))
+                            diagnostic = _diagnostic("developer deployer result", issue or "missing", "repair result publication and rerun", log_path)
+                            release._publish_result(latest_result, _fallback_result(workspace, run_id, started_at, log_path, diagnostic, args.image))
                             return status if status else 2
                         except (deploy.DeploymentError, OSError) as exc:
-                            release._write_stream(sys.stderr, log, ("mkchad-develop: " + str(exc) + "\n").encode())
-                            release._publish_result(latest_result, _fallback_result(workspace, run_id, started_at, log_path, str(exc), args.image))
+                            diagnostic = _develop_failure_diagnostic(exc, log_path)
+                            release._write_stream(sys.stderr, log, ("mkchad-develop: " + diagnostic + "\n").encode())
+                            release._publish_result(latest_result, _fallback_result(workspace, run_id, started_at, log_path, diagnostic, args.image))
                             return 2
                         except KeyboardInterrupt:
-                            result = _fallback_result(workspace, run_id, started_at, log_path, "developer deployment interrupted", args.image)
+                            result = _fallback_result(workspace, run_id, started_at, log_path, _diagnostic("developer deployment", "interrupted", "inspect the retained log, repair any partial state, and rerun", log_path), args.image)
                             result["outcome"] = "interrupted"
                             release._publish_result(latest_result, result)
                             return 2
@@ -211,18 +276,22 @@ def main(argv: list[str] | None = None) -> int:
                             # suppresses cleanup failures and interruption, preserving it.
                             _discard_build_run(temporary)
                 except (deploy.DeploymentError, OSError) as exc:
-                    release._write_stream(sys.stderr, log, ("mkchad-develop: " + str(exc) + "\n").encode())
-                    release._publish_result(latest_result, _fallback_result(workspace, run_id, started_at, log_path, str(exc), args.image))
+                    diagnostic = _develop_failure_diagnostic(exc, log_path)
+                    release._write_stream(sys.stderr, log, ("mkchad-develop: " + diagnostic + "\n").encode())
+                    release._publish_result(latest_result, _fallback_result(workspace, run_id, started_at, log_path, diagnostic, args.image))
                     return 2
                 except KeyboardInterrupt:
-                    result = _fallback_result(workspace, run_id, started_at, log_path, "developer deployment interrupted", args.image)
+                    result = _fallback_result(workspace, run_id, started_at, log_path, _diagnostic("developer deployment", "interrupted", "inspect the retained log, repair any partial state, and rerun", log_path), args.image)
                     result["outcome"] = "interrupted"
                     release._publish_result(latest_result, result)
                     return 2
                 finally:
                     result_path.unlink(missing_ok=True)
     except release.InvocationBusy:
-        print("mkchad-develop: another invocation is already running", file=sys.stderr)
+        print("mkchad-develop: " + _diagnostic("invocation", "contention", "another invocation is active; wait for it to finish and retry"), file=sys.stderr)
+        return 2
+    except (deploy.DeploymentError, OSError):
+        print("mkchad-develop: " + _diagnostic("diagnostic state", "filesystem", "repair the deployment state directory and retry", retained_log), file=sys.stderr)
         return 2
 
 

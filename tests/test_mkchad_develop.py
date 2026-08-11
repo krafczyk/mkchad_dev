@@ -302,7 +302,7 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         with mock.patch.dict(os.environ, environment, clear=False):
             self.assertEqual(self.deploy.execute_developer_deployment(self.workspace, None, log_path=self.root / "developer.log", result_path=result_path, run_id="123e4567-e89b-12d3-a456-426614174000", **self._package_kwargs()), 2)
 
-        self.assertIn("partial target has no lifecycle command", json.loads(result_path.read_text(encoding="utf-8"))["diagnostic"])
+        self.assertIn("lifecycle-prerequisite", json.loads(result_path.read_text(encoding="utf-8"))["diagnostic"])
         self.assertTrue((container_dir / "neovim.sif").is_symlink())
 
     def test_matching_developer_image_skips_image_work_and_preserves_caller(self):
@@ -351,7 +351,7 @@ class DeveloperWorkspaceTests(unittest.TestCase):
 
         self.assertTrue(image.is_file())
         action.assert_not_called()
-        self.assertIn("could prune the developer caller image", json.loads(result_path.read_text(encoding="utf-8"))["diagnostic"])
+        self.assertIn("image-admission", json.loads(result_path.read_text(encoding="utf-8"))["diagnostic"])
 
     def test_supplied_image_rejects_an_unsafe_active_selector_before_target_mutation(self):
         image = self.root / "image.sif"
@@ -626,7 +626,7 @@ class DeveloperWorkspaceTests(unittest.TestCase):
 
         result = json.loads((state / "mkchad" / "deploy" / "latest-result.json").read_text(encoding="utf-8"))
         self.assertEqual(result["outcome"], "failed")
-        self.assertIn("another developer build", result["diagnostic"])
+        self.assertIn("build-contention", result["diagnostic"])
 
     def test_public_command_publishes_final_wait_cleanup_failure(self):
         command = load_developer_command()
@@ -644,7 +644,7 @@ class DeveloperWorkspaceTests(unittest.TestCase):
 
         result = json.loads((state / "mkchad" / "deploy" / "latest-result.json").read_text(encoding="utf-8"))
         self.assertEqual(result["outcome"], "failed")
-        self.assertIn("process-group cleanup did not complete", result["diagnostic"])
+        self.assertIn("command-cleanup", result["diagnostic"])
 
     def test_capture_replaces_malformed_subprocess_output(self):
         result = self.deploy._capture(
@@ -675,7 +675,7 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="mkchad-develop-build-", dir="/tmp/mkchad-v1/container-tools-runtime-boundary") as temporary, mock.patch.object(
             command.deploy, "_capture", return_value=subprocess.CompletedProcess([], 1, stdout="", stderr="failed\n")
         ):
-            with self.assertRaisesRegex(command.deploy.DeploymentError, "CMake installation failed"):
+            with self.assertRaisesRegex(command.deploy.DeploymentError, "CMake configure failed"):
                 command._install_host_tools(self.tools, source_commit, pathlib.Path(temporary))
 
     def test_build_rejects_malformed_or_mismatched_compiled_identity(self):
@@ -876,9 +876,9 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         state = self.root / "state"
         build_parent = self.root / "container-tools-runtime-boundary"
 
-        for build, diagnostic in (
-            (subprocess.CompletedProcess([], 78, stdout="", stderr="build failed\n"), "CMake installation failed"),
-            (command.deploy.DeploymentError("command timed out after 1 seconds: cmake"), "timed out"),
+        for build, category in (
+            (subprocess.CompletedProcess([], 78, stdout="", stderr="build failed\n"), "cmake-configure"),
+            (command.deploy.DeploymentError("command timed out after 1 seconds: cmake"), "command-timeout"),
         ):
             capture = command.deploy._capture
 
@@ -899,7 +899,7 @@ class DeveloperWorkspaceTests(unittest.TestCase):
             self.assertEqual([path.name for path in build_parent.iterdir()], ["build.lock"])
             result = json.loads((state / "mkchad" / "deploy" / "latest-result.json").read_text(encoding="utf-8"))
             self.assertEqual(result["outcome"], "failed")
-            self.assertIn(diagnostic, result["diagnostic"])
+            self.assertIn(category, result["diagnostic"])
 
     def test_public_command_cleans_interrupted_build_and_publishes_interruption(self):
         command = load_developer_command()
@@ -939,7 +939,47 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         self.assertEqual(result["phase"], "preflight")
         self.assertEqual(result["failed_step"], "developer-admission")
         self.assertEqual(result["image"], {"choice": "install", "supplied_sha256": None, "active_sha256": None, "decision": "unavailable"})
-        self.assertIn("preflight unavailable", result["diagnostic"])
+        self.assertIn("deployment-failure", result["diagnostic"])
+
+    def test_developer_diagnostic_names_build_phase_and_retained_log(self):
+        command = load_developer_command()
+
+        diagnostic = command._diagnostic(
+            "container-tools build", "cmake-build", "repair the build prerequisites and rerun",
+            pathlib.Path("/tmp/mkchad-v1/run.log"),
+        )
+
+        self.assertEqual(
+            diagnostic,
+            "container-tools build: cmake-build: repair the build prerequisites and rerun; "
+            "inspect log: /tmp/mkchad-v1/run.log",
+        )
+
+    def test_developer_result_rejection_reports_safe_binding_categories(self):
+        command = load_developer_command()
+        with tempfile.TemporaryDirectory(prefix="developer-result-", dir="/tmp/mkchad-v1") as temporary:
+            result_path = pathlib.Path(temporary) / "result.json"
+            log_path = pathlib.Path(temporary) / "run.log"
+            expected = {
+                "mode": "developer",
+                "run_id": "run-1",
+                "log_path": str(log_path),
+                "outcome": "failed",
+                "diagnostic": "failed",
+            }
+            cases = (
+                (None, 2, "missing"),
+                ({"mode": "other"}, 2, "schema-invalid"),
+                ({**expected, "run_id": "run-2"}, 2, "run-binding-mismatch"),
+                ({**expected, "log_path": "/tmp/other.log"}, 2, "log-binding-mismatch"),
+                ({**expected, "outcome": "succeeded"}, 2, "status-outcome-mismatch"),
+            )
+            for document, status, issue in cases:
+                with self.subTest(issue=issue):
+                    result_path.unlink(missing_ok=True)
+                    if document is not None:
+                        result_path.write_text(json.dumps(document), encoding="utf-8")
+                    self.assertEqual(command._child_result_issue(result_path, "run-1", log_path, status), issue)
 
     def test_public_command_publishes_an_interrupted_fallback(self):
         command = load_developer_command()

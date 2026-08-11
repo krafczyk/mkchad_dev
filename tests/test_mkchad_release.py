@@ -276,15 +276,16 @@ raise SystemExit(child_exit)
         self.assertEqual(self.latest_result()["outcome"], "failed")
         self.assertEqual(self.latest_result()["diagnostic"], "fixture child failed")
         self.assertEqual(self.invoke(remote, child_mode="missing", child_exit=9)[0], 9)
-        self.assertIn("did not publish", self.latest_result()["diagnostic"])
+        self.assertIn("release deployer result: missing", self.latest_result()["diagnostic"])
+        self.assertNotIn("child standard error", self.latest_result()["diagnostic"])
         self.assertEqual(self.invoke(remote, child_mode="wrong-log")[0], 2)
-        self.assertIn("does not match", self.latest_result()["diagnostic"])
+        self.assertIn("log-binding-mismatch", self.latest_result()["diagnostic"])
         self.assertEqual(self.invoke(remote, child_mode="wrong-run")[0], 2)
-        self.assertIn("does not match", self.latest_result()["diagnostic"])
+        self.assertIn("run-binding-mismatch", self.latest_result()["diagnostic"])
         self.assertEqual(self.invoke(remote, child_mode="malformed")[0], 2)
-        self.assertIn("does not match", self.latest_result()["diagnostic"])
+        self.assertIn("schema-invalid", self.latest_result()["diagnostic"])
         self.assertEqual(self.invoke(remote, child_mode="stale")[0], 2)
-        self.assertIn("did not publish", self.latest_result()["diagnostic"])
+        self.assertIn("missing", self.latest_result()["diagnostic"])
 
     def test_interruption_promotes_the_run_bound_interrupted_result(self):
         checkout = self.root / "interrupted-checkout"
@@ -341,6 +342,22 @@ raise SystemExit(child_exit)
         self.assertEqual(self.invoke(remote)[0], 0)
         self.assertFalse(list(self.temp.glob("mkchad-release-*")))
 
+    def test_log_rotation_failure_is_controlled_without_replacing_a_prior_result(self):
+        _, remote, _ = self.remote_with_release()
+        self.deploy_root.mkdir(parents=True)
+        prior = self.deploy_root / "latest-result.json"
+        prior.write_text('{"previous":true}\n', encoding="utf-8")
+
+        with mock.patch.object(self.launcher, "_rotate_logs", side_effect=OSError("TOKEN=secret")):
+            status, _stdout, stderr = self.invoke(remote)
+
+        self.assertEqual(status, 2)
+        self.assertIn("mkchad-release: diagnostic state: filesystem", stderr)
+        self.assertNotIn("inspect log:", stderr)
+        self.assertNotIn("secret", stderr)
+        self.assertNotIn("Traceback", stderr)
+        self.assertEqual(prior.read_text(encoding="utf-8"), '{"previous":true}\n')
+
 
 class ReleaseLoggingTests(unittest.TestCase):
     """Exercise launcher logging behavior shared with release-owned deployment output."""
@@ -352,6 +369,82 @@ class ReleaseLoggingTests(unittest.TestCase):
         launcher._write_stream(terminal, log, b"API_TOKEN=DO-NOT-PUBLISH child output\n")
         self.assertEqual(terminal.getvalue(), "API_TOKEN=<redacted> child output\n")
         self.assertEqual(log.getvalue(), terminal.getvalue())
+
+    def test_actionable_diagnostic_is_redacted_and_points_to_the_retained_log(self):
+        launcher = load_launcher()
+
+        diagnostic = launcher._diagnostic(
+            "release acquisition", "git-operation", "check release access and retry",
+            pathlib.Path("/tmp/mkchad-v1/run.log"),
+        )
+
+        self.assertEqual(
+            diagnostic,
+            "release acquisition: git-operation: check release access and retry; "
+            "inspect log: /tmp/mkchad-v1/run.log",
+        )
+        self.assertNotIn("token=secret", launcher._diagnostic("x", "token=secret", "retry"))
+
+        bounded = launcher._diagnostic(
+            "release acquisition", "git-operation", "x" * 5000,
+            pathlib.Path("/tmp/mkchad-v1/retained.log"),
+        )
+        self.assertEqual(len(bounded), 4096)
+        self.assertTrue(bounded.endswith("; inspect log: /tmp/mkchad-v1/retained.log"))
+
+    def test_child_result_issue_does_not_expose_child_document_contents(self):
+        launcher = load_launcher()
+        with tempfile.TemporaryDirectory(prefix="child-result-", dir="/tmp/mkchad-v1") as temporary:
+            result = pathlib.Path(temporary) / "result.json"
+            result.write_text('{"token":"secret"}', encoding="utf-8")
+
+            issue = launcher._child_result_issue(
+                result,
+                run_id="123e4567-e89b-12d3-a456-426614174000",
+                release="v1",
+                log_path=pathlib.Path("/tmp/mkchad-v1/run.log"),
+                child_status=0,
+            )
+
+        self.assertEqual(issue, "schema-invalid")
+
+    def test_rejected_child_diagnostic_contains_no_subprocess_output(self):
+        launcher = load_launcher()
+
+        diagnostic = launcher._diagnostic(
+            "release deployer result", "schema-invalid",
+            "repair the release deployer result publication and rerun",
+            pathlib.Path("/tmp/mkchad-v1/run.log"),
+        )
+
+        self.assertEqual(
+            diagnostic,
+            "release deployer result: schema-invalid: repair the release deployer result publication and rerun; "
+            "inspect log: /tmp/mkchad-v1/run.log",
+        )
+        self.assertNotIn("child standard error", diagnostic)
+
+    def test_promoted_child_result_is_redacted_without_changing_its_contract(self):
+        launcher = load_launcher()
+        with tempfile.TemporaryDirectory(prefix="child-promotion-", dir="/tmp/mkchad-v1") as temporary:
+            root = pathlib.Path(temporary)
+            source = root / "source.json"
+            destination = root / "latest-result.json"
+            log_path = root / "run.log"
+            document = launcher._fallback_result(
+                "123e4567-e89b-12d3-a456-426614174000",
+                "v1",
+                "2026-08-11T00:00:00Z",
+                log_path,
+                "API_TOKEN=secret deployment failed",
+            )
+            source.write_text(json.dumps(document), encoding="utf-8")
+
+            launcher._promote_child_result(source, destination, document)
+
+            promoted = json.loads(destination.read_text(encoding="utf-8"))
+        self.assertTrue(launcher._valid_result_document(promoted))
+        self.assertEqual(promoted["diagnostic"], "API_TOKEN=<redacted> deployment failed")
 
 
 if __name__ == "__main__":

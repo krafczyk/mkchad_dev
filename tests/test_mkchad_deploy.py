@@ -133,6 +133,20 @@ class DeploymentContractTests(unittest.TestCase):
             )
         self.assertNotIn("-DCMAKE_C_FLAGS=-fno-link-libatomic", commands[0])
 
+    def test_release_host_install_reports_the_failed_cmake_phase_and_status(self):
+        responses = [
+            subprocess.CompletedProcess([], 0, stdout="", stderr=""),
+            subprocess.CompletedProcess([], 78, stdout="", stderr="failed"),
+        ]
+        with tempfile.TemporaryDirectory(prefix="release-host-install-", dir="/tmp/mkchad-v1") as temporary, mock.patch.object(
+            self.deploy, "_capture", side_effect=responses
+        ), mock.patch.object(self.deploy, "_roots", return_value={"home": pathlib.Path(temporary) / "home"}):
+            with self.assertRaises(self.deploy.DeploymentError) as raised:
+                self.deploy._install_host_tools(pathlib.Path(temporary) / "source", "a" * 40, pathlib.Path(temporary))
+
+        self.assertEqual(raised.exception.category, "cmake-configure")
+        self.assertIn("status 78", raised.exception.action)
+
     def test_image_artifacts_and_action_order_fail_closed(self):
         """Reject forged image metadata and deployment actions before staging."""
         mutations = (
@@ -247,6 +261,34 @@ class DeploymentContractTests(unittest.TestCase):
             with self.assertRaises(self.deploy.DeploymentError):
                 self.deploy.validate_result_v2_document(malformed)
 
+    def test_deployment_diagnostic_redacts_exception_text_without_commands_or_environment(self):
+        error = self.deploy.DeploymentError("command failed: API_TOKEN=DO-NOT-PUBLISH /private/command")
+
+        diagnostic = self.deploy._deployment_diagnostic("msk_containers:image-install", error, pathlib.Path("/tmp/mkchad-v1/run.log"))
+
+        self.assertEqual(
+            diagnostic,
+            "msk_containers:image-install: command-failure: repair the failed deployment prerequisite and rerun; "
+            "inspect log: /tmp/mkchad-v1/run.log",
+        )
+        self.assertNotIn("DO-NOT-PUBLISH", diagnostic)
+        self.assertNotIn("/private/command", diagnostic)
+
+    def test_deployment_diagnostic_preserves_log_suffix_when_safe_detail_is_large(self):
+        error = self.deploy.DeploymentError(
+            "partial target",
+            category="lifecycle-prerequisite",
+            action="confirm inactivity and retry",
+            safe_detail="x" * 5000,
+        )
+
+        diagnostic = self.deploy._deployment_diagnostic(
+            "preflight", error, pathlib.Path("/tmp/mkchad-v1/retained.log")
+        )
+
+        self.assertEqual(len(diagnostic), 4096)
+        self.assertTrue(diagnostic.endswith("; inspect log: /tmp/mkchad-v1/retained.log"))
+
 
 class DeploymentExecutionTests(unittest.TestCase):
     """Exercise the real schema-2 flow against isolated local fixture repositories."""
@@ -352,9 +394,9 @@ class DeploymentExecutionTests(unittest.TestCase):
     def _write_manifest(self):
         (self.repo / "deploy" / "release.json").write_text(json.dumps(self.manifest), encoding="utf-8")
 
-    def _execute(self, run_id="123e4567-e89b-12d3-a456-426614174000", *, replace_partial=False):
+    def _execute(self, run_id="123e4567-e89b-12d3-a456-426614174000", *, replace_partial=False, install_error=None):
         self.result = self.root / "result.json"
-        with mock.patch.object(self.deploy, "_install_host_tools") as install_host_tools:
+        with mock.patch.object(self.deploy, "_install_host_tools", side_effect=install_error) as install_host_tools:
             result = self.deploy.execute_deployment(
                 self.repo,
                 self.image,
@@ -487,7 +529,7 @@ class DeploymentExecutionTests(unittest.TestCase):
 
         with mock.patch.object(self.deploy, "_stage_image", side_effect=AssertionError("matching image must be reused")):
             self.assertEqual(self._execute("223e4567-e89b-12d3-a456-426614174000"), 2)
-        self.assertIn("managed service is active", self._result()["diagnostic"])
+        self.assertIn("lifecycle-status", self._result()["diagnostic"])
 
         os.environ["LIFECYCLE_STATUS"] = "inactive"
         with mock.patch.object(self.deploy, "_stage_image", side_effect=AssertionError("matching image must be reused")):
@@ -500,7 +542,7 @@ class DeploymentExecutionTests(unittest.TestCase):
         launcher.write_text("outdated\n", encoding="ascii")
         os.environ["LIFECYCLE_STATUS"] = "healthy"
         self.assertEqual(self._execute("223e4567-e89b-12d3-a456-426614174000"), 2)
-        self.assertIn("managed service is active", self._result()["diagnostic"])
+        self.assertIn("lifecycle-status", self._result()["diagnostic"])
         os.environ["LIFECYCLE_STATUS"] = "inactive"
         self.assertEqual(self._execute("323e4567-e89b-12d3-a456-426614174000"), 0)
         self.assertEqual(launcher.read_bytes(), (self._destination("opencode-db") / "bin" / "opencode-db").read_bytes())
@@ -521,7 +563,7 @@ class DeploymentExecutionTests(unittest.TestCase):
         launcher.parent.mkdir(parents=True, exist_ok=True)
         launcher.symlink_to(self.root / "outside")
         self.assertEqual(self._execute("223e4567-e89b-12d3-a456-426614174000", replace_partial=True), 2)
-        self.assertIn("action failed: opencode-db:opencode-db-preflight", self._result()["diagnostic"])
+        self.assertIn("opencode-db:opencode-db-preflight: action-nonzero", self._result()["diagnostic"])
 
     def test_opencode_db_launcher_is_a_partial_target_without_the_lifecycle_command(self):
         launcher = self.home / ".local" / "bin" / "opencode-db"
@@ -530,8 +572,12 @@ class DeploymentExecutionTests(unittest.TestCase):
 
         self.assertEqual(self._execute(), 2)
 
-        self.assertIn(str(launcher), self._result()["diagnostic"])
-        self.assertIn("partial target has no lifecycle command", self._result()["diagnostic"])
+        self.assertEqual(
+            self._result()["diagnostic"],
+            "preflight: lifecycle-prerequisite: confirm the managed service is inactive, then rerun with --replace-partial; "
+            f"affected: lifecycle={self.home / '.local/bin/mkchad-opencode-server'}; managed paths={launcher}; "
+            f"inspect log: {self.root / 'run.log'}",
+        )
 
     def test_dirty_wrong_image_and_preflight_failure_do_not_mutate(self):
         wrong = self.manifest["artifacts"]["nvim-image"][0]["sha256"]
@@ -559,6 +605,11 @@ class DeploymentExecutionTests(unittest.TestCase):
         self.assertEqual(statuses["image-install"], "failed")
         self.assertEqual(statuses["image-install-preflight"], "succeeded")
         self.assertEqual(statuses["host-tools-verify"], "pending")
+        self.assertEqual(
+            failed["diagnostic"],
+            "msk_containers:image-install: action-nonzero: inspect the retained action output, repair status 7, and rerun; "
+            f"inspect log: {self.root / 'run.log'}",
+        )
         self.assertFalse(list(self.state.rglob("*journal*")))
         self.assertFalse(list(self.state.rglob("*recovery*")))
         os.environ.pop("IMAGE_INSTALL_STATUS")
@@ -570,6 +621,23 @@ class DeploymentExecutionTests(unittest.TestCase):
             self.assertEqual(self._execute(), 2)
 
         self.assertEqual(self._result()["artifact"]["observed_sha256"], digest)
+
+    def test_host_tool_build_failure_uses_its_own_step_and_action(self):
+        error = self.deploy.DeploymentError(
+            "container-tools CMake build failed",
+            category="cmake-build",
+            action="inspect the retained CMake output, repair the build prerequisites after status 78, and rerun",
+        )
+
+        self.assertEqual(self._execute(install_error=error), 2)
+
+        result = self._result()
+        self.assertEqual(result["failed_step"], "container-tools-install")
+        self.assertEqual(
+            result["diagnostic"],
+            "container-tools-install: cmake-build: inspect the retained CMake output, repair the build prerequisites after status 78, and rerun; "
+            f"inspect log: {self.root / 'run.log'}",
+        )
 
     def test_interrupted_result_refreshes_the_active_image_digest_after_mutation(self):
         digest = self.manifest["artifacts"]["nvim-image"][0]["sha256"]
@@ -593,10 +661,7 @@ class DeploymentExecutionTests(unittest.TestCase):
         partial.parent.mkdir(parents=True)
         partial.write_text("partial\n", encoding="ascii")
         self.assertEqual(self._execute("223e4567-e89b-12d3-a456-426614174000"), 2)
-        self.assertEqual(
-            self._result()["diagnostic"],
-            f"partial target has no lifecycle command at {self.home / '.local' / 'bin' / 'mkchad-opencode-server'}; detected pre-existing managed paths: {partial}; rerun with --replace-partial only after confirming the managed service is inactive",
-        )
+        self.assertIn(f"managed paths={partial}", self._result()["diagnostic"])
         self.assertFalse(self._destination("msk_containers").exists())
         partial.unlink()
 
@@ -616,6 +681,7 @@ class DeploymentExecutionTests(unittest.TestCase):
         mkchad = self._destination("mkchad")
         subprocess.run(["git", "-C", str(mkchad), "remote", "set-url", "origin", "git@github.com:krafczyk/other"], check=True)
         self.assertEqual(self._execute("223e4567-e89b-12d3-a456-426614174000"), 2)
+        self.assertIn("affected: component=mkchad", self._result()["diagnostic"])
         subprocess.run(["git", "-C", str(mkchad), "remote", "set-url", "origin", "git@github.com:krafczyk/mkchad"], check=True)
         (mkchad / "init.lua").write_text("user change\n", encoding="ascii")
         self.assertEqual(self._execute("323e4567-e89b-12d3-a456-426614174000"), 2)
@@ -642,7 +708,7 @@ class DeploymentExecutionTests(unittest.TestCase):
         os.environ["LIFECYCLE_STATUS"] = "healthy"
 
         self.assertEqual(self._execute("223e4567-e89b-12d3-a456-426614174000", replace_partial=True), 2)
-        self.assertIn("managed service is active", self._result()["diagnostic"])
+        self.assertIn("lifecycle-status", self._result()["diagnostic"])
 
     def test_caller_image_inside_managed_directory_is_not_a_partial_target(self):
         container_dir = self.home / "containers"

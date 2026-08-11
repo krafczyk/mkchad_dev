@@ -68,7 +68,21 @@ DEPLOYED_COMPONENTS = tuple(name for name, disposition in COMPONENTS.items() if 
 
 
 class DeploymentError(RuntimeError):
-    """Raised when preflight, apply, or final verification cannot complete."""
+    """Describe a deployment failure and its optional safe operator guidance.
+
+    Args:
+        message: Internal failure description retained for exception chaining.
+        category: Stable user-visible failure category, when known at the source.
+        action: Concrete user-visible repair action paired with ``category``.
+        safe_detail: Optional bounded operational detail known not to contain
+            command arguments, environment values, or untrusted output.
+    """
+
+    def __init__(self, message: str, *, category: str | None = None, action: str | None = None, safe_detail: str | None = None):
+        super().__init__(message)
+        self.category = category
+        self.action = action
+        self.safe_detail = safe_detail
 
 
 def _reject_duplicates(pairs):
@@ -308,7 +322,11 @@ def _terminate_group(process: subprocess.Popen):
             try:
                 process.wait(timeout=5)
             except subprocess.TimeoutExpired as exc:
-                raise DeploymentError("process-group cleanup did not complete") from exc
+                raise DeploymentError(
+                    "process-group cleanup did not complete",
+                    category="command-cleanup",
+                    action="confirm the prior command has stopped before retrying",
+                ) from exc
 
 
 def _close_capture_pipes(process: subprocess.Popen):
@@ -330,7 +348,11 @@ def _capture(command: list[str], *, cwd: pathlib.Path | None = None, env: dict[s
     try:
         process = subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True, close_fds=True)
     except OSError as exc:
-        raise DeploymentError(f"command could not start: {command[0]}") from exc
+        raise DeploymentError(
+            f"command could not start: {command[0]}",
+            category="command-start",
+            action="install or repair the required local tool, then retry",
+        ) from exc
     assert process.stdout is not None and process.stderr is not None
     selector = selectors.DefaultSelector()
     captured = {"stdout": bytearray(), "stderr": bytearray()}
@@ -349,7 +371,11 @@ def _capture(command: list[str], *, cwd: pathlib.Path | None = None, env: dict[s
                     continue
                 channel = key.data
                 if len(captured[channel]) + len(data) > CAPTURE_LIMIT:
-                    raise DeploymentError(f"command {channel} output exceeded {CAPTURE_LIMIT} byte capture limit: {command[0]}")
+                    raise DeploymentError(
+                        f"command {channel} output exceeded {CAPTURE_LIMIT} byte capture limit: {command[0]}",
+                        category="command-output-limit",
+                        action="reduce command output below the deployment capture limit, then retry",
+                    )
                 captured[channel].extend(data)
         process.wait(timeout=max(0.1, deadline - time.monotonic()))
     except KeyboardInterrupt:
@@ -363,7 +389,11 @@ def _capture(command: list[str], *, cwd: pathlib.Path | None = None, env: dict[s
             _terminate_group(process)
         finally:
             _close_capture_pipes(process)
-        raise DeploymentError(f"command timed out after {timeout:g} seconds: {command[0]}") from exc
+        raise DeploymentError(
+            f"command timed out after {timeout:g} seconds: {command[0]}",
+            category="command-timeout",
+            action="inspect the retained log, repair the stalled prerequisite, and retry",
+        ) from exc
     except DeploymentError:
         try:
             _terminate_group(process)
@@ -385,7 +415,13 @@ def _git(arguments: list[str], cwd: pathlib.Path | None = None, check: bool = Tr
     """Run a bounded noninteractive Git command without hooks or templates."""
     result = _capture(["git", "-c", "core.hooksPath=/dev/null", "-c", "init.templateDir=", *arguments], cwd=cwd, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
     if check and result.returncode:
-        raise DeploymentError(f"git command failed: {arguments[0]}")
+        operation_index = 2 if len(arguments) >= 3 and arguments[0] == "-C" else 0
+        operation = arguments[operation_index] if operation_index < len(arguments) else "operation"
+        raise DeploymentError(
+            f"git command failed: {operation}",
+            category="git-operation",
+            action=f"repair Git {operation} access or state after status {result.returncode}, then retry",
+        )
     return result
 
 
@@ -677,11 +713,19 @@ def _runtime_image(image: pathlib.Path, architecture: str):
     """Verify the staged image architecture with Apptainer or Singularity."""
     runtime = shutil.which("apptainer") or shutil.which("singularity")
     if not runtime:
-        raise DeploymentError("no Apptainer or Singularity runtime is available")
+        raise DeploymentError(
+            "no Apptainer or Singularity runtime is available",
+            category="container-runtime-missing",
+            action="install Apptainer or Singularity on the host, then retry",
+        )
     result = _capture([runtime, "exec", str(image), "uname", "-m"], timeout=40)
     observed = {"amd64": "x86_64", "x86": "x86_64", "arm64": "aarch64"}.get(result.stdout.strip().lower(), result.stdout.strip().lower())
     if result.returncode or observed != architecture:
-        raise DeploymentError("staged image architecture does not match the release artifact")
+        raise DeploymentError(
+            "staged image architecture does not match the release artifact",
+            category="runtime-architecture",
+            action="provide the release image built for this host architecture, then retry",
+        )
 
 
 def _existing(destination: pathlib.Path, component: dict, staged: pathlib.Path) -> dict:
@@ -692,7 +736,12 @@ def _existing(destination: pathlib.Path, component: dict, staged: pathlib.Path) 
         raise DeploymentError(f"destination is not its Git top level: {destination}")
     origin = _git(["config", "--get", "remote.origin.url"], destination).stdout.strip()
     if origin.rstrip("/").removesuffix(".git") != component["repository"].rstrip("/").removesuffix(".git"):
-        raise DeploymentError("existing checkout has wrong origin")
+        raise DeploymentError(
+            "existing checkout has wrong origin",
+            category="checkout-origin",
+            action="restore the component's canonical remote.origin.url, then rerun",
+            safe_detail=f"component={component['name']}",
+        )
     preserved = set(component.get("preserved_paths", ()))
     for entry in _git(["status", "--porcelain=v1", "-z", "--ignored=matching", "--untracked-files=all"], destination).stdout.split("\0"):
         if entry:
@@ -718,7 +767,11 @@ def _run_action(action: dict, component: dict, image: pathlib.Path | None, recov
     try:
         process = subprocess.Popen(argv, cwd=checkout, env=environment, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True, close_fds=True)
     except OSError as exc:
-        raise DeploymentError(f"action could not start: {component['name']}:{action['id']}") from exc
+        raise DeploymentError(
+            f"action could not start: {component['name']}:{action['id']}",
+            category="action-start",
+            action="restore the staged executable and its local prerequisites, then rerun",
+        ) from exc
     assert process.stdout is not None and process.stderr is not None
     selector = selectors.DefaultSelector()
     selector.register(process.stdout, selectors.EVENT_READ, sys.stdout)
@@ -729,7 +782,11 @@ def _run_action(action: dict, component: dict, image: pathlib.Path | None, recov
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 _terminate_group(process)
-                raise DeploymentError(f"action timed out: {action['id']}")
+                raise DeploymentError(
+                    f"action timed out: {action['id']}",
+                    category="action-timeout",
+                    action="inspect the retained action output, repair the stalled action, and rerun",
+                )
             for key, _ in selector.select(min(0.1, remaining)):
                 data = os.read(key.fileobj.fileno(), 65536)
                 if not data:
@@ -743,13 +800,21 @@ def _run_action(action: dict, component: dict, image: pathlib.Path | None, recov
         raise
     except subprocess.TimeoutExpired as exc:
         _terminate_group(process)
-        raise DeploymentError(f"action timed out: {action['id']}") from exc
+        raise DeploymentError(
+            f"action timed out: {action['id']}",
+            category="action-timeout",
+            action="inspect the retained action output, repair the stalled action, and rerun",
+        ) from exc
     finally:
         selector.close()
         process.stdout.close()
         process.stderr.close()
     if process.returncode:
-        raise DeploymentError(f"action failed: {component['name']}:{action['id']}")
+        raise DeploymentError(
+            f"action failed: {component['name']}:{action['id']}",
+            category="action-nonzero",
+            action=f"inspect the retained action output, repair status {process.returncode}, and rerun",
+        )
 
 
 def _installer_sources(msk_checkout: pathlib.Path) -> list[pathlib.Path]:
@@ -835,6 +900,65 @@ def _active_image_digest(home: pathlib.Path) -> str:
     return observation["digest"]
 
 
+def _deployment_diagnostic(operation: str, error: BaseException, log_path: pathlib.Path | None = None) -> str:
+    """Render a safe action-oriented deployment failure without exception detail.
+
+    The exception text is used only to select a stable category; it is never
+    published because it can include command arguments, environment-derived
+    paths, or untrusted subprocess output.
+    """
+    detail = None
+    if isinstance(error, DeploymentError) and error.category is not None and error.action is not None:
+        category, action, detail = error.category, error.action, error.safe_detail
+    else:
+        text = str(error).lower()
+        category, action = "command-failure", "repair the failed deployment prerequisite and rerun"
+        if "interrupted" in text:
+            category, action = "interrupted", "inspect the retained log, repair any partial state, and rerun"
+        elif "action could not start" in text:
+            category, action = "action-start", "repair the named action prerequisite and rerun"
+        elif "action timed out" in text:
+            category, action = "action-timeout", "inspect the action log, repair the action, and rerun"
+        elif "action failed" in text:
+            category, action = "action-nonzero", "repair the failed action and rerun"
+        elif "output exceeded" in text:
+            category, action = "command-output-limit", "reduce command output and rerun"
+        elif "timed out" in text:
+            category, action = "command-timeout", "check the required service and retry"
+        elif "cleanup" in text:
+            category, action = "command-cleanup", "confirm the prior command has stopped before retrying"
+        elif "could not start" in text:
+            category, action = "command-start", "repair the required local tool and retry"
+        elif "wrong origin" in text:
+            category, action = "checkout-origin", "restore the canonical checkout origin and rerun"
+        elif "source" in text or "child" in text or "workspace" in text:
+            category, action = "source-admission", "repair the clean committed source state and rerun"
+        elif "git" in text or "checkout" in text:
+            category, action = "git-operation", "repair the selected checkout or repository access and rerun"
+        elif "architecture" in text or "runtime" in text:
+            category, action = "runtime-architecture", "provide an image for this host architecture and rerun"
+        elif "active image selector" in text:
+            category, action = "active-image-selector", "repair the active image selector and rerun"
+        elif "partial target" in text:
+            category, action = "lifecycle-prerequisite", "confirm inactivity, then use --replace-partial if appropriate"
+        elif "service" in text or "lifecycle" in text:
+            category, action = "lifecycle-status", "confirm the managed service is inactive or fully compliant and rerun"
+        elif "image" in text:
+            category, action = "image-admission", "provide a valid selected image and rerun"
+        elif "interlock" in text:
+            category, action = "contention", "wait for the active deployment to finish and retry"
+    message = f"{operation}: {category}: {action}"
+    if detail is not None:
+        message += f"; affected: {detail}"
+    message = REDACT.sub(r"\1=<redacted>", message)
+    if log_path is None:
+        return message[:4096]
+    suffix = REDACT.sub(r"\1=<redacted>", f"; inspect log: {log_path}")
+    if len(suffix) >= 4096:
+        return REDACT.sub(r"\1=<redacted>", f"{operation}: {category}: {action}; inspect the deployment state logs; the log path is too long to report")[:4096]
+    return message[:4096 - len(suffix)] + suffix
+
+
 def _consume_caller_image(source: pathlib.Path, roots: dict[str, pathlib.Path], expected_digest: str):
     """Remove a co-located caller artifact after its managed image is verified."""
     source = pathlib.Path(os.path.abspath(source))
@@ -917,7 +1041,7 @@ def _publish(path: pathlib.Path, document: dict, *, validate=True):
     os.replace(temporary, path)
 
 
-def _execute_components(deployed: dict[str, dict], artifact: dict, image: pathlib.Path | None, *, developer: bool, result_path: pathlib.Path, replace_partial: bool, staging_root: pathlib.Path | None, stage_sources, recheck_sources, install_host_tools, result_builder) -> int:
+def _execute_components(deployed: dict[str, dict], artifact: dict, image: pathlib.Path | None, *, developer: bool, log_path: pathlib.Path, result_path: pathlib.Path, replace_partial: bool, staging_root: pathlib.Path | None, stage_sources, recheck_sources, install_host_tools, result_builder) -> int:
     """Run the shared target procedure from already-selected component sources.
 
     Source selection differs between release and developer modes; destination
@@ -968,7 +1092,11 @@ def _execute_components(deployed: dict[str, dict], artifact: dict, image: pathli
             if image is not None:
                 if active_image["state"] == "unsafe":
                     image_info["decision"] = "blocked-unsafe-active"
-                    raise DeploymentError("active image selector is unsafe or unavailable")
+                    raise DeploymentError(
+                        "active image selector is unsafe or unavailable",
+                        category="active-image-selector",
+                        action="repair the active neovim.sif selector inside NVIM_CONTAINER_DIR, then rerun",
+                    )
                 if active_image["state"] == "valid" and active_image["digest"] == image_info["supplied_sha256"]:
                     image_info.update(choice="reused", decision="reused-active")
                 else:
@@ -976,14 +1104,22 @@ def _execute_components(deployed: dict[str, dict], artifact: dict, image: pathli
             if developer and image is not None and image_info["choice"] == "install":
                 container_dir = pathlib.Path(os.environ.get("NVIM_CONTAINER_DIR", roots["home"] / "containers"))
                 if container_dir.exists() and pathlib.Path(os.path.abspath(image)).parent.resolve(strict=True) == container_dir.resolve(strict=True) and MANAGED_IMAGE.fullmatch(image.name):
-                    raise DeploymentError("the image installer could prune the developer caller image; move it outside NVIM_CONTAINER_DIR or activate the identical image first")
+                    raise DeploymentError(
+                        "the image installer could prune the developer caller image",
+                        category="image-admission",
+                        action="move the caller image outside NVIM_CONTAINER_DIR or activate the identical image, then rerun",
+                    )
             lifecycle = roots["home"] / ".local" / "bin" / "mkchad-opencode-server"
             active = False
             if lifecycle.exists():
                 status = _capture([str(lifecycle), "status", "--json"], env={**os.environ, "HOME": str(roots["home"]), "XDG_CONFIG_HOME": str(roots["xdg_config_home"]), "XDG_DATA_HOME": str(roots["xdg_data_home"]), "XDG_STATE_HOME": str(roots["xdg_state_home"])}, timeout=40)
                 payload = json.loads(status.stdout) if not status.returncode else None
                 if not isinstance(payload, dict) or payload.get("schema") != 1 or payload.get("ok") is not True or payload.get("command") != "status" or payload.get("status") not in {"inactive", "healthy", "degraded", "blocked", "starting", "stopping", "failed"}:
-                    raise DeploymentError("managed service status is unavailable or malformed")
+                    raise DeploymentError(
+                        "managed service status is unavailable or malformed",
+                        category="lifecycle-status",
+                        action="run mkchad-opencode-server status --json, repair its status response, then rerun",
+                    )
                 active = payload["status"] != "inactive"
             else:
                 partial_paths = sorted(
@@ -994,8 +1130,10 @@ def _execute_components(deployed: dict[str, dict], artifact: dict, image: pathli
                     detail = ", ".join(map(str, partial_paths))
                     if not replace_partial:
                         raise DeploymentError(
-                            f"partial target has no lifecycle command at {lifecycle}; detected pre-existing managed paths: {detail}; "
-                            "rerun with --replace-partial only after confirming the managed service is inactive"
+                            "partial target has no lifecycle command",
+                            category="lifecycle-prerequisite",
+                            action="confirm the managed service is inactive, then rerun with --replace-partial",
+                            safe_detail=f"lifecycle={lifecycle}; managed paths={detail}",
                         )
                     print(f"mkchad-deploy: --replace-partial asserted the managed service is inactive; replacing: {detail}", file=sys.stderr)
             recovery = staging / "recovery"
@@ -1004,7 +1142,11 @@ def _execute_components(deployed: dict[str, dict], artifact: dict, image: pathli
             checkout_mutation = any(not plan["compliant"] for _, plan in plans.values())
             mutation_required = checkout_mutation or any(mismatch is not None for mismatch in host_mismatches.values()) or image_info["choice"] == "install"
             if active and mutation_required:
-                raise DeploymentError("managed service is active and target is not completely compliant")
+                raise DeploymentError(
+                    "managed service is active and target is not completely compliant",
+                    category="lifecycle-status",
+                    action="stop the managed service, then rerun the deployment",
+                )
             staged_image = None
             if image_info["choice"] == "install":
                 assert image is not None and image_info["supplied_sha256"] is not None
@@ -1100,19 +1242,28 @@ def _execute_components(deployed: dict[str, dict], artifact: dict, image: pathli
                     failure_step = "caller-image-consumption"
                     _consume_caller_image(image, roots, artifact["sha256"])
             diagnostic = "developer deployment verified" if developer else "deployment verified; configuration is pending"
+            failure_step = "container-tools-install"
             install_host_tools(staged["container_tools"][1], deployed["container_tools"]["commit"], staging)
             _publish(result_path, result_builder(roots, actions, "succeeded", phase, None, diagnostic, started_at, image_info), validate=not developer)
             return 0
     except KeyboardInterrupt:
         image_info["active_sha256"] = _active_image_observation(roots["home"])["digest"]
-        _publish(result_path, result_builder(roots, actions, "interrupted", phase, f"{current['component']}:{current['id']}" if current else failure_step, "deployment interrupted; repair or inspect and rerun", started_at, image_info), validate=not developer)
+        operation = f"{current['component']}:{current['id']}" if current else failure_step
+        interruption = DeploymentError(
+            "interrupted",
+            category="interrupted",
+            action="inspect the retained log, repair any partial state, and rerun",
+        )
+        _publish(result_path, result_builder(roots, actions, "interrupted", phase, operation, _deployment_diagnostic(operation, interruption, log_path), started_at, image_info), validate=not developer)
         return 2
     except (DeploymentError, OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
         if current is not None:
             current["status"] = "failed"
         image_info["active_sha256"] = _active_image_observation(roots["home"])["digest"]
-        _publish(result_path, result_builder(roots, actions, "failed", phase, f"{current['component']}:{current['id']}" if current else failure_step, str(exc), started_at, image_info), validate=not developer)
-        print("mkchad-deploy: " + REDACT.sub(r"\1=<redacted>", str(exc)), file=sys.stderr)
+        operation = f"{current['component']}:{current['id']}" if current else failure_step
+        diagnostic = _deployment_diagnostic(operation, exc, log_path)
+        _publish(result_path, result_builder(roots, actions, "failed", phase, operation, diagnostic, started_at, image_info), validate=not developer)
+        print("mkchad-deploy: " + diagnostic, file=sys.stderr)
         return 2
     finally:
         shutil.rmtree(staging, ignore_errors=True)
@@ -1150,7 +1301,11 @@ def _container_tools_identity(stdout: str, source_commit: str, architecture: str
     try:
         identity = json.loads(stdout, object_pairs_hook=_reject_duplicates)
     except (json.JSONDecodeError, DeploymentError) as exc:
-        raise DeploymentError("installed container-tools version is malformed") from exc
+        raise DeploymentError(
+            "installed container-tools version is malformed",
+            category="installed-identity",
+            action="rebuild container-tools from the selected source, then rerun",
+        ) from exc
     if (
         not isinstance(identity, dict)
         or set(identity) != {"product_version", "source_commit", "architecture", "mount_plan_grammar"}
@@ -1159,7 +1314,11 @@ def _container_tools_identity(stdout: str, source_commit: str, architecture: str
         or identity["architecture"] != architecture
         or identity["mount_plan_grammar"] != "ct-mount-plan-v1"
     ):
-        raise DeploymentError("installed container-tools identity does not match selected source")
+        raise DeploymentError(
+            "installed container-tools identity does not match selected source",
+            category="installed-identity",
+            action="remove the mismatched local install and redeploy the selected source",
+        )
     return identity
 
 
@@ -1178,13 +1337,21 @@ def _install_host_tools(source: pathlib.Path, source_commit: str, staging: pathl
     prefix = _roots()["home"] / ".local"
     build = staging / "container-tools-build"
     architecture, commands = _container_tools_build_commands(source, build, prefix)
-    for command in commands:
+    for phase, command in zip(("configure", "build", "install"), commands, strict=True):
         result = _capture(command, timeout=300)
         if result.returncode:
-            raise DeploymentError("container-tools CMake installation failed")
+            raise DeploymentError(
+                f"container-tools CMake {phase} failed",
+                category=f"cmake-{phase}",
+                action=f"inspect the retained CMake output, repair the {phase} prerequisites after status {result.returncode}, and rerun",
+            )
     result = _capture([str(prefix / "bin" / "container-tools"), "--version", "--json"], timeout=40)
     if result.returncode:
-        raise DeploymentError("installed container-tools identity does not match selected source")
+        raise DeploymentError(
+            "installed container-tools identity command failed",
+            category="installed-identity",
+            action=f"repair the installed container-tools executable after status {result.returncode}, then rerun",
+        )
     _container_tools_identity(result.stdout, source_commit, architecture)
 
 
@@ -1219,7 +1386,7 @@ def execute_deployment(repo: pathlib.Path, image: pathlib.Path, *, release_tag: 
         raise DeploymentError("release has no image for this architecture")
     deployed = {item["name"]: dict(item) for item in manifest["components"] if item["disposition"] == "deployed"}
     return _execute_components(
-        deployed, artifact, image, developer=False, result_path=result_path, replace_partial=replace_partial, staging_root=None,
+        deployed, artifact, image, developer=False, log_path=log_path, result_path=result_path, replace_partial=replace_partial, staging_root=None,
         stage_sources=_stage_release_sources, recheck_sources=lambda: None,
         install_host_tools=_install_host_tools,
         result_builder=lambda roots, actions, outcome, phase, failed_step, diagnostic, started_at, image_info: _result(manifest, roots, artifact, run_id, release_tag, started_at, log_path, actions, outcome, phase, failed_step, diagnostic, image_info["active_sha256"]),
@@ -1267,7 +1434,7 @@ def execute_developer_deployment(workspace: pathlib.Path, image: pathlib.Path | 
         raise DeploymentError("developer container-tools source does not match the admitted workspace child")
     deployed = _developer_components(admission["commits"])
     return _execute_components(
-        deployed, artifact, image, developer=True, result_path=result_path, replace_partial=replace_partial, staging_root=staging_root,
+        deployed, artifact, image, developer=True, log_path=log_path, result_path=result_path, replace_partial=replace_partial, staging_root=staging_root,
         stage_sources=lambda _components, staging: stage_developer_sources(admission, staging), recheck_sources=lambda: recheck_developer_workspace(admission),
         install_host_tools=installer,
         result_builder=lambda _roots, actions, outcome, phase, failed_step, diagnostic, started, image_info: developer_result(admission, actions=actions, artifact=artifact, image=image_info, run_id=run_id, started_at=started, log_path=log_path, outcome=outcome, phase=phase, failed_step=failed_step, diagnostic=diagnostic),
@@ -1299,8 +1466,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.deploy != "deploy":
             parser.error("only the deploy handoff is supported")
         return execute_deployment(pathlib.Path.cwd(), args.image, release_tag=args.release, log_path=args.log_path, result_path=args.result_path, run_id=args.run_id, replace_partial=args.replace_partial)
-    except DeploymentError as exc:
-        print("mkchad-deploy: " + str(exc), file=sys.stderr)
+    except (DeploymentError, OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+        print("mkchad-deploy: " + _deployment_diagnostic("launcher handoff", exc, args.log_path), file=sys.stderr)
         return 2
 
 

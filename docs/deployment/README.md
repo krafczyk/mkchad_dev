@@ -189,8 +189,18 @@ The launcher streams Git and deployer output to the terminal and writes the
 same redacted output to `${XDG_STATE_HOME:-$HOME/.local/state}/mkchad/deploy/`.
 It keeps the current log and two previous logs. `latest-result.json` is
 atomically replaced only by the admitted run's matching run ID and log path.
-Partial-target diagnostics report the expected lifecycle command and every
-pre-existing managed path that requires lifecycle validation.
+Every controlled failure uses `mkchad-release:`, `mkchad-develop:`, or
+`mkchad-deploy:` followed by an operation, safe category, and repair action.
+When a run log was created, the diagnostic includes `inspect log: PATH` for
+that retained log; contention and pre-log state failures instead state the
+prerequisite to repair or wait for. Child result rejection reports only a safe
+category such as `missing`, `schema-invalid`, or a run, release, log, or status
+binding mismatch. Exception text, command arguments, environment values, and
+untrusted result contents are not published. Allowlisted operational details,
+such as the affected component or detected managed paths, remain available when
+they are needed to perform the repair. Partial-target diagnostics identify those
+paths and direct the operator to confirm inactivity before using
+`--replace-partial`.
 
 The release result distinguishes deployed, embedded, configuration-owned, and
 disabled components. A successful release result is `configuration-pending`:
