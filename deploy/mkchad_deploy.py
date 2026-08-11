@@ -542,7 +542,12 @@ def _developer_child(path: pathlib.Path, name: str, *, allow_nested: bool = Fals
     for code, changed in _workspace_status(path):
         nested_change = allow_nested and changed.rstrip("/") == "container_tools" and code == " M"
         if not nested_change:
-            raise DeploymentError(f"developer child has local work: {name}:{changed or '<rename>'}")
+            raise DeploymentError(
+                f"developer child has local work: {name}:{changed or '<rename>'}",
+                category="source-admission",
+                action="commit, remove, or relocate the component's local work and rerun",
+                safe_detail=f"component={name}",
+            )
     commit = _git(["rev-parse", "--verify", "HEAD^{commit}"], path, check=False)
     if commit.returncode or not SHA1.fullmatch(commit.stdout.strip()):
         raise DeploymentError(f"developer child HEAD is not a commit: {name}")

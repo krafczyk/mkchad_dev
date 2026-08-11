@@ -941,6 +941,27 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         self.assertEqual(result["image"], {"choice": "install", "supplied_sha256": None, "active_sha256": None, "decision": "unavailable"})
         self.assertIn("deployment-failure", result["diagnostic"])
 
+    def test_public_source_admission_failure_is_actionable_and_logged_once(self):
+        command = load_developer_command()
+        state = self.root / "state"
+        terminal = io.StringIO()
+        build = self.tools / "build"
+        build.mkdir()
+        (build / "CMakeCache.txt").write_text("generated\n", encoding="ascii")
+
+        with mock.patch.object(command.pathlib.Path, "cwd", return_value=self.workspace), mock.patch.dict(
+            os.environ, {"HOME": str(self.root / "home"), "XDG_STATE_HOME": str(state)}, clear=False
+        ), mock.patch.object(command, "BUILD_ROOT", self.root / "build-root"), contextlib.redirect_stderr(terminal):
+            self.assertEqual(command.main(self._command_args()), 2)
+
+        result = json.loads((state / "mkchad" / "deploy" / "latest-result.json").read_text(encoding="utf-8"))
+        log = pathlib.Path(result["log_path"]).read_text(encoding="utf-8")
+        self.assertIn("source-admission", result["diagnostic"])
+        self.assertIn("affected: component=container_tools", result["diagnostic"])
+        self.assertNotIn("cmake-install", result["diagnostic"])
+        self.assertEqual(terminal.getvalue().count("mkchad-develop:"), 1)
+        self.assertEqual(log.count("mkchad-develop:"), 1)
+
     def test_developer_diagnostic_names_build_phase_and_retained_log(self):
         command = load_developer_command()
 

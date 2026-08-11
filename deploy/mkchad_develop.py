@@ -51,7 +51,7 @@ def _diagnostic(operation: str, category: str, action: str, log_path: pathlib.Pa
 def _develop_failure_diagnostic(error: BaseException, log_path: pathlib.Path) -> str:
     """Classify local build and deployment errors without publishing exception text."""
     if isinstance(error, deploy.DeploymentError) and error.category is not None and error.action is not None:
-        return _diagnostic("developer deployment", error.category, error.action, log_path)
+        return deploy._deployment_diagnostic("developer deployment", error, log_path)
     text = str(error)
     if "CMake" in text:
         category = "cmake-install"
@@ -263,7 +263,7 @@ def main(argv: list[str] | None = None) -> int:
                             return status if status else 2
                         except (deploy.DeploymentError, OSError) as exc:
                             diagnostic = _develop_failure_diagnostic(exc, log_path)
-                            release._write_stream(sys.stderr, log, ("mkchad-develop: " + diagnostic + "\n").encode())
+                            _write_build_output(sys.stderr, log, "mkchad-develop: " + diagnostic + "\n")
                             release._publish_result(latest_result, _fallback_result(workspace, run_id, started_at, log_path, diagnostic, args.image))
                             return 2
                         except KeyboardInterrupt:
@@ -277,7 +277,7 @@ def main(argv: list[str] | None = None) -> int:
                             _discard_build_run(temporary)
                 except (deploy.DeploymentError, OSError) as exc:
                     diagnostic = _develop_failure_diagnostic(exc, log_path)
-                    release._write_stream(sys.stderr, log, ("mkchad-develop: " + diagnostic + "\n").encode())
+                    _write_build_output(sys.stderr, log, "mkchad-develop: " + diagnostic + "\n")
                     release._publish_result(latest_result, _fallback_result(workspace, run_id, started_at, log_path, diagnostic, args.image))
                     return 2
                 except KeyboardInterrupt:
