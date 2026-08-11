@@ -545,7 +545,7 @@ def _developer_child(path: pathlib.Path, name: str, *, allow_nested: bool = Fals
             raise DeploymentError(
                 f"developer child has local work: {name}:{changed or '<rename>'}",
                 category="source-admission",
-                action="commit, remove, or relocate the component's local work and rerun",
+                action="component source tree is dirty; commit, remove, or relocate its local work and rerun",
                 safe_detail=f"component={name}",
             )
     commit = _git(["rev-parse", "--verify", "HEAD^{commit}"], path, check=False)

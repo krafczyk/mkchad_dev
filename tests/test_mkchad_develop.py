@@ -957,6 +957,7 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         result = json.loads((state / "mkchad" / "deploy" / "latest-result.json").read_text(encoding="utf-8"))
         log = pathlib.Path(result["log_path"]).read_text(encoding="utf-8")
         self.assertIn("source-admission", result["diagnostic"])
+        self.assertIn("component source tree is dirty", result["diagnostic"])
         self.assertIn("affected: component=container_tools", result["diagnostic"])
         self.assertNotIn("cmake-install", result["diagnostic"])
         self.assertEqual(terminal.getvalue().count("mkchad-develop:"), 1)
