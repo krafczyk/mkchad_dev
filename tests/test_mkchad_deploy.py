@@ -550,7 +550,7 @@ class DeploymentExecutionTests(unittest.TestCase):
         diagnostic = self._result()["diagnostic"]
         self.assertIn("lifecycle-status", diagnostic)
         self.assertIn("installed lifecycle command returned malformed status JSON", diagnostic)
-        self.assertIn("reinstall the MkChad host launchers", diagnostic)
+        self.assertIn("Host Launcher Recovery in msk_containers/docs/host-installation.md", diagnostic)
         self.assertNotIn("command-failure", diagnostic)
 
     def test_opencode_db_launcher_mismatch_requires_inactive_lifecycle_and_reinstalls(self):

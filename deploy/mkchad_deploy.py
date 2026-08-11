@@ -1124,7 +1124,7 @@ def _execute_components(deployed: dict[str, dict], artifact: dict, image: pathli
                     raise DeploymentError(
                         "installed lifecycle command returned malformed status JSON",
                         category="lifecycle-status",
-                        action="installed lifecycle command returned malformed status JSON; reinstall the MkChad host launchers, then rerun",
+                        action="installed lifecycle command returned malformed status JSON; follow Host Launcher Recovery in msk_containers/docs/host-installation.md, then rerun",
                     ) from exc
                 if not isinstance(payload, dict) or payload.get("schema") != 1 or payload.get("ok") is not True or payload.get("command") != "status" or payload.get("status") not in {"inactive", "healthy", "degraded", "blocked", "starting", "stopping", "failed"}:
                     raise DeploymentError(
