@@ -43,6 +43,21 @@ class DeploymentContractTests(unittest.TestCase):
             self.assertIn("repository", component)
             self.assertIn("commit", component)
 
+    def test_deployment_lock_parent_is_private_for_new_and_existing_state(self):
+        """Create or tighten the current-user-owned lifecycle interlock parent."""
+        with tempfile.TemporaryDirectory(prefix="deployment-lock-", dir="/tmp/mkchad-v1") as temporary:
+            root = pathlib.Path(temporary)
+            for existing in (False, True):
+                with self.subTest(existing=existing):
+                    parent = root / ("existing" if existing else "new") / "mkchad"
+                    if existing:
+                        parent.mkdir(parents=True, mode=0o755)
+                        parent.chmod(0o755)
+                    with self.deploy._lock(parent / "deployment.lock"):
+                        status = parent.stat()
+                        self.assertEqual(status.st_uid, os.geteuid())
+                        self.assertEqual(status.st_mode & 0o777, 0o700)
+
     def test_checked_in_manifest_deploys_the_pinned_opencode_db_launcher(self):
         """Keep the managed database utility distinct from configuration handoff."""
         component = next(component for component in self.release["components"] if component["name"] == "opencode-db")
@@ -98,11 +113,25 @@ class DeploymentContractTests(unittest.TestCase):
             self.deploy._install_host_tools(pathlib.Path(temporary) / "source", source_commit, pathlib.Path(temporary))
 
         compiler = "musl-gcc" if architecture in {"x86_64", "aarch64"} else "gcc"
-        self.assertIn("-DCONTAINER_TOOLS_STATIC=ON", commands[0])
-        self.assertIn(f"-DCMAKE_C_COMPILER={compiler}", commands[0])
-        self.assertEqual(commands[1][0:2], ["cmake", "--build"])
-        self.assertEqual(commands[2][0:2], ["cmake", "--install"])
-        self.assertEqual(commands[3][-2:], ["--version", "--json"])
+        self.assertEqual(commands[0], [compiler, "-fno-link-libatomic", "-x", "c", "-c", "/dev/null", "-o", "/dev/null"])
+        self.assertIn("-DCONTAINER_TOOLS_STATIC=ON", commands[1])
+        self.assertIn("-DCMAKE_C_FLAGS=-fno-link-libatomic", commands[1])
+        self.assertIn(f"-DCMAKE_C_COMPILER={compiler}", commands[1])
+        self.assertEqual(commands[2][0:2], ["cmake", "--build"])
+        self.assertEqual(commands[3][0:2], ["cmake", "--install"])
+        self.assertEqual(commands[4][-2:], ["--version", "--json"])
+
+    def test_release_host_install_omits_unsupported_libatomic_opt_out(self):
+        """Keep GCC 15 musl builds working when the GCC 16 option is absent."""
+        with mock.patch.object(
+            self.deploy,
+            "_capture",
+            return_value=subprocess.CompletedProcess([], 1, stdout="", stderr="unsupported"),
+        ):
+            _architecture, commands = self.deploy._container_tools_build_commands(
+                pathlib.Path("/source"), pathlib.Path("/build"), pathlib.Path("/prefix")
+            )
+        self.assertNotIn("-DCMAKE_C_FLAGS=-fno-link-libatomic", commands[0])
 
     def test_image_artifacts_and_action_order_fail_closed(self):
         """Reject forged image metadata and deployment actions before staging."""

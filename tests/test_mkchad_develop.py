@@ -433,13 +433,15 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         with mock.patch.object(command.deploy, "_capture", side_effect=build) as capture:
             command._install_host_tools(self.tools, source_commit, build_root)
 
-        self.assertEqual(commands[0][:3], ["cmake", "-S", str(self.tools)])
-        self.assertIn("-DCONTAINER_TOOLS_STATIC=ON", commands[0])
         expected_compiler = "musl-gcc" if self.deploy._native_architecture() in {"x86_64", "aarch64"} else "gcc"
-        self.assertIn(f"-DCMAKE_C_COMPILER={expected_compiler}", commands[0])
-        self.assertEqual(commands[1][0:2], ["cmake", "--build"])
-        self.assertEqual(commands[2][0:2], ["cmake", "--install"])
-        self.assertEqual(commands[3][-2:], ["--version", "--json"])
+        self.assertEqual(commands[0], [expected_compiler, "-fno-link-libatomic", "-x", "c", "-c", "/dev/null", "-o", "/dev/null"])
+        self.assertEqual(commands[1][:3], ["cmake", "-S", str(self.tools)])
+        self.assertIn("-DCONTAINER_TOOLS_STATIC=ON", commands[1])
+        self.assertIn("-DCMAKE_C_FLAGS=-fno-link-libatomic", commands[1])
+        self.assertIn(f"-DCMAKE_C_COMPILER={expected_compiler}", commands[1])
+        self.assertEqual(commands[2][0:2], ["cmake", "--build"])
+        self.assertEqual(commands[3][0:2], ["cmake", "--install"])
+        self.assertEqual(commands[4][-2:], ["--version", "--json"])
         self.assertEqual(capture.call_args.kwargs, {"timeout": command.BUILD_TIMEOUT})
 
     def test_public_command_builds_from_the_deployer_supplied_checkout(self):
@@ -682,7 +684,7 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         source_commit = self._commit_value(self.tools)
         identities = ("not-json", json.dumps({"product_version": "1.0.0-dev", "source_commit": "0" * 40, "architecture": self.deploy._native_architecture(), "mount_plan_grammar": "ct-mount-plan-v1"}))
         for identity in identities:
-            responses = [subprocess.CompletedProcess([], 0, stdout="", stderr="")] * 3 + [subprocess.CompletedProcess([], 0, stdout=identity, stderr="")]
+            responses = [subprocess.CompletedProcess([], 0, stdout="", stderr="")] * 4 + [subprocess.CompletedProcess([], 0, stdout=identity, stderr="")]
             with self.subTest(identity=identity), tempfile.TemporaryDirectory(prefix="mkchad-develop-build-", dir="/tmp/mkchad-v1/container-tools-runtime-boundary") as temporary, mock.patch.object(command.deploy, "_capture", side_effect=responses):
                 with self.assertRaises(command.deploy.DeploymentError):
                     command._install_host_tools(self.tools, source_commit, pathlib.Path(temporary))
@@ -698,9 +700,9 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         def build(argv, **kwargs):
             nonlocal calls
             calls += 1
-            if calls == 1:
+            if calls == 2:
                 return subprocess.CompletedProcess(argv, 0, stdout="token=secret\n", stderr="password=secret\n")
-            if calls == 4:
+            if calls == 5:
                 identity = {"product_version": "1.0.0-dev", "source_commit": source_commit, "architecture": self.deploy._native_architecture(), "mount_plan_grammar": "ct-mount-plan-v1"}
                 return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(identity), stderr="")
             return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
