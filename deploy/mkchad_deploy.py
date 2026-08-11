@@ -401,7 +401,18 @@ def _digest(path: pathlib.Path) -> str:
 @contextlib.contextmanager
 def _lock(path: pathlib.Path):
     """Hold the ordinary deployment interlock for this synchronous run."""
-    path.parent.mkdir(parents=True, exist_ok=True)
+    parent = path.parent
+    parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    parent_status = parent.lstat()
+    if not stat.S_ISDIR(parent_status.st_mode):
+        raise DeploymentError(f"deployment lock parent must be a directory: {parent}")
+    if parent_status.st_uid != os.geteuid():
+        raise DeploymentError(
+            f"deployment lock parent must be owned by uid {os.geteuid()}; "
+            f"found uid {parent_status.st_uid}: {parent}"
+        )
+    if stat.S_IMODE(parent_status.st_mode) != 0o700:
+        parent.chmod(0o700)
     with path.open("a+") as handle:
         try:
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1108,13 +1119,25 @@ def _execute_components(deployed: dict[str, dict], artifact: dict, image: pathli
 
 
 def _container_tools_build_commands(source: pathlib.Path, build: pathlib.Path, prefix: pathlib.Path) -> tuple[str, tuple[list[str], ...]]:
-    """Return the native architecture and fixed CMake source-install commands."""
+    """Return the native architecture and compatible CMake source-install commands.
+
+    The musl wrapper inherits its host GCC driver. GCC 16 introduced automatic
+    libatomic linking, but some wrapper packages do not provide the resulting
+    static ``libatomic_asneeded`` selector. Probe the compiler-only opt-out
+    before CMake's mandatory link check; older GCC releases reject that option.
+    """
     architecture = _native_architecture()
     compiler = "musl-gcc" if architecture in {"x86_64", "aarch64"} else "gcc"
+    support = _capture(
+        [compiler, "-fno-link-libatomic", "-x", "c", "-c", "/dev/null", "-o", "/dev/null"],
+        timeout=10,
+    )
+    compiler_flags = ["-DCMAKE_C_FLAGS=-fno-link-libatomic"] if support.returncode == 0 else []
     return architecture, (
         [
             "cmake", "-S", str(source), "-B", str(build),
             "-DCMAKE_BUILD_TYPE=Release", "-DCONTAINER_TOOLS_STATIC=ON",
+            *compiler_flags,
             f"-DCMAKE_C_COMPILER={compiler}", f"-DCMAKE_INSTALL_PREFIX={prefix}",
         ],
         ["cmake", "--build", str(build)],
