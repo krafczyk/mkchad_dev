@@ -72,10 +72,13 @@ build-root-global nonblocking lock. The latter spans stale-run reclamation,
 staging, building, deployment, and result publication, so commands using
 different XDG state roots cannot reclaim each other's active build directories.
 When that build lock is busy, the command publishes a controlled developer
-failure result in its own state root. X86_64 and AArch64 builds select
-`musl-gcc`; PPC64LE selects GCC. The installed executable's JSON version must
-report the admitted source commit, native architecture, product version, and
-`ct-mount-plan-v1` grammar. Callers cannot select another source, archive,
+failure result in its own state root. X86_64 and AArch64 builds use `musl-gcc`
+when it is available on `PATH`; otherwise they select GCC after verifying that
+it can link a complete static libc executable. PPC64LE selects the same verified
+GCC path. CMake and the selected compiler must be available on `PATH`. The
+installed executable's JSON version must report the admitted source commit,
+native architecture, product version, and `ct-mount-plan-v1` grammar. Callers
+cannot select another source, archive,
 identity, compiler family, or install prefix.
 After it publishes a normal, controlled-failure, or interrupted terminal result,
 the command immediately makes one best-effort cleanup attempt for its `run-*`

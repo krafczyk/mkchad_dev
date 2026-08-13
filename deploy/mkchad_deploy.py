@@ -1282,20 +1282,50 @@ def _execute_components(deployed: dict[str, dict], artifact: dict, image: pathli
 
 
 def _container_tools_build_commands(source: pathlib.Path, build: pathlib.Path, prefix: pathlib.Path) -> tuple[str, tuple[list[str], ...]]:
-    """Return the native architecture and compatible CMake source-install commands.
+    """Return the native architecture and verified static CMake build commands.
 
-    The musl wrapper inherits its host GCC driver. GCC 16 introduced automatic
-    libatomic linking, but some wrapper packages do not provide the resulting
-    static ``libatomic_asneeded`` selector. Probe the compiler-only opt-out
-    before CMake's mandatory link check; older GCC releases reject that option.
+    X86_64 and AArch64 prefer musl but fall back to GCC when it can link static
+    libc; PPC64LE uses the same verified GCC path. The musl wrapper inherits its
+    host GCC driver. GCC 16 introduced automatic libatomic linking, but some
+    wrapper packages do not provide the resulting static
+    ``libatomic_asneeded`` selector. Probe the compiler-only opt-out before
+    CMake's mandatory link check; older GCC releases reject that option.
+
+    Raises:
+        DeploymentError: If CMake or a native compiler is unavailable, or a GCC
+            fallback cannot link a static libc executable.
     """
     architecture = _native_architecture()
-    compiler = "musl-gcc" if architecture in {"x86_64", "aarch64"} else "gcc"
+    if shutil.which("cmake") is None:
+        raise DeploymentError(
+            "CMake is unavailable",
+            category="missing-tool",
+            action="make cmake available on PATH, then rerun",
+        )
+    compiler = "musl-gcc" if architecture in {"x86_64", "aarch64"} and shutil.which("musl-gcc") else "gcc"
+    if shutil.which(compiler) is None:
+        raise DeploymentError(
+            f"static C compiler is unavailable: {compiler}",
+            category="missing-tool",
+            action=f"make {compiler} available on PATH, then rerun",
+        )
     support = _capture(
         [compiler, "-fno-link-libatomic", "-x", "c", "-c", "/dev/null", "-o", "/dev/null"],
         timeout=10,
     )
-    compiler_flags = ["-DCMAKE_C_FLAGS=-fno-link-libatomic"] if support.returncode == 0 else []
+    compiler_option = ["-fno-link-libatomic"] if support.returncode == 0 else []
+    if compiler == "gcc":
+        static_link = _capture(
+            [compiler, *compiler_option, "-static", "-x", "c", "/dev/null", "-Wl,--defsym=main=0", "-o", "/dev/null"],
+            timeout=10,
+        )
+        if static_link.returncode:
+            raise DeploymentError(
+                "GCC cannot link a static libc executable",
+                category="static-toolchain",
+                action="install the static libc development files for gcc, then rerun",
+            )
+    compiler_flags = ["-DCMAKE_C_FLAGS=-fno-link-libatomic"] if compiler_option else []
     return architecture, (
         [
             "cmake", "-S", str(source), "-B", str(build),

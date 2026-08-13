@@ -93,7 +93,7 @@ class DeploymentContractTests(unittest.TestCase):
     def test_release_host_install_uses_cmake_and_compiled_identity(self):
         """Build the release-pinned source through the normal static CMake path."""
         source_commit = "a" * 40
-        architecture = self.deploy._native_architecture()
+        architecture = "x86_64"
         identity = json.dumps({
             "product_version": "1.0.0-dev",
             "source_commit": source_commit,
@@ -108,11 +108,15 @@ class DeploymentContractTests(unittest.TestCase):
             return subprocess.CompletedProcess(command, 0, stdout=output, stderr="")
 
         with tempfile.TemporaryDirectory(prefix="release-host-install-", dir="/tmp/mkchad-v1") as temporary, mock.patch.object(
-            self.deploy, "_capture", side_effect=capture
-        ), mock.patch.object(self.deploy, "_roots", return_value={"home": pathlib.Path(temporary) / "home"}):
+            self.deploy, "_native_architecture", return_value=architecture
+        ), mock.patch.object(
+            self.deploy.shutil, "which", return_value="/usr/bin/tool"
+        ), mock.patch.object(self.deploy, "_capture", side_effect=capture), mock.patch.object(
+            self.deploy, "_roots", return_value={"home": pathlib.Path(temporary) / "home"}
+        ):
             self.deploy._install_host_tools(pathlib.Path(temporary) / "source", source_commit, pathlib.Path(temporary))
 
-        compiler = "musl-gcc" if architecture in {"x86_64", "aarch64"} else "gcc"
+        compiler = "musl-gcc"
         self.assertEqual(commands[0], [compiler, "-fno-link-libatomic", "-x", "c", "-c", "/dev/null", "-o", "/dev/null"])
         self.assertIn("-DCONTAINER_TOOLS_STATIC=ON", commands[1])
         self.assertIn("-DCMAKE_C_FLAGS=-fno-link-libatomic", commands[1])
@@ -123,7 +127,7 @@ class DeploymentContractTests(unittest.TestCase):
 
     def test_release_host_install_omits_unsupported_libatomic_opt_out(self):
         """Keep GCC 15 musl builds working when the GCC 16 option is absent."""
-        with mock.patch.object(
+        with mock.patch.object(self.deploy.shutil, "which", return_value="/usr/bin/tool"), mock.patch.object(
             self.deploy,
             "_capture",
             return_value=subprocess.CompletedProcess([], 1, stdout="", stderr="unsupported"),
@@ -133,14 +137,101 @@ class DeploymentContractTests(unittest.TestCase):
             )
         self.assertNotIn("-DCMAKE_C_FLAGS=-fno-link-libatomic", commands[0])
 
+    def test_x86_and_arm_host_install_fall_back_to_gcc_with_static_libc(self):
+        """Allow HPC hosts without musl to build a verified static executable."""
+        for architecture in ("x86_64", "aarch64"):
+            with self.subTest(architecture=architecture):
+                probes = []
+
+                def capture(command, **_kwargs):
+                    probes.append(command)
+                    return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+                available = {"cmake": "/usr/bin/cmake", "gcc": "/opt/gcc/bin/gcc"}
+                with mock.patch.object(self.deploy, "_native_architecture", return_value=architecture), mock.patch.object(
+                    self.deploy.shutil, "which", side_effect=available.get
+                ), mock.patch.object(self.deploy, "_capture", side_effect=capture):
+                    _architecture, commands = self.deploy._container_tools_build_commands(
+                        pathlib.Path("/source"), pathlib.Path("/build"), pathlib.Path("/prefix")
+                    )
+
+                self.assertEqual(probes[0][0], "gcc")
+                self.assertEqual(probes[1][0:3], ["gcc", "-fno-link-libatomic", "-static"])
+                self.assertIn("-Wl,--defsym=main=0", probes[1])
+                self.assertIn("-DCMAKE_C_COMPILER=gcc", commands[0])
+                self.assertIn("-DCONTAINER_TOOLS_STATIC=ON", commands[0])
+
+    def test_ppc64le_host_install_uses_verified_static_gcc(self):
+        """Keep PPC64LE on GCC while applying the same static-link preflight."""
+        probes = []
+
+        def capture(command, **_kwargs):
+            probes.append(command)
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        with mock.patch.object(self.deploy, "_native_architecture", return_value="ppc64le"), mock.patch.object(
+            self.deploy.shutil, "which", return_value="/usr/bin/tool"
+        ), mock.patch.object(self.deploy, "_capture", side_effect=capture):
+            _architecture, commands = self.deploy._container_tools_build_commands(
+                pathlib.Path("/source"), pathlib.Path("/build"), pathlib.Path("/prefix")
+            )
+
+        self.assertEqual(probes[0][0], "gcc")
+        self.assertIn("-static", probes[1])
+        self.assertIn("-DCMAKE_C_COMPILER=gcc", commands[0])
+
+    def test_gcc_fallback_requires_static_libc(self):
+        """Fail before CMake when GCC cannot link against a static libc."""
+        available = {"cmake": "/usr/bin/cmake", "gcc": "/usr/bin/gcc"}
+        responses = [
+            subprocess.CompletedProcess([], 0, stdout="", stderr=""),
+            subprocess.CompletedProcess([], 1, stdout="", stderr="missing libc.a"),
+        ]
+        with mock.patch.object(self.deploy, "_native_architecture", return_value="x86_64"), mock.patch.object(
+            self.deploy.shutil, "which", side_effect=available.get
+        ), mock.patch.object(self.deploy, "_capture", side_effect=responses):
+            with self.assertRaises(self.deploy.DeploymentError) as raised:
+                self.deploy._container_tools_build_commands(
+                    pathlib.Path("/source"), pathlib.Path("/build"), pathlib.Path("/prefix")
+                )
+
+        self.assertEqual(raised.exception.category, "static-toolchain")
+        self.assertIn("static libc", raised.exception.action)
+        self.assertIn("gcc", raised.exception.action)
+
+    def test_host_install_names_missing_build_tools(self):
+        """Identify unavailable build commands instead of reporting a generic tool."""
+        with mock.patch.object(self.deploy.shutil, "which", return_value=None):
+            with self.assertRaises(self.deploy.DeploymentError) as raised:
+                self.deploy._container_tools_build_commands(
+                    pathlib.Path("/source"), pathlib.Path("/build"), pathlib.Path("/prefix")
+                )
+
+        self.assertEqual(raised.exception.category, "missing-tool")
+        self.assertIn("cmake", raised.exception.action)
+
+        available = {"cmake": "/usr/bin/cmake"}
+        with mock.patch.object(self.deploy, "_native_architecture", return_value="x86_64"), mock.patch.object(
+            self.deploy.shutil, "which", side_effect=available.get
+        ):
+            with self.assertRaises(self.deploy.DeploymentError) as raised:
+                self.deploy._container_tools_build_commands(
+                    pathlib.Path("/source"), pathlib.Path("/build"), pathlib.Path("/prefix")
+                )
+
+        self.assertEqual(raised.exception.category, "missing-tool")
+        self.assertIn("gcc", raised.exception.action)
+
     def test_release_host_install_reports_the_failed_cmake_phase_and_status(self):
         responses = [
             subprocess.CompletedProcess([], 0, stdout="", stderr=""),
             subprocess.CompletedProcess([], 78, stdout="", stderr="failed"),
         ]
         with tempfile.TemporaryDirectory(prefix="release-host-install-", dir="/tmp/mkchad-v1") as temporary, mock.patch.object(
-            self.deploy, "_capture", side_effect=responses
-        ), mock.patch.object(self.deploy, "_roots", return_value={"home": pathlib.Path(temporary) / "home"}):
+            self.deploy.shutil, "which", return_value="/usr/bin/tool"
+        ), mock.patch.object(self.deploy, "_capture", side_effect=responses), mock.patch.object(
+            self.deploy, "_roots", return_value={"home": pathlib.Path(temporary) / "home"}
+        ):
             with self.assertRaises(self.deploy.DeploymentError) as raised:
                 self.deploy._install_host_tools(pathlib.Path(temporary) / "source", "a" * 40, pathlib.Path(temporary))
 

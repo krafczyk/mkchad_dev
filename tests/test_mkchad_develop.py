@@ -418,10 +418,11 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, build_root, True)
         commands = []
         source_commit = self._commit_value(self.tools)
+        architecture = "x86_64"
         identity = json.dumps({
             "product_version": "1.0.0-dev",
             "source_commit": source_commit,
-            "architecture": self.deploy._native_architecture(),
+            "architecture": architecture,
             "mount_plan_grammar": "ct-mount-plan-v1",
         }) + "\n"
 
@@ -430,10 +431,14 @@ class DeveloperWorkspaceTests(unittest.TestCase):
             stdout = identity if argv[-2:] == ["--version", "--json"] else "built\n"
             return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
 
-        with mock.patch.object(command.deploy, "_capture", side_effect=build) as capture:
+        with mock.patch.object(command.deploy, "_native_architecture", return_value=architecture), mock.patch.object(
+            command.deploy.shutil, "which", return_value="/usr/bin/tool"
+        ), mock.patch.object(
+            command.deploy, "_capture", side_effect=build
+        ) as capture:
             command._install_host_tools(self.tools, source_commit, build_root)
 
-        expected_compiler = "musl-gcc" if self.deploy._native_architecture() in {"x86_64", "aarch64"} else "gcc"
+        expected_compiler = "musl-gcc"
         self.assertEqual(commands[0], [expected_compiler, "-fno-link-libatomic", "-x", "c", "-c", "/dev/null", "-o", "/dev/null"])
         self.assertEqual(commands[1][:3], ["cmake", "-S", str(self.tools)])
         self.assertIn("-DCONTAINER_TOOLS_STATIC=ON", commands[1])
@@ -673,6 +678,8 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         command.BUILD_ROOT.mkdir(parents=True, exist_ok=True)
         source_commit = self._commit_value(self.tools)
         with tempfile.TemporaryDirectory(prefix="mkchad-develop-build-", dir="/tmp/mkchad-v1/container-tools-runtime-boundary") as temporary, mock.patch.object(
+            command.deploy, "_native_architecture", return_value="x86_64"
+        ), mock.patch.object(command.deploy.shutil, "which", return_value="/usr/bin/tool"), mock.patch.object(
             command.deploy, "_capture", return_value=subprocess.CompletedProcess([], 1, stdout="", stderr="failed\n")
         ):
             with self.assertRaisesRegex(command.deploy.DeploymentError, "CMake configure failed"):
@@ -685,7 +692,11 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         identities = ("not-json", json.dumps({"product_version": "1.0.0-dev", "source_commit": "0" * 40, "architecture": self.deploy._native_architecture(), "mount_plan_grammar": "ct-mount-plan-v1"}))
         for identity in identities:
             responses = [subprocess.CompletedProcess([], 0, stdout="", stderr="")] * 4 + [subprocess.CompletedProcess([], 0, stdout=identity, stderr="")]
-            with self.subTest(identity=identity), tempfile.TemporaryDirectory(prefix="mkchad-develop-build-", dir="/tmp/mkchad-v1/container-tools-runtime-boundary") as temporary, mock.patch.object(command.deploy, "_capture", side_effect=responses):
+            with self.subTest(identity=identity), tempfile.TemporaryDirectory(prefix="mkchad-develop-build-", dir="/tmp/mkchad-v1/container-tools-runtime-boundary") as temporary, mock.patch.object(
+                command.deploy, "_native_architecture", return_value="x86_64"
+            ), mock.patch.object(
+                command.deploy.shutil, "which", return_value="/usr/bin/tool"
+            ), mock.patch.object(command.deploy, "_capture", side_effect=responses):
                 with self.assertRaises(command.deploy.DeploymentError):
                     command._install_host_tools(self.tools, source_commit, pathlib.Path(temporary))
 
@@ -707,7 +718,11 @@ class DeveloperWorkspaceTests(unittest.TestCase):
                 return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(identity), stderr="")
             return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
-        with tempfile.TemporaryDirectory(prefix="mkchad-develop-build-", dir="/tmp/mkchad-v1/container-tools-runtime-boundary") as temporary, contextlib.redirect_stdout(command._StreamLog(terminal, log)), contextlib.redirect_stderr(command._StreamLog(terminal, log)), mock.patch.object(command.deploy, "_capture", side_effect=build):
+        with tempfile.TemporaryDirectory(prefix="mkchad-develop-build-", dir="/tmp/mkchad-v1/container-tools-runtime-boundary") as temporary, contextlib.redirect_stdout(command._StreamLog(terminal, log)), contextlib.redirect_stderr(command._StreamLog(terminal, log)), mock.patch.object(
+            command.deploy, "_native_architecture", return_value="x86_64"
+        ), mock.patch.object(
+            command.deploy.shutil, "which", return_value="/usr/bin/tool"
+        ), mock.patch.object(command.deploy, "_capture", side_effect=build):
             command._install_host_tools(self.tools, source_commit, pathlib.Path(temporary), log)
 
         expected = "token=<redacted>\npassword=<redacted>\n"
