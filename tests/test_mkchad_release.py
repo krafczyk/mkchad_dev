@@ -81,7 +81,7 @@ result_path = pathlib.Path(value('--result-path'))
 run_id = value('--run-id')
 capture = os.environ.get('MKCHAD_RELEASE_CAPTURE')
 if capture:
-    pathlib.Path(capture).write_text(json.dumps({'argv': sys.argv[1:], 'release': release, 'image': image, 'log_path': log_path, 'result_path': str(result_path), 'run_id': run_id}), encoding='utf-8')
+    pathlib.Path(capture).write_text(json.dumps({'argv': sys.argv[1:], 'release': release, 'image': image, 'log_path': log_path, 'result_path': str(result_path), 'run_id': run_id, 'container_tools_c_compiler': os.environ.get('CONTAINER_TOOLS_C_COMPILER')}), encoding='utf-8')
 print('child standard output')
 print('child standard error', file=sys.stderr)
 mode = os.environ.get('MKCHAD_RELEASE_CHILD_MODE', 'success')
@@ -220,6 +220,18 @@ raise SystemExit(child_exit)
 
         self.assertEqual(status, 0)
         self.assertIn("--replace-partial", json.loads(capture.read_text(encoding="utf-8"))["argv"])
+
+    def test_compiler_override_is_forwarded_to_the_release_deployer(self):
+        """Preserve the exact static compiler selection across release handoff."""
+        _, remote, _ = self.remote_with_release()
+        capture = self.root / "compiler-override.json"
+        compiler = "/opt/toolchains/bin/musl-gcc"
+
+        with mock.patch.dict(os.environ, {"CONTAINER_TOOLS_C_COMPILER": compiler}, clear=False):
+            status, _, _ = self.invoke(remote, capture=capture)
+
+        self.assertEqual(status, 0)
+        self.assertEqual(json.loads(capture.read_text(encoding="utf-8"))["container_tools_c_compiler"], compiler)
 
     def test_only_public_options_are_accepted(self):
         _, remote, _ = self.remote_with_release()

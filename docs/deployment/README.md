@@ -75,11 +75,28 @@ When that build lock is busy, the command publishes a controlled developer
 failure result in its own state root. X86_64 and AArch64 builds use `musl-gcc`
 when it is available on `PATH`; otherwise they select GCC after verifying that
 it can link a complete static libc executable. PPC64LE selects the same verified
-GCC path. CMake and the selected compiler must be available on `PATH`. The
-installed executable's JSON version must report the admitted source commit,
-native architecture, product version, and `ct-mount-plan-v1` grammar. Callers
-cannot select another source, archive,
-identity, compiler family, or install prefix.
+GCC path. CMake and any automatically selected compiler must be available on
+`PATH`. The installed executable's JSON version must report the admitted source
+commit, native architecture, product version, and `ct-mount-plan-v1` grammar.
+Callers cannot select another source, archive, identity, or install prefix.
+
+Both release and developer deployment accept an optional static compiler
+override through `CONTAINER_TOOLS_C_COMPILER`. Set it to one specific absolute
+path to an executable compiler, for example:
+
+```bash
+CONTAINER_TOOLS_C_COMPILER=/opt/toolchains/bin/musl-gcc \
+  mkchad-release --release TAG --image /absolute/path/to/nvim_container_x86.sif
+```
+
+The release launcher preserves the variable when it hands off to the fetched
+deployer, and the repository-local developer command reads it directly. The
+deployer uses that exact path as compiler `argv[0]` and as CMake's
+`CMAKE_C_COMPILER` value. The path may be a symlink but must resolve to an
+executable regular file. A non-absolute, nonexistent, non-executable, or
+non-static-linking override stops the run before CMake; no fallback is attempted.
+When the variable is unset or empty, the automatic `musl-gcc`/GCC selection
+above applies.
 After it publishes a normal, controlled-failure, or interrupted terminal result,
 the command immediately makes one best-effort cleanup attempt for its `run-*`
 directory while still holding the build lock. Cleanup errors and interruption

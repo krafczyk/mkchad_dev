@@ -435,7 +435,9 @@ def main(argv: list[str] | None = None) -> int:
     Side effects:
         Acquires the public invocation lock, writes one run log and terminal result,
         fetches the selected release into temporary storage, and removes that storage
-        after the release-owned deployer exits.
+        after the release-owned deployer exits. The inherited
+        ``CONTAINER_TOOLS_C_COMPILER`` value, when nonempty, is passed unchanged to
+        select the release deployer's exact static host-tool compiler.
     """
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0], allow_abbrev=False)
     parser.add_argument("--release", required=True)

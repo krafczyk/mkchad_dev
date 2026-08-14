@@ -48,6 +48,7 @@ class DeveloperWorkspaceTests(unittest.TestCase):
 
     def setUp(self):
         self.deploy = load_deployer()
+        self.enterContext(mock.patch.dict(os.environ, {"CONTAINER_TOOLS_C_COMPILER": ""}, clear=False))
         self.root = pathlib.Path(tempfile.mkdtemp(prefix="mkchad-develop-", dir="/tmp/mkchad-v1"))
         self.addCleanup(shutil.rmtree, self.root, True)
         self.workspace = self.root / "workspace"
@@ -448,6 +449,39 @@ class DeveloperWorkspaceTests(unittest.TestCase):
         self.assertEqual(commands[3][0:2], ["cmake", "--install"])
         self.assertEqual(commands[4][-2:], ["--version", "--json"])
         self.assertEqual(capture.call_args.kwargs, {"timeout": command.BUILD_TIMEOUT})
+
+    def test_build_invocation_uses_the_compiler_override_exactly(self):
+        """Pass the override unchanged through the developer CMake build path."""
+        command = load_developer_command()
+        source_commit = self._commit_value(self.tools)
+        identity = json.dumps({
+            "product_version": "1.0.0-dev",
+            "source_commit": source_commit,
+            "architecture": "x86_64",
+            "mount_plan_grammar": "ct-mount-plan-v1",
+        })
+        commands = []
+        with tempfile.TemporaryDirectory(prefix="compiler-override-", dir="/tmp/mkchad-v1") as temporary:
+            compiler = pathlib.Path(temporary) / "static-cc"
+            compiler.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+            compiler.chmod(0o755)
+
+            def build(argv, **_kwargs):
+                commands.append(argv)
+                stdout = identity if argv[-2:] == ["--version", "--json"] else ""
+                return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+            with mock.patch.dict(os.environ, {"CONTAINER_TOOLS_C_COMPILER": str(compiler)}), mock.patch.object(
+                command.deploy.shutil, "which", side_effect=lambda value: "/usr/bin/cmake" if value == "cmake" else None
+            ), mock.patch.object(command.deploy, "_capture", side_effect=build), mock.patch.object(
+                command.deploy, "_elf_is_static_executable", return_value=True
+            ):
+                command._install_host_tools(self.tools, source_commit, pathlib.Path(temporary))
+
+        self.assertEqual(commands[0][0], str(compiler))
+        self.assertEqual(commands[1][0], str(compiler))
+        self.assertEqual(commands[2][0], commands[1][-1])
+        self.assertIn(f"-DCMAKE_C_COMPILER={compiler}", commands[3])
 
     def test_public_command_builds_from_the_deployer_supplied_checkout(self):
         command = load_developer_command()

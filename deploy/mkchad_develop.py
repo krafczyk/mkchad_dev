@@ -218,7 +218,19 @@ def main(argv: list[str] | None = None) -> int:
 
     The command accepts no release selector. It validates the current parent
     workspace, stages local child commits through the deployer, and atomically
-    promotes the direct developer result to the shared latest-result path.
+    promotes the direct developer result to the shared latest-result path. A
+    nonempty ``CONTAINER_TOOLS_C_COMPILER`` environment value selects the exact
+    absolute compiler used for the required static host-tool build.
+
+    Args:
+        argv: Optional CLI arguments; process arguments are used when omitted.
+
+    Returns:
+        Zero on verified success, otherwise two after publishing failure state.
+
+    Side effects:
+        Stages admitted source, may replace managed deployment state, builds and
+        installs host tools, and publishes deployment logs and a terminal result.
     """
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0], allow_abbrev=False)
     parser.add_argument("--image", type=pathlib.Path, required=True)

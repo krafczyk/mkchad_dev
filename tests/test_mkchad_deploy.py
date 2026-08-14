@@ -34,6 +34,7 @@ class DeploymentContractTests(unittest.TestCase):
     def setUp(self):
         self.deploy = load_deployer()
         self.release = json.loads((ROOT / "deploy" / "release.json").read_text(encoding="utf-8"))
+        self.enterContext(mock.patch.dict(os.environ, {"CONTAINER_TOOLS_C_COMPILER": ""}, clear=False))
 
     def test_checked_in_manifest_is_schema_2_and_explicit(self):
         self.assertEqual(self.deploy.validate_release_v2_document(self.release), self.release)
@@ -136,6 +137,106 @@ class DeploymentContractTests(unittest.TestCase):
                 pathlib.Path("/source"), pathlib.Path("/build"), pathlib.Path("/prefix")
             )
         self.assertNotIn("-DCMAKE_C_FLAGS=-fno-link-libatomic", commands[0])
+
+    def test_container_tools_compiler_override_uses_the_exact_absolute_path(self):
+        """Use an explicit compiler path unchanged for probing and CMake."""
+        with tempfile.TemporaryDirectory(prefix="compiler-override-", dir="/tmp/mkchad-v1") as temporary:
+            compiler = pathlib.Path(temporary) / "static-cc"
+            compiler.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+            compiler.chmod(0o755)
+            probes = []
+
+            def capture(command, **_kwargs):
+                probes.append(command)
+                return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+            with mock.patch.dict(os.environ, {"CONTAINER_TOOLS_C_COMPILER": str(compiler)}), mock.patch.object(
+                self.deploy.shutil, "which", side_effect=lambda command: "/usr/bin/cmake" if command == "cmake" else None
+            ), mock.patch.object(self.deploy, "_capture", side_effect=capture), mock.patch.object(
+                self.deploy, "_elf_is_static_executable", return_value=True
+            ):
+                _architecture, commands = self.deploy._container_tools_build_commands(
+                    pathlib.Path("/source"), pathlib.Path(temporary) / "build", pathlib.Path("/prefix")
+                )
+
+        self.assertEqual(probes[0][0], str(compiler))
+        self.assertEqual(probes[1][0], str(compiler))
+        self.assertEqual(probes[2][0], probes[1][-1])
+        self.assertIn(f"-DCMAKE_C_COMPILER={compiler}", commands[0])
+
+    def test_container_tools_compiler_override_must_produce_an_executable(self):
+        """Reject an executable command that reports success without compiling."""
+        with tempfile.TemporaryDirectory(prefix="compiler-override-", dir="/tmp/mkchad-v1") as temporary, mock.patch.dict(
+            os.environ, {"CONTAINER_TOOLS_C_COMPILER": "/bin/true"}
+        ), mock.patch.object(
+            self.deploy.shutil, "which", side_effect=lambda command: "/usr/bin/cmake" if command == "cmake" else None
+        ):
+            with self.assertRaises(self.deploy.DeploymentError) as raised:
+                self.deploy._container_tools_build_commands(
+                    pathlib.Path("/source"), pathlib.Path(temporary) / "build", pathlib.Path("/prefix")
+                )
+
+        self.assertEqual(raised.exception.category, "compiler-override")
+
+    def test_container_tools_compiler_override_rejects_invalid_paths_before_probing(self):
+        """Reject malformed, unavailable, and non-executable compiler overrides."""
+        with tempfile.TemporaryDirectory(prefix="compiler-override-", dir="/tmp/mkchad-v1") as temporary:
+            root = pathlib.Path(temporary)
+            unavailable = root / "missing-cc"
+            non_executable = root / "non-executable-cc"
+            non_executable.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+            for compiler in ("relative-cc", str(unavailable), str(non_executable), str(root)):
+                with self.subTest(compiler=compiler), mock.patch.dict(
+                    os.environ, {"CONTAINER_TOOLS_C_COMPILER": compiler}
+                ), mock.patch.object(self.deploy, "_capture") as capture:
+                    with self.assertRaises(self.deploy.DeploymentError) as raised:
+                        self.deploy._container_tools_build_commands(
+                            pathlib.Path("/source"), pathlib.Path("/build"), pathlib.Path("/prefix")
+                        )
+
+                    self.assertEqual(raised.exception.category, "compiler-override")
+                    capture.assert_not_called()
+
+    def test_empty_container_tools_compiler_override_uses_automatic_selection(self):
+        """Treat an empty override like the default compiler-selection path."""
+        probes = []
+
+        def capture(command, **_kwargs):
+            probes.append(command)
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        available = {"cmake": "/usr/bin/cmake", "musl-gcc": "/usr/bin/musl-gcc"}
+        with mock.patch.dict(os.environ, {"CONTAINER_TOOLS_C_COMPILER": ""}), mock.patch.object(
+            self.deploy, "_native_architecture", return_value="x86_64"
+        ), mock.patch.object(self.deploy.shutil, "which", side_effect=available.get), mock.patch.object(
+            self.deploy, "_capture", side_effect=capture
+        ):
+            _architecture, commands = self.deploy._container_tools_build_commands(
+                pathlib.Path("/source"), pathlib.Path("/build"), pathlib.Path("/prefix")
+            )
+
+        self.assertEqual(probes[0][0], "musl-gcc")
+        self.assertIn("-DCMAKE_C_COMPILER=musl-gcc", commands[0])
+
+    def test_container_tools_compiler_override_requires_static_linking(self):
+        """Reject an executable override that cannot build the required static binary."""
+        with tempfile.TemporaryDirectory(prefix="compiler-override-", dir="/tmp/mkchad-v1") as temporary:
+            compiler = pathlib.Path(temporary) / "dynamic-cc"
+            compiler.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+            compiler.chmod(0o755)
+            responses = [
+                subprocess.CompletedProcess([], 0, stdout="", stderr=""),
+                subprocess.CompletedProcess([], 1, stdout="", stderr="static libc unavailable"),
+            ]
+            with mock.patch.dict(os.environ, {"CONTAINER_TOOLS_C_COMPILER": str(compiler)}), mock.patch.object(
+                self.deploy.shutil, "which", side_effect=lambda command: "/usr/bin/cmake" if command == "cmake" else None
+            ), mock.patch.object(self.deploy, "_capture", side_effect=responses):
+                with self.assertRaises(self.deploy.DeploymentError) as raised:
+                    self.deploy._container_tools_build_commands(
+                        pathlib.Path("/source"), pathlib.Path(temporary) / "build", pathlib.Path("/prefix")
+                    )
+
+        self.assertEqual(raised.exception.category, "compiler-override")
 
     def test_x86_and_arm_host_install_fall_back_to_gcc_with_static_libc(self):
         """Allow HPC hosts without musl to build a verified static executable."""

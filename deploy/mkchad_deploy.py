@@ -17,6 +17,7 @@ import selectors
 import shutil
 import signal
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -1281,8 +1282,57 @@ def _execute_components(deployed: dict[str, dict], artifact: dict, image: pathli
         shutil.rmtree(staging, ignore_errors=True)
 
 
+def _elf_is_static_executable(path: pathlib.Path) -> bool:
+    """Return whether a regular native ELF has load segments and no interpreter."""
+    try:
+        status = path.stat()
+        with path.open("rb") as executable:
+            ident = executable.read(16)
+            if len(ident) != 16 or ident[:4] != b"\x7fELF" or ident[6] != 1:
+                return False
+            byte_order = "<" if ident[5] == 1 else ">" if ident[5] == 2 else ""
+            formats = {
+                1: ("HHIIIIIHHHHHH", "IIIIIIII"),
+                2: ("HHIQQQIHHHHHH", "IIQQQQQQ"),
+            }
+            if not byte_order or ident[4] not in formats or not stat.S_ISREG(status.st_mode):
+                return False
+            header_format, program_format = formats[ident[4]]
+            header_size = struct.calcsize(byte_order + header_format)
+            header_bytes = executable.read(header_size)
+            if len(header_bytes) != header_size:
+                return False
+            header = struct.unpack(byte_order + header_format, header_bytes)
+            program_offset, entry_size, entry_count = header[4], header[8], header[9]
+            expected_entry_size = struct.calcsize(byte_order + program_format)
+            if header[0] not in (2, 3) or header[2] != 1 or entry_size != expected_entry_size or entry_count == 0:
+                return False
+            saw_load = False
+            for index in range(entry_count):
+                executable.seek(program_offset + index * entry_size)
+                program_bytes = executable.read(entry_size)
+                if len(program_bytes) != entry_size:
+                    return False
+                program = struct.unpack(byte_order + program_format, program_bytes)
+                if program[0] == 3:
+                    return False
+                saw_load = saw_load or program[0] == 1
+            return saw_load
+    except (OSError, ValueError, struct.error):
+        return False
+
+
 def _container_tools_build_commands(source: pathlib.Path, build: pathlib.Path, prefix: pathlib.Path) -> tuple[str, tuple[list[str], ...]]:
     """Return the native architecture and verified static CMake build commands.
+
+    Args:
+        source: Exact admitted container-tools source checkout.
+        build: Invocation-private CMake build directory.
+        prefix: Installation prefix for the completed package.
+
+    Returns:
+        The native architecture and ordered configure, build, and install
+        commands.
 
     X86_64 and AArch64 prefer musl but fall back to GCC when it can link static
     libc; PPC64LE uses the same verified GCC path. The musl wrapper inherits its
@@ -1291,9 +1341,14 @@ def _container_tools_build_commands(source: pathlib.Path, build: pathlib.Path, p
     ``libatomic_asneeded`` selector. Probe the compiler-only opt-out before
     CMake's mandatory link check; older GCC releases reject that option.
 
+    A nonempty :envvar:`CONTAINER_TOOLS_C_COMPILER` selects one absolute regular
+    executable for both probes and CMake. An unset or empty override retains the
+    automatic architecture-specific compiler selection.
+
     Raises:
-        DeploymentError: If CMake or a native compiler is unavailable, or a GCC
-            fallback cannot link a static libc executable.
+        DeploymentError: If CMake or a native compiler is unavailable, the
+            compiler override is invalid, or the selected compiler cannot link
+            the required static executable. No CMake command runs on failure.
     """
     architecture = _native_architecture()
     if shutil.which("cmake") is None:
@@ -1302,8 +1357,19 @@ def _container_tools_build_commands(source: pathlib.Path, build: pathlib.Path, p
             category="missing-tool",
             action="make cmake available on PATH, then rerun",
         )
-    compiler = "musl-gcc" if architecture in {"x86_64", "aarch64"} and shutil.which("musl-gcc") else "gcc"
-    if shutil.which(compiler) is None:
+    override = os.environ.get("CONTAINER_TOOLS_C_COMPILER", "")
+    if override:
+        compiler_path = pathlib.Path(override)
+        if not compiler_path.is_absolute() or not compiler_path.is_file() or not os.access(compiler_path, os.X_OK):
+            raise DeploymentError(
+                "container-tools compiler override is not an absolute executable file",
+                category="compiler-override",
+                action="set CONTAINER_TOOLS_C_COMPILER to an absolute executable compiler path, then rerun",
+            )
+        compiler = override
+    else:
+        compiler = "musl-gcc" if architecture in {"x86_64", "aarch64"} and shutil.which("musl-gcc") else "gcc"
+    if not override and shutil.which(compiler) is None:
         raise DeploymentError(
             f"static C compiler is unavailable: {compiler}",
             category="missing-tool",
@@ -1314,7 +1380,29 @@ def _container_tools_build_commands(source: pathlib.Path, build: pathlib.Path, p
         timeout=10,
     )
     compiler_option = ["-fno-link-libatomic"] if support.returncode == 0 else []
-    if compiler == "gcc":
+    if override:
+        with tempfile.TemporaryDirectory(prefix="container-tools-compiler-probe-", dir=build.parent) as temporary:
+            probe_source = pathlib.Path(temporary) / "probe.c"
+            probe_executable = pathlib.Path(temporary) / "probe"
+            probe_source.write_text("int main(void) { return 0; }\n", encoding="ascii")
+            static_link = _capture(
+                [compiler, *compiler_option, "-static", str(probe_source), "-o", str(probe_executable)],
+                timeout=10,
+            )
+            if static_link.returncode or not _elf_is_static_executable(probe_executable):
+                raise DeploymentError(
+                    "container-tools compiler override cannot link a static executable",
+                    category="compiler-override",
+                    action="set CONTAINER_TOOLS_C_COMPILER to an absolute compiler path that can link static executables, then rerun",
+                )
+            execution = _capture([str(probe_executable)], timeout=10)
+            if execution.returncode:
+                raise DeploymentError(
+                    "container-tools compiler override produced an unusable static executable",
+                    category="compiler-override",
+                    action="set CONTAINER_TOOLS_C_COMPILER to an absolute native compiler path, then rerun",
+                )
+    elif compiler == "gcc":
         static_link = _capture(
             [compiler, *compiler_option, "-static", "-x", "c", "/dev/null", "-Wl,--defsym=main=0", "-o", "/dev/null"],
             timeout=10,
@@ -1417,7 +1505,10 @@ def execute_deployment(repo: pathlib.Path, image: pathlib.Path, *, release_tag: 
         DeploymentError: If launcher handoff or manifest selection is invalid.
 
     The function stages exact repositories, may update deployed checkouts and
-    host tools, and atomically publishes a terminal result.
+    host tools, and atomically publishes a terminal result. A nonempty
+    ``CONTAINER_TOOLS_C_COMPILER`` environment value selects the exact absolute
+    compiler used for the required static host-tool build and fails closed when
+    that compiler cannot produce a runnable static executable.
     """
     if not TAG.fullmatch(release_tag) or ".." in release_tag or not UUID.fullmatch(run_id):
         raise DeploymentError("invalid launcher handoff")
