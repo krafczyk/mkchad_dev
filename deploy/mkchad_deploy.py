@@ -38,7 +38,6 @@ COMPONENTS = {
     "opencode.nvim": "configuration-owned",
     "opencode-project-reload": "configuration-owned",
     "compound-engineering": "configuration-owned",
-    "opencode_sprint_loop": "disabled",
 }
 CONFIGURATION_COMPONENTS = frozenset(name for name, disposition in COMPONENTS.items() if disposition == "configuration-owned")
 PHASES = ("preflight", "apply", "verify")

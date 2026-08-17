@@ -9,8 +9,7 @@ from parent or nested Gitlinks.
 `msk_containers`, `container_tools`, `mkchad`, and `opencode-db` are deployed checkouts.
 `opencode` is embedded in the verified SIF. `opencode.nvim`,
 `opencode-project-reload`, and `compound-engineering` remain
-configuration-owned; the deployer does not install them. `opencode_sprint_loop`
-is disabled.
+configuration-owned; the deployer does not install them.
 
 The deployer preserves only MkChad's ignored `opencode-server.json` and
 `lazy-lock.json`, and it never reads either file. It never reads or mutates

@@ -24,10 +24,6 @@ repository that they apply to.
   server.
 - `opencode/`: active OpenCode fork for MkChad-specific TUI integration.
 - `opencode-db/`: active standalone OpenCode SQLite cleanup tool.
-- `opencode_sprint_loop/`: frozen historical reference for the former Python
-  controller.
-- `opencode_sprint_loop/opencode_sprint_loop.lua/`: frozen historical Neovim
-  client for that controller.
 - `opencode-project-reload/`: active standalone OpenCode TUI plugin that
   safely reloads one project instance.
 - `compound-engineering/`: active Compound Engineering fork for cross-harness

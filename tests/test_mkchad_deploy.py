@@ -355,13 +355,13 @@ class DeploymentContractTests(unittest.TestCase):
                 with self.assertRaises(self.deploy.DeploymentError):
                     self.deploy.validate_release_v2_document(malformed)
 
-    def test_json_schemas_close_nine_components_and_preserve_three_component_handoff(self):
-        """Keep schema-2 results aligned with the expanded deployed-child set."""
+    def test_json_schemas_close_eight_components_and_preserve_three_component_handoff(self):
+        """Keep schema-2 results aligned with the active component set."""
         release_schema = json.loads((ROOT / "deploy/release-v2.schema.json").read_text(encoding="utf-8"))
         result_schema = json.loads((ROOT / "deploy/result-v2.schema.json").read_text(encoding="utf-8"))
-        self.assertEqual((release_schema["properties"]["components"]["minItems"], release_schema["properties"]["components"]["maxItems"]), (9, 9))
+        self.assertEqual((release_schema["properties"]["components"]["minItems"], release_schema["properties"]["components"]["maxItems"]), (8, 8))
         self.assertEqual(set(release_schema["properties"]["artifacts"]["properties"]), {"nvim-image"})
-        self.assertEqual((result_schema["properties"]["components"]["minItems"], result_schema["properties"]["components"]["maxItems"]), (9, 9))
+        self.assertEqual((result_schema["properties"]["components"]["minItems"], result_schema["properties"]["components"]["maxItems"]), (8, 8))
         self.assertNotIn("packages", result_schema["properties"])
 
     def test_release_schema_enforces_unique_image_architectures(self):

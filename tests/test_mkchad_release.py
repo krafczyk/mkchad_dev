@@ -101,7 +101,6 @@ if mode not in ('missing', 'stale'):
                 ('msk_containers', 'deployed'), ('container_tools', 'deployed'), ('mkchad', 'deployed'), ('opencode-db', 'deployed'),
                 ('opencode', 'embedded'), ('opencode.nvim', 'configuration-owned'),
                 ('opencode-project-reload', 'configuration-owned'), ('compound-engineering', 'configuration-owned'),
-                ('opencode_sprint_loop', 'disabled'),
             ]
         ],
         'artifact': {'architecture': 'x86_64', 'expected_sha256': '0' * 64, 'observed_sha256': None},

@@ -8,9 +8,9 @@
     "schema": {"const": 2},
     "components": {
       "type": "array",
-      "minItems": 9,
-      "maxItems": 9,
-      "items": {"oneOf": [{"$ref": "#/$defs/msk_containers"}, {"$ref": "#/$defs/container_tools"}, {"$ref": "#/$defs/mkchad"}, {"$ref": "#/$defs/opencode_db"}, {"$ref": "#/$defs/opencode"}, {"$ref": "#/$defs/opencode_nvim"}, {"$ref": "#/$defs/opencode_project_reload"}, {"$ref": "#/$defs/compound_engineering"}, {"$ref": "#/$defs/opencode_sprint_loop"}]},
+      "minItems": 8,
+      "maxItems": 8,
+      "items": {"oneOf": [{"$ref": "#/$defs/msk_containers"}, {"$ref": "#/$defs/container_tools"}, {"$ref": "#/$defs/mkchad"}, {"$ref": "#/$defs/opencode_db"}, {"$ref": "#/$defs/opencode"}, {"$ref": "#/$defs/opencode_nvim"}, {"$ref": "#/$defs/opencode_project_reload"}, {"$ref": "#/$defs/compound_engineering"}]},
       "allOf": [
         {"contains": {"$ref": "#/$defs/msk_containers"}, "minContains": 1, "maxContains": 1},
         {"contains": {"$ref": "#/$defs/container_tools"}, "minContains": 1, "maxContains": 1},
@@ -19,8 +19,7 @@
         {"contains": {"$ref": "#/$defs/opencode"}, "minContains": 1, "maxContains": 1},
         {"contains": {"$ref": "#/$defs/opencode_nvim"}, "minContains": 1, "maxContains": 1},
         {"contains": {"$ref": "#/$defs/opencode_project_reload"}, "minContains": 1, "maxContains": 1},
-        {"contains": {"$ref": "#/$defs/compound_engineering"}, "minContains": 1, "maxContains": 1},
-        {"contains": {"$ref": "#/$defs/opencode_sprint_loop"}, "minContains": 1, "maxContains": 1}
+        {"contains": {"$ref": "#/$defs/compound_engineering"}, "minContains": 1, "maxContains": 1}
       ]
     },
     "artifacts": {
@@ -137,12 +136,6 @@
     },
     "opencode_nvim": {"allOf": [{"$ref": "#/$defs/configuration_owned"}, {"properties": {"name": {"const": "opencode.nvim"}}}]},
     "opencode_project_reload": {"allOf": [{"$ref": "#/$defs/configuration_owned"}, {"properties": {"name": {"const": "opencode-project-reload"}}}]},
-    "compound_engineering": {"allOf": [{"$ref": "#/$defs/configuration_owned"}, {"properties": {"name": {"const": "compound-engineering"}}}]},
-    "opencode_sprint_loop": {
-      "type": "object",
-      "required": ["name", "disposition", "repository", "commit"],
-      "additionalProperties": false,
-      "properties": {"name": {"const": "opencode_sprint_loop"}, "disposition": {"const": "disabled"}, "repository": {"$ref": "#/$defs/repository"}, "commit": {"$ref": "#/$defs/commit"}}
-    }
+    "compound_engineering": {"allOf": [{"$ref": "#/$defs/configuration_owned"}, {"properties": {"name": {"const": "compound-engineering"}}}]}
   }
 }

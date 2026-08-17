@@ -10,10 +10,6 @@
 	path = opencode.nvim
 	url = git@github.com:krafczyk/opencode.nvim
 	branch = mkchad-v1
-[submodule "opencode_sprint_loop"]
-	path = opencode_sprint_loop
-	url = git@github.com:krafczyk/opencode_sprint_loop
-	branch = mkchad-v1
 [submodule "opencode-project-reload"]
 	path = opencode-project-reload
 	url = git@github.com:krafczyk/opencode-project-reload.git

@@ -48,7 +48,6 @@ COMPONENT_DISPOSITIONS = {
     "opencode.nvim": "configuration-owned",
     "opencode-project-reload": "configuration-owned",
     "compound-engineering": "configuration-owned",
-    "opencode_sprint_loop": "disabled",
 }
 REDACT_ASSIGNMENT = re.compile(r"(?i)\b(?P<key>[A-Za-z0-9_-]*(?:password|token|secret|api[_-]?key)[A-Za-z0-9_-]*)=[^\s]+")
 COMMAND_TIMEOUT = 300

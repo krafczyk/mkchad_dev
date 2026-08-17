@@ -14,8 +14,8 @@
     "phase": {"enum": ["preflight", "apply", "verify"]},
     "components": {
       "type": "array",
-      "minItems": 9,
-      "maxItems": 9,
+      "minItems": 8,
+      "maxItems": 8,
       "items": {"$ref": "#/$defs/component"},
       "allOf": [
         {"contains": {"properties": {"name": {"const": "msk_containers"}}}, "minContains": 1, "maxContains": 1},
@@ -25,8 +25,7 @@
         {"contains": {"properties": {"name": {"const": "opencode"}}}, "minContains": 1, "maxContains": 1},
         {"contains": {"properties": {"name": {"const": "opencode.nvim"}}}, "minContains": 1, "maxContains": 1},
         {"contains": {"properties": {"name": {"const": "opencode-project-reload"}}}, "minContains": 1, "maxContains": 1},
-        {"contains": {"properties": {"name": {"const": "compound-engineering"}}}, "minContains": 1, "maxContains": 1},
-        {"contains": {"properties": {"name": {"const": "opencode_sprint_loop"}}}, "minContains": 1, "maxContains": 1}
+        {"contains": {"properties": {"name": {"const": "compound-engineering"}}}, "minContains": 1, "maxContains": 1}
       ]
     },
     "artifact": {"$ref": "#/$defs/artifact"},
@@ -45,8 +44,8 @@
       "required": ["name", "disposition", "requested_commit", "observed_commit"],
       "additionalProperties": false,
       "properties": {
-        "name": {"enum": ["msk_containers", "container_tools", "mkchad", "opencode-db", "opencode", "opencode.nvim", "opencode-project-reload", "compound-engineering", "opencode_sprint_loop"]},
-        "disposition": {"enum": ["deployed", "embedded", "configuration-owned", "disabled"]},
+        "name": {"enum": ["msk_containers", "container_tools", "mkchad", "opencode-db", "opencode", "opencode.nvim", "opencode-project-reload", "compound-engineering"]},
+        "disposition": {"enum": ["deployed", "embedded", "configuration-owned"]},
         "requested_commit": {"$ref": "#/$defs/commit"},
         "observed_commit": {"oneOf": [{"$ref": "#/$defs/commit"}, {"type": "null"}]}
       }

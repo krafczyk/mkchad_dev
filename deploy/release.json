@@ -128,12 +128,6 @@
       "disposition": "configuration-owned",
       "repository": "git@github.com:krafczyk/compound-engineering-plugin.git",
       "commit": "241078528a8c1e36f32a6e277a2976f17a1015cb"
-    },
-    {
-      "name": "opencode_sprint_loop",
-      "disposition": "disabled",
-      "repository": "git@github.com:krafczyk/opencode_sprint_loop",
-      "commit": "5e71e56e6fc471c7021a7e34a58485cb38c2ab49"
     }
   ],
   "artifacts": {

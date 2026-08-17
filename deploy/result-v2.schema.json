@@ -12,7 +12,7 @@
     "completed_at": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"},
     "outcome": {"enum": ["succeeded", "failed", "interrupted"]},
     "phase": {"enum": ["preflight", "apply", "verify"]},
-    "components": {"type": "array", "minItems": 9, "maxItems": 9},
+    "components": {"type": "array", "minItems": 8, "maxItems": 8},
     "artifact": {"$ref": "#/$defs/artifact"},
     "actions": {"type": "array", "items": {"$ref": "#/$defs/action"}},
     "configuration_handoff": {"$ref": "#/$defs/configuration_handoff"},
