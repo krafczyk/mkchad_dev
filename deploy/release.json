@@ -5,7 +5,7 @@
       "name": "msk_containers",
       "disposition": "deployed",
       "repository": "git@github.com:krafczyk/msk_containers",
-      "commit": "d2fce51801ebd86ab2c04b67ac0510f3180061f2",
+      "commit": "506eb6785b550904ccc793517ab09d255c070806",
       "destination": {
         "root": "xdg_data_home",
         "path": "mkchad/components/msk_containers"
@@ -56,7 +56,7 @@
       "name": "mkchad",
       "disposition": "deployed",
       "repository": "git@github.com:krafczyk/mkchad",
-      "commit": "2f8793ba2581ec04b4ab9488717689b70bb1dc90",
+      "commit": "aeab439db26fdd635bebfc5298271e7f077b6a74",
       "destination": {
         "root": "xdg_config_home",
         "path": "mkchad"
@@ -68,7 +68,7 @@
       "name": "container_tools",
       "disposition": "deployed",
       "repository": "git@github.com:krafczyk/container_tools",
-      "commit": "16776f2b70506816b96a31b0f84f6e7dd2b32313",
+      "commit": "eae504da664a6f683306f7830e106626077c2e68",
       "destination": {
         "root": "xdg_data_home",
         "path": "mkchad/components/msk_containers/container_tools"
@@ -79,7 +79,7 @@
       "name": "opencode-db",
       "disposition": "deployed",
       "repository": "git@github.com:krafczyk/opencode-db.git",
-      "commit": "fd8782cf56c0823bf850f36c5967ade4da896d00",
+      "commit": "4fea5c262b649723549e0ee4adfedfcf70c12f8b",
       "destination": {
         "root": "xdg_data_home",
         "path": "mkchad/components/opencode-db"
@@ -109,7 +109,7 @@
       "name": "opencode",
       "disposition": "embedded",
       "repository": "git@github.com:krafczyk/opencode.git",
-      "commit": "9ff58294d62af73a9b17deb6bbf508072fb89671"
+      "commit": "a5bd24d4a20178ed550f91e6b771068cca18a0b3"
     },
     {
       "name": "opencode.nvim",
@@ -121,20 +121,25 @@
       "name": "opencode-project-reload",
       "disposition": "configuration-owned",
       "repository": "git@github.com:krafczyk/opencode-project-reload.git",
-      "commit": "4548302d5b79ab079b2a9d503a4556c6119cbab2"
+      "commit": "eab3ae6b70fdb10a110824f7c0bf1d008945e355"
     },
     {
       "name": "compound-engineering",
       "disposition": "configuration-owned",
       "repository": "git@github.com:krafczyk/compound-engineering-plugin.git",
-      "commit": "241078528a8c1e36f32a6e277a2976f17a1015cb"
+      "commit": "f94077c23d7af2340778890f9d65fde7a69e6a95"
     }
   ],
   "artifacts": {
     "nvim-image": [
       {
         "architecture": "x86_64",
-        "sha256": "8adc7ce8fb7a6f91ee9fb38a5cda3b71dbe4d589508192c74123c1fe100b9c03",
+        "sha256": "1556dd0a845b06c250677bcef10f929a48b0fe5adee1e0506e8c44e685efca5b",
+        "source_filename_class": "raw-nvim-container"
+      },
+      {
+        "architecture": "aarch64",
+        "sha256": "c893bb39f3e6996f053789ff5c031e7f1fe527a53956f3cf0cf6e891ded372f2",
         "source_filename_class": "raw-nvim-container"
       }
     ]

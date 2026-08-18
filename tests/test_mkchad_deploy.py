@@ -64,7 +64,7 @@ class DeploymentContractTests(unittest.TestCase):
         component = next(component for component in self.release["components"] if component["name"] == "opencode-db")
         self.assertEqual(component["disposition"], "deployed")
         self.assertEqual(component["repository"], "git@github.com:krafczyk/opencode-db.git")
-        self.assertEqual(component["commit"], "fd8782cf56c0823bf850f36c5967ade4da896d00")
+        self.assertEqual(component["commit"], "4fea5c262b649723549e0ee4adfedfcf70c12f8b")
         self.assertEqual(component["destination"], {"root": "xdg_data_home", "path": "mkchad/components/opencode-db"})
         self.assertEqual(
             component["actions"],
