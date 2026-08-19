@@ -30,3 +30,7 @@
 	path = opencode-db
 	url = git@github.com:krafczyk/opencode-db.git
 	branch = mkchad-v1
+[submodule "mkchad-commander"]
+	path = mkchad-commander
+	url = git@github.com:krafczyk/mkchad-commander.git
+	branch = mkchad-v1

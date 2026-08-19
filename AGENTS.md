@@ -24,6 +24,8 @@ repository that they apply to.
   server.
 - `opencode/`: active OpenCode fork for MkChad-specific TUI integration.
 - `opencode-db/`: active standalone OpenCode SQLite cleanup tool.
+- `mkchad-commander/`: active standalone development-session inspection and
+  recovery CLI.
 - `opencode-project-reload/`: active standalone OpenCode TUI plugin that
   safely reloads one project instance.
 - `compound-engineering/`: active Compound Engineering fork for cross-harness
